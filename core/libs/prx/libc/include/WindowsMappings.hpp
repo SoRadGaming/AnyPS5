@@ -558,6 +558,10 @@ private:
             ULONG_PTR reported = found.size();
             DWORD granularity = 0;
             if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
+            if (run.fresh == 0) {
+                for (ULONG_PTR index = 0; index < reported; ++index) pages[(*count)++] = reinterpret_cast<void*>(std::max(reinterpret_cast<std::uintptr_t>(found[index]), from));
+                return;
+            }
             for (ULONG_PTR index = 0; index < reported; ++index) written.push_back(reinterpret_cast<std::uintptr_t>(found[index]));
         }
         auto next = written.begin();
