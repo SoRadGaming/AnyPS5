@@ -113,6 +113,9 @@ struct CachedTexture {
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+    // The untrackedKey the snapshot was last read or compared equal at, for a surface outside the
+    // write watch; zero when none was taken.
+    std::array<std::uint64_t, 4> untracked{};
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -336,6 +339,10 @@ struct TextureCounters {
     // Storage images a Revalidate refreshed directly instead of through the lookups (T1, see
     // ShaderResources::refreshOwnObjects).
     std::atomic<std::uint64_t> ownRefreshes{0};
+    // Snapshot hits over memory outside the write watch: kept by an unchanged UntrackedHint key, or
+    // by a byte compare.
+    std::atomic<std::uint64_t> untrackedKept{0};
+    std::atomic<std::uint64_t> untrackedCompared{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -352,7 +359,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.untrackedKept), count(counters.untrackedCompared));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -517,6 +524,19 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
     return budget;
 }
 
+// A snapshot over memory outside the write watch is compared with guest memory again only when this
+// key changed: a write-watch mark in the range, a driver store, a mapping change or a recorded GPU
+// write (as StorageTexture::compareUntracked). Taken before the snapshot is read or compared, so a
+// CPU store racing with that leaves a mark for the next key. Zero when the range has no hint.
+std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t bytes) {
+    if (GuestMemory::CollectEpoch() == 0) return {};
+    const auto hint = GuestMemory::UntrackedHint(address, bytes);
+    if (hint == 0) return {};
+    const auto* recorder = Recorder::Active();
+    const std::array<std::uint64_t, 4> key{hint, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+    return (key[2] & 1u) == 0 ? key : std::array<std::uint64_t, 4>{};
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
@@ -648,6 +668,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             committed = std::move(ranges);
         }
     }
+    const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
@@ -680,9 +701,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (it->committed != committed) return false;
                 return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->bytes.size()) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
+            const auto kept = [&] {
+                if (untracked[0] == 0) return false;
+                const bool same = it->untracked == untracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
+                (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
+                return same;
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
+                it->untracked = untracked;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();
@@ -711,8 +739,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
-        if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+        const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
+        if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
         ReadTextureSurface(resource, *keys, entry.bytes);
+        if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
