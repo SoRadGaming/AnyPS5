@@ -31,7 +31,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
-            bumpEpoch(&EpochBumps::drains);
+            static const bool noLabelBump = std::getenv("APS5_DEBUG_NO_LABEL_BUMP") != nullptr;
+            if (!noLabelBump) bumpEpoch(&EpochBumps::drains);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
@@ -364,7 +365,8 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         bytes.assign(stored.begin(), stored.end());
         writes.emplace_back(address, address + bytes.size());
     }
-    if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
+    static const bool noLabelBump = std::getenv("APS5_DEBUG_NO_LABEL_BUMP") != nullptr;
+    if (endOfPipeInterrupt && !noLabelBump) bumpEpoch(&EpochBumps::drains);
     auto stored = bytes;
     DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
         GuestMemory::SetCurrentPacket(opcode, queue);
