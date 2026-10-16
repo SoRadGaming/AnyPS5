@@ -288,9 +288,8 @@ void StartProcessSampler() {
 
 }
 
-void StartWorkerSampler() {
-    StartProcessSampler();
-    const char* path = std::getenv("APS5_SAMPLE_WORKER");
+void startThreadSampler(const char* variable, std::jthread& slot) {
+    const char* path = std::getenv(variable);
     if (path == nullptr) return;
     auto sampler = std::make_unique<Sampler>();
     sampler->path = path;
@@ -303,7 +302,7 @@ void StartWorkerSampler() {
         sampler->stackHigh = reinterpret_cast<std::uint64_t>(block->StackBase);
     }
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
-    workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
+    slot = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -317,14 +316,29 @@ void StartWorkerSampler() {
     });
 }
 
+std::jthread committerSamplerThread;
+
+void StartWorkerSampler() {
+    StartProcessSampler();
+    startThreadSampler("APS5_SAMPLE_WORKER", workerSamplerThread);
+}
+
+// LOCAL DEBUG: APS5_SAMPLE_COMMITTER=<file> samples the pipelined draw committer like APS5_SAMPLE_WORKER.
+void StartCommitterSampler() {
+    startThreadSampler("APS5_SAMPLE_COMMITTER", committerSamplerThread);
+}
+
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
+    committerSamplerThread.request_stop();
+    if (committerSamplerThread.joinable()) committerSamplerThread.join();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
 }
 #else
 void StartWorkerSampler() {}
+void StartCommitterSampler() {}
 void StopWorkerSampler() {}
 #endif
 
