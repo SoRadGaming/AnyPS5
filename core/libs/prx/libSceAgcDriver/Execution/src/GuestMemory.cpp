@@ -1244,6 +1244,26 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
+// LOCAL DEBUG (APS5_DEBUG_MISS_STATS): why memoized collects walk, per thread, every 10 s.
+struct MissStats {
+    std::uint64_t uncached = 0, uncachedNs = 0, memoHits = 0, missSerial = 0, missEpoch = 0, missNone = 0, missNs = 0, serialChanges = 0, lastSerial = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+thread_local MissStats missStats;
+bool missStatsEnabled() {
+    static const bool enabled = std::getenv("APS5_DEBUG_MISS_STATS") != nullptr;
+    return enabled;
+}
+void reportMissStats() {
+    auto& st = missStats;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - st.last < std::chrono::seconds(10)) return;
+    if (st.uncached + st.memoHits + st.missSerial + st.missEpoch + st.missNone != 0) std::fprintf(stderr, "[miss-stats] thread %lu: uncached walks %llu (%.1f ms), memo hits %llu, memoized walks: serial changed %llu, epoch changed %llu, no entry %llu (%.1f ms), unwatch serial changes seen %llu\n", GetCurrentThreadId(), static_cast<unsigned long long>(st.uncached), st.uncachedNs / 1e6, static_cast<unsigned long long>(st.memoHits), static_cast<unsigned long long>(st.missSerial), static_cast<unsigned long long>(st.missEpoch), static_cast<unsigned long long>(st.missNone), st.missNs / 1e6, static_cast<unsigned long long>(st.serialChanges));
+    const auto serial = st.lastSerial;
+    st = MissStats{};
+    st.lastSerial = serial;
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -1263,6 +1283,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (missStatsEnabled()) ++missStats.memoHits;
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
@@ -1272,13 +1293,45 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (missStatsEnabled()) ++missStats.memoHits;
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
     }
+    int missKind = -1;
+    if (missStatsEnabled()) {
+        auto& st = missStats;
+        if (unwatched != st.lastSerial) {
+            ++st.serialChanges;
+            st.lastSerial = unwatched;
+        }
+        if (!useMemo) missKind = 0;
+        else {
+            missKind = 3;
+            for (const auto& entry : threadCollectMemo().entries) {
+                if (entry.begin <= first && stop <= entry.end) {
+                    if (entry.epoch == epoch && entry.unwatched != unwatched) missKind = 1;
+                    else if (entry.epoch != epoch && missKind == 3) missKind = 2;
+                }
+            }
+        }
+    }
+    const auto missStart = missKind >= 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    struct MissNote {
+        int kind;
+        std::chrono::steady_clock::time_point start;
+        ~MissNote() {
+            if (kind < 0) return;
+            auto& st = missStats;
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            if (kind == 0) { ++st.uncached; st.uncachedNs += ns; }
+            else { (kind == 1 ? st.missSerial : kind == 2 ? st.missEpoch : st.missNone)++; st.missNs += ns; }
+            reportMissStats();
+        }
+    } missNote{missKind, missStart};
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
