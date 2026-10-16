@@ -9,6 +9,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
+#include <map>
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -1264,6 +1265,46 @@ void reportMissStats() {
     st.lastSerial = serial;
 }
 
+// Epoch coverage (APS5_DEBUG_COVERAGE=1, local experiment): the merged page ranges this thread walked in
+// its current epoch under one unwatch serial. A collect inside them is served like a memo hit.
+struct EpochCoverage {
+    std::uint64_t epoch = 0;
+    std::uint64_t serial = 0;
+    std::map<std::uintptr_t, std::uintptr_t> ranges;
+};
+EpochCoverage& epochCoverage() {
+    thread_local EpochCoverage* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+bool epochCoverageEnabled() {
+    static const bool enabled = std::getenv("APS5_DEBUG_COVERAGE") != nullptr;
+    return enabled;
+}
+bool epochCovers(std::uint64_t epoch, std::uint64_t serial, std::uintptr_t first, std::uintptr_t stop) {
+    auto& coverage = epochCoverage();
+    if (coverage.epoch != epoch || coverage.serial != serial || coverage.ranges.empty()) return false;
+    auto it = coverage.ranges.upper_bound(first);
+    if (it == coverage.ranges.begin()) return false;
+    --it;
+    return it->first <= first && stop <= it->second;
+}
+void coverEpoch(std::uint64_t epoch, std::uint64_t serial, std::uintptr_t first, std::uintptr_t stop) {
+    auto& coverage = epochCoverage();
+    if (coverage.epoch != epoch || coverage.serial != serial) {
+        coverage.ranges.clear();
+        coverage.epoch = epoch;
+        coverage.serial = serial;
+    }
+    auto it = coverage.ranges.upper_bound(first);
+    if (it != coverage.ranges.begin() && std::prev(it)->second >= first) --it;
+    while (it != coverage.ranges.end() && it->first <= stop) {
+        first = std::min(first, it->first);
+        stop = std::max(stop, it->second);
+        it = coverage.ranges.erase(it);
+    }
+    coverage.ranges.emplace(first, stop);
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -1279,6 +1320,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
+        if (epochCoverageEnabled() && epochCovers(epoch, unwatched, first, stop)) {
+            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            if (missStatsEnabled()) ++missStats.memoHits;
+            return tracker.generation.load(std::memory_order_relaxed);
+        }
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
@@ -1371,6 +1417,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         else {
             auto& memo = threadCollectMemo();
             memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial};
+            if (epochCoverageEnabled()) coverEpoch(epoch, serial, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
             if (epochCollectMapEnabled()) {
                 auto& entry = epochCollectMap(epoch).ranges[first];
                 if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
