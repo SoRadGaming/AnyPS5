@@ -230,20 +230,27 @@ void UniformSliceDecodes(AgcDriver::VulkanDevice& device, const Shaders& shaders
 }
 
 void RecordedFillClearsWithoutWait(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
-    auto& htile = NewBlock();
-    const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
-    Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
-    Require(Draw(device, shaders, surface, {}) == 0u, "a draw at depth 0.5 passed LESS against the 0.5 written before it");
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        const std::array<std::uint32_t, 4> pattern{};
-        Require(device.FillBuffer(htile.Address(), HtileFillBytes, pattern), "the fill of 0 over the HTILE was not recorded on the GPU");
+    const VkStencilOpState writeFive{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, 5u};
+    const VkStencilOpState equalZero{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xffu, 0u, 0u};
+    for (const bool stencil : {false, true}) {
+        auto& htile = NewBlock();
+        const Surface surface{NewBlock().Address(), stencil ? NewBlock().Address() : 0, htile.Address(), stencil, stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT};
+        Require(Draw(device, shaders, surface, {.depthWrite = true, .stencilTest = stencil, .stencil = writeFive}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+        Require(Draw(device, shaders, surface, {}) == 0u, "a draw at depth 0.5 passed LESS against the 0.5 written before it");
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const auto word = stencil ? 0xf0u : 0u;
+            const std::array<std::uint32_t, 4> pattern{word, word, word, word};
+            Require(device.FillBuffer(htile.Address(), HtileFillBytes, pattern), stencil ? "the depth and stencil fast clear fill (SMem 0) over the HTILE was not recorded on the GPU" : "the fill of 0 over the HTILE was not recorded on the GPU");
+        }
+        const auto waits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, stencil ? "a depth and stencil fast clear fill recorded over the HTILE did not clear the depth to DB_DEPTH_CLEAR (1.0)" : "a fill of 0 recorded over the HTILE did not clear the depth to DB_DEPTH_CLEAR (1.0)");
+        Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() == waits, "the bind of the depth target waited for the GPU to run the fill recorded over its HTILE");
+        const auto expanded = stencil ? 0xfffff3ffu : 0xfffc000fu;
+        Require(AllWords(WordsAt(htile, 0), expanded), stencil ? "the bind after a depth and stencil fast clear fill recorded over the HTILE did not store it back as expanded (0xfffff3ff)" : "the bind after a fill recorded over the HTILE did not store it back as expanded (0xfffc000f)");
+        if (stencil) Require(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = equalZero}) == Covered, "a depth and stencil fast clear fill recorded over the HTILE did not clear the stencil to 0");
+        Require(Draw(device, shaders, surface, {}) == 0u, "the depth drawn after the clear from the recorded fill was cleared again");
     }
-    const auto waits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
-    Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a fill of 0 recorded over the HTILE did not clear the depth to DB_DEPTH_CLEAR (1.0)");
-    Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() == waits, "the bind of the depth target waited for the GPU to run the fill recorded over its HTILE");
-    Require(AllWords(WordsAt(htile, 0), 0xfffc000fu), "the bind after a fill recorded over the HTILE did not store it back as expanded (0xfffc000f)");
-    Require(Draw(device, shaders, surface, {}) == 0u, "the depth drawn after the clear from the recorded fill was cleared again");
 }
 
 void DepthOnlyFillKeepsStencil(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
