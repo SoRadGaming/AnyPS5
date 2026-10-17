@@ -1,5 +1,6 @@
 #include "Translation/VectorInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -24,6 +25,10 @@ bool roundsProductSeparately(const RdnaInstruction& inst) {
 }
 
 std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& inst) const {
+    // APS5_EXPERIMENT_NO_SOFT_F32_FLUSH=1 (measurement only): no software f32 denormal flush; the
+    // host float controls decide.
+    static const bool noSoftFlush = std::getenv("APS5_EXPERIMENT_NO_SOFT_F32_FLUSH") != nullptr;
+    if (noSoftFlush) return 0u;
     std::uint32_t flush = 0u;
     switch (inst.op) {
     case RdnaOpcode::VAddF32:

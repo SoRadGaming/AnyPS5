@@ -9,6 +9,12 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <fstream>
+#include <map>
+#include <set>
+#include <string>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -22,6 +28,91 @@
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
+// APS5_PROFILE_DRAW_GPU / APS5_PIPELINE_ISA: the graphics pipeline this thread bound last (the key
+// a draw's GPU range is filed under) and the pipelines the [gputime] report asked to disassemble.
+VkPipeline& LastBoundPipeline() {
+    static thread_local VkPipeline pipeline = VK_NULL_HANDLE;
+    return pipeline;
+}
+
+namespace {
+
+struct IsaRequests {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::pair<double, std::uint64_t>> wanted;
+    std::set<std::uint64_t> dumped;
+    std::atomic<bool> any{false};
+};
+
+IsaRequests& isaRequests() {
+    static IsaRequests requests;
+    return requests;
+}
+
+void dumpPipelineIsa(const Context& context, VkPipeline pipeline, double ms, std::uint64_t count) {
+    const auto getProperties = context.Function<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
+    const auto getRepresentations = context.Function<PFN_vkGetPipelineExecutableInternalRepresentationsKHR>("vkGetPipelineExecutableInternalRepresentationsKHR");
+    VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    pipelineInfo.pipeline = pipeline;
+    std::uint32_t executables = 0;
+    if (getProperties(context.device, &pipelineInfo, &executables, nullptr) != VK_SUCCESS) return;
+    std::vector<VkPipelineExecutablePropertiesKHR> properties(executables, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+    if (getProperties(context.device, &pipelineInfo, &executables, properties.data()) != VK_SUCCESS) return;
+    char name[64];
+    std::snprintf(name, sizeof(name), "isa-%016llx.txt", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(pipeline)));
+    std::ofstream out(name, std::ios::trunc);
+    out << "pipeline " << name << ": " << ms << " ms GPU in " << count << " timed draws per 10 s report" << '\n';
+    for (std::uint32_t index = 0; index < executables; ++index) {
+        VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+        executable.pipeline = pipeline;
+        executable.executableIndex = index;
+        std::uint32_t representations = 0;
+        if (getRepresentations(context.device, &executable, &representations, nullptr) != VK_SUCCESS) continue;
+        std::vector<VkPipelineExecutableInternalRepresentationKHR> items(representations, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+        if (getRepresentations(context.device, &executable, &representations, items.data()) != VK_SUCCESS) continue;
+        std::vector<std::vector<char>> storage(items.size());
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            storage[i].assign(items[i].dataSize + 1, 0);
+            items[i].pData = storage[i].data();
+        }
+        if (getRepresentations(context.device, &executable, &representations, items.data()) != VK_SUCCESS) continue;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            out << "==== executable " << index << " (" << properties[index].name << ", stages 0x" << std::hex << properties[index].stages << std::dec << ", subgroup " << properties[index].subgroupSize << ") representation " << items[i].name << ": " << items[i].description << '\n';
+            if (items[i].isText) out << static_cast<const char*>(items[i].pData);
+            else out << "(binary, " << items[i].dataSize << " bytes)";
+            out << '\n';
+        }
+    }
+    std::fprintf(stderr, "[pipeline-isa] wrote %s (%.1f ms GPU, %llu draws)\n", name, ms, static_cast<unsigned long long>(count));
+}
+
+void noteBound(const Context& context, VkPipeline pipeline) {
+    LastBoundPipeline() = pipeline;
+    auto& requests = isaRequests();
+    if (!requests.any.load(std::memory_order_relaxed)) return;
+    std::pair<double, std::uint64_t> cost;
+    {
+        std::lock_guard lock(requests.mutex);
+        const auto found = requests.wanted.find(reinterpret_cast<std::uintptr_t>(pipeline));
+        if (found == requests.wanted.end()) return;
+        cost = found->second;
+        requests.wanted.erase(found);
+        requests.dumped.insert(reinterpret_cast<std::uintptr_t>(pipeline));
+        requests.any.store(!requests.wanted.empty(), std::memory_order_relaxed);
+    }
+    dumpPipelineIsa(context, pipeline, cost.first, cost.second);
+}
+
+}
+
+void RequestPipelineIsa(std::uint64_t pipeline, double ms, std::uint64_t count) {
+    auto& requests = isaRequests();
+    std::lock_guard lock(requests.mutex);
+    if (requests.dumped.contains(pipeline)) return;
+    requests.wanted[pipeline] = {ms, count};
+    requests.any.store(true, std::memory_order_relaxed);
+}
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline) {
     if (!context.pipelineExecutableInfo) return;
@@ -517,7 +608,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         blend.pAttachments = firstChannels.empty() ? nullptr : firstChannels.data();
         std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
         VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
+        static const bool captureIsa = std::getenv("APS5_PIPELINE_ISA") != nullptr;
+        pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (captureIsa ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0) : 0;
         pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
         pipelineInfo.pStages = stages.data();
         VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
@@ -727,6 +819,7 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
+    noteBound(context, best != VK_NULL_HANDLE ? best : pipeline);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     if (state.stencilReplayReference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
@@ -763,11 +856,13 @@ void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state) con
 void Pipeline::ContinueSecondChannel(VkCommandBuffer commands) const {
     Require(secondChannel != VK_NULL_HANDLE, "the pipeline blends every channel in one pass");
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, secondChannel);
+    noteBound(context, secondChannel);
 }
 
 void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) const {
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, backFaces);
+    noteBound(context, backFaces);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);

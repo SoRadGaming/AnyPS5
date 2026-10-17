@@ -39,6 +39,8 @@
 
 namespace AgcDriver::Graphics {
 
+VkPipeline& LastBoundPipeline();
+
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
@@ -1387,6 +1389,17 @@ struct IndirectRecord {
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, std::uint32_t firstIndex = 0) {
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
+    // APS5_PROFILE_DRAW_GPU (with APS5_PROFILE_GPU): each draw is a [gputime] range filed under its
+    // bound pipeline (bit 63 set), so the report ranks pipelines by GPU time.
+    static const bool drawGpu = std::getenv("APS5_PROFILE_DRAW_GPU") != nullptr;
+    struct DrawTiming {
+        Recorder* recorder;
+        std::uint32_t index;
+        ~DrawTiming() {
+            if (recorder != nullptr) recorder->EndGpuTiming(index);
+        }
+    } drawTiming{drawGpu ? context.recorder : nullptr, Recorder::NoTiming};
+    if (drawTiming.recorder != nullptr) drawTiming.index = drawTiming.recorder->BeginGpuTimingInPass(reinterpret_cast<std::uintptr_t>(LastBoundPipeline()) | (std::uint64_t{1} << 63));
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
         context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));

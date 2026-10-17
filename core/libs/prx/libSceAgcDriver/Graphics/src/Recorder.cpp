@@ -35,6 +35,8 @@
 
 namespace AgcDriver::Graphics {
 
+void RequestPipelineIsa(std::uint64_t pipeline, double ms, std::uint64_t count);
+
 namespace {
 
 Recorder* activeRecorder = nullptr;
@@ -1914,6 +1916,11 @@ std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     return beginTiming(key);
 }
 
+std::uint32_t Recorder::BeginGpuTimingInPass(std::uint64_t key) {
+    if (!GpuTimingEnabled() || open == nullptr) return NoTiming;
+    return beginTiming(key);
+}
+
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;
@@ -2457,6 +2464,18 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    // APS5_PIPELINE_ISA: the costliest draw pipelines (keys with bit 63, APS5_PROFILE_DRAW_GPU) are
+    // asked for their disassembly once the title has run a while.
+    static const int wantIsa = [] { const char* text = std::getenv("APS5_PIPELINE_ISA"); return text != nullptr ? std::max(1, std::atoi(text)) : 0; }();
+    static int isaReports = 0;
+    if (wantIsa != 0 && ++isaReports == wantIsa) {
+        int requested = 0;
+        for (const auto& [key, totals] : hot) {
+            if ((key >> 63) == 0) continue;
+            RequestPipelineIsa(key & ~(std::uint64_t{1} << 63), totals.ms, totals.count);
+            if (++requested == 8) break;
+        }
+    }
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
