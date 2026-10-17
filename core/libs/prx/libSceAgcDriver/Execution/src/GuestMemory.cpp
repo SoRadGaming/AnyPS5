@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -435,6 +436,8 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    // Set once the spans are built: every query asks, and std::call_once costs a TLS lookup.
+    std::atomic<bool> ready{false};
     PageSpan arena;
     PageSpan image;
 
@@ -493,6 +496,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void PageStates::initialize() {
+    if (ready.load(std::memory_order_acquire)) return;
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -515,6 +519,7 @@ void PageStates::initialize() {
         }
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+        ready.store(true, std::memory_order_release);
     });
 }
 
@@ -673,9 +678,21 @@ bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
 #endif
         }
     };
-    thread_local const Bounds bounds;
+    // The bounds live in TEB slots (HostThreadSlot): a thread_local here cost an emulated TLS lookup
+    // on every guest memory check. A high bound of 1 marks a thread whose bounds could not be read.
+    struct StackLowSlot {};
+    struct StackHighSlot {};
+    auto high = HostThreadSlot<std::uintptr_t, StackHighSlot>::Get();
+    if (high == 0) {
+        const Bounds bounds;
+        HostThreadSlot<std::uintptr_t, StackLowSlot>::Set(bounds.low);
+        high = bounds.high != 0 ? bounds.high : 1;
+        HostThreadSlot<std::uintptr_t, StackHighSlot>::Set(high);
+    }
+    if (high == 1) return false;
+    const auto low = HostThreadSlot<std::uintptr_t, StackLowSlot>::Get();
     const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
-    return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;
+    return frame >= low && frame < high && address >= frame && address < high && bytes <= high - address;
 }
 
 // Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
@@ -1161,8 +1178,8 @@ struct EpochCollectMap {
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
-    thread_local EpochCollectMap* slot = nullptr;
-    auto& map = ShaderRecompiler::ThreadOwned(slot);
+    struct Tag {};
+    auto& map = ThreadScratch<EpochCollectMap, Tag>();
     if (map.epoch != epoch) {
         map.ranges.clear();
         map.epoch = epoch;
@@ -1273,8 +1290,8 @@ struct EpochCoverage {
     std::map<std::uintptr_t, std::uintptr_t> ranges;
 };
 EpochCoverage& epochCoverage() {
-    thread_local EpochCoverage* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct Tag {};
+    return ThreadScratch<EpochCoverage, Tag>();
 }
 bool epochCoverageEnabled() {
     static const bool enabled = std::getenv("APS5_DEBUG_COVERAGE") != nullptr;

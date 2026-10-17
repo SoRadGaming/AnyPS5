@@ -19,6 +19,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1205,8 +1206,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         std::vector<VkDeviceSize> rangeOffsets;
         std::vector<VkBuffer> soloHandles;
     };
-    thread_local FetchScratch* fetchScratchSlot = nullptr;
-    auto& scratch = ShaderRecompiler::ThreadOwned(fetchScratchSlot);
+    auto& scratch = ThreadScratch<FetchScratch, FetchScratch>();
     auto& fetches = scratch.fetches;
     auto& fetchValid = scratch.fetchValid;
     fetches.clear();

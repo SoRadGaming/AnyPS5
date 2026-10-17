@@ -4942,14 +4942,14 @@ std::span<std::byte> ShaderResources::DrawBindings::Snapshot::Contents() const {
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    struct ReadsTag {};
+    auto& reads = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsTag>();
     guestMemory.InPlaceReads(reads);
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    struct SelectedTag {};
+    auto& selected = ThreadScratch<std::vector<std::size_t>, SelectedTag>();
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
@@ -5052,8 +5052,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    struct CountsTag {};
+    auto& counts = ThreadScratch<std::array<std::vector<VkDescriptorPoolSize>, 2>, CountsTag>();
     for (auto& sizes : counts) sizes.clear();
     for (const auto& binding : bindings) {
         const auto set = setOf(binding);
@@ -5079,14 +5079,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
-    auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
+    struct BuffersTag {};
+    auto& buffers = ThreadScratch<std::vector<VkDescriptorBufferInfo>, BuffersTag>();
     buffers = descriptorBuffers;
-    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
-    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
+    struct WritesTag {};
+    auto& writes = ThreadScratch<std::vector<VkWriteDescriptorSet>, WritesTag>();
     writes = descriptorWrites;
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    struct IndicesTag {};
+    auto& snapshotIndices = ThreadScratch<std::vector<std::size_t>, IndicesTag>();
     snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     auto nextWrite = writes.begin();
@@ -5147,8 +5147,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
     } else {
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-        auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+        struct ReadsTag {};
+        auto& reads = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsTag>();
         guestMemory.InPlaceReads(reads);
         recorder.NotePendingReads(reads, kind);
     }

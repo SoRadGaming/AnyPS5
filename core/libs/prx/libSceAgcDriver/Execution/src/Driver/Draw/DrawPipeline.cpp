@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -59,9 +60,10 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
 }
 
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
-    static thread_local std::uint64_t followed = 0;
-    if (followed == token) return;
-    followed = token;
+    struct FollowedTag {};
+    using Followed = HostThreadSlot<std::uint64_t, FollowedTag>;
+    if (Followed::Get() == token) return;
+    Followed::Set(token);
     GuestMemory::BumpCollectEpoch();
 }
 
