@@ -1265,6 +1265,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 // LOCAL DEBUG (APS5_DEBUG_MISS_STATS): why memoized collects walk, per thread, every 10 s.
 struct MissStats {
     std::uint64_t uncached = 0, uncachedNs = 0, memoHits = 0, missSerial = 0, missEpoch = 0, missNone = 0, missNs = 0, serialChanges = 0, lastSerial = 0;
+    std::uint64_t epochs = 0, lastEpoch = 0, failed = 0;
+    // APS5_DEBUG_MISS_STATS=2: memoized walks by requested range {stop, walks, ns}.
+    std::unordered_map<std::uint64_t, std::array<std::uint64_t, 3>> ranges;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
 thread_local MissStats missStats;
@@ -1277,9 +1280,19 @@ void reportMissStats() {
     const auto now = std::chrono::steady_clock::now();
     if (now - st.last < std::chrono::seconds(10)) return;
     if (st.uncached + st.memoHits + st.missSerial + st.missEpoch + st.missNone != 0) std::fprintf(stderr, "[miss-stats] thread %lu: uncached walks %llu (%.1f ms), memo hits %llu, memoized walks: serial changed %llu, epoch changed %llu, no entry %llu (%.1f ms), unwatch serial changes seen %llu\n", GetCurrentThreadId(), static_cast<unsigned long long>(st.uncached), st.uncachedNs / 1e6, static_cast<unsigned long long>(st.memoHits), static_cast<unsigned long long>(st.missSerial), static_cast<unsigned long long>(st.missEpoch), static_cast<unsigned long long>(st.missNone), st.missNs / 1e6, static_cast<unsigned long long>(st.serialChanges));
+    std::fprintf(stderr, "[miss-stats] thread %lu: epochs %llu, failed walks %llu, distinct walked ranges %zu\n", GetCurrentThreadId(), static_cast<unsigned long long>(st.epochs), static_cast<unsigned long long>(st.failed), st.ranges.size());
+    if (!st.ranges.empty()) {
+        std::vector<std::pair<std::uint64_t, std::array<std::uint64_t, 3>>> top(st.ranges.begin(), st.ranges.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second[2] > b.second[2]; });
+        std::fprintf(stderr, "[miss-stats] thread %lu top walked ranges:", GetCurrentThreadId());
+        for (std::size_t i = 0; i < top.size() && i < 12; ++i) std::fprintf(stderr, " 0x%llx+0x%llx x%llu %.1fms", static_cast<unsigned long long>(top[i].first), static_cast<unsigned long long>(top[i].second[0] - top[i].first), static_cast<unsigned long long>(top[i].second[1]), top[i].second[2] / 1e6);
+        std::fprintf(stderr, "\n");
+    }
     const auto serial = st.lastSerial;
+    const auto lastEpoch = st.lastEpoch;
     st = MissStats{};
     st.lastSerial = serial;
+    st.lastEpoch = lastEpoch;
 }
 
 // Epoch coverage (APS5_DEBUG_COVERAGE=1, local experiment): the merged page ranges this thread walked in
@@ -1368,6 +1381,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             ++st.serialChanges;
             st.lastSerial = unwatched;
         }
+        if (epoch != st.lastEpoch) {
+            ++st.epochs;
+            st.lastEpoch = epoch;
+        }
         if (!useMemo) missKind = 0;
         else {
             missKind = 3;
@@ -1386,15 +1403,28 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     struct MissNote {
         int kind;
         std::chrono::steady_clock::time_point start;
+        std::uint64_t first, stop;
+        bool done = false;
         ~MissNote() {
             if (kind < 0) return;
             auto& st = missStats;
             const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            if (!done) ++st.failed;
             if (kind == 0) { ++st.uncached; st.uncachedNs += ns; }
-            else { (kind == 1 ? st.missSerial : kind == 2 ? st.missEpoch : st.missNone)++; st.missNs += ns; }
+            else {
+                (kind == 1 ? st.missSerial : kind == 2 ? st.missEpoch : st.missNone)++;
+                st.missNs += ns;
+                static const bool detail = [] { const char* text = std::getenv("APS5_DEBUG_MISS_STATS"); return text != nullptr && text[0] == '2'; }();
+                if (detail) {
+                    auto& range = st.ranges[first];
+                    range[0] = std::max(range[0], stop);
+                    ++range[1];
+                    range[2] += ns;
+                }
+            }
             reportMissStats();
         }
-    } missNote{missKind, missStart};
+    } missNote{missKind, missStart, first, stop};
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -1441,6 +1471,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
+    missNote.done = true;
     return tracker.generation;
 }
 
