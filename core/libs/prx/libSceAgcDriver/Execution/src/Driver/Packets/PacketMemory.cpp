@@ -208,7 +208,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
         static const bool unlockedDrain = std::getenv("APS5_NO_UNLOCKED_DRAIN") == nullptr && !drainAll;
 
-        bumpEpoch(&EpochBumps::drains);
+        // LOCAL EXPERIMENT (APS5_DEBUG_NO_DRAIN_BUMP=1): a device drain keeps the collect epoch.
+        static const bool noDrainBump = std::getenv("APS5_DEBUG_NO_DRAIN_BUMP") != nullptr;
+        if (!noDrainBump) bumpEpoch(&EpochBumps::drains);
         std::shared_ptr<VulkanDevice> draining;
         std::uint64_t epoch = 0;
         {
