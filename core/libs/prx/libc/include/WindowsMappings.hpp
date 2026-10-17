@@ -552,10 +552,14 @@ private:
 
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
-        std::vector<std::uintptr_t> written;
+        // The scratch lists are members (Collect holds the mutex): a walk allocates nothing.
+        auto& written = residentWritten;
+        written.clear();
         if (collection != Collection::Fresh) {
-            std::vector<void*> found((stop - first + 4095) / 4096);
-            ULONG_PTR reported = found.size();
+            auto& found = residentFound;
+            const auto pageCount = static_cast<std::size_t>((stop - first + 4095) / 4096);
+            if (found.size() < pageCount) found.resize(pageCount);
+            ULONG_PTR reported = pageCount;
             DWORD granularity = 0;
             if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
             if (run.fresh == 0) {
@@ -895,6 +899,8 @@ private:
     }
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::shared_ptr<Physical>> physical;
     std::map<std::uintptr_t, Run> residentRuns;
+    std::vector<void*> residentFound;
+    std::vector<std::uintptr_t> residentWritten;
     std::map<std::uintptr_t, std::size_t> splitAliases;
     std::size_t granularity = 0x10000;
     bool watchResident = false;
