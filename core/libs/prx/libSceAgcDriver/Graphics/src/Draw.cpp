@@ -1192,12 +1192,29 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
-    fetches.reserve(attributes.size());
-    fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    // The per-draw fetch bookkeeping lives in the thread's scratch (ThreadOwned), not on the heap.
+    struct FetchScratch {
+        std::vector<VertexFetch> fetches;
+        std::vector<std::size_t> fetchValid;
+        std::vector<std::size_t> fetchOf;
+        std::vector<std::shared_ptr<Buffer>> zeroed;
+        std::vector<std::uint8_t> isSolo;
+        std::vector<VertexFetch> plannedFetches;
+        std::vector<std::size_t> plannedOf;
+        std::vector<VkBuffer> rangeHandles;
+        std::vector<VkDeviceSize> rangeOffsets;
+        std::vector<VkBuffer> soloHandles;
+    };
+    thread_local FetchScratch* fetchScratchSlot = nullptr;
+    auto& scratch = ShaderRecompiler::ThreadOwned(fetchScratchSlot);
+    auto& fetches = scratch.fetches;
+    auto& fetchValid = scratch.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
+    auto& fetchOf = scratch.fetchOf;
+    fetchOf.assign(attributes.size(), 0);
+    auto& zeroed = scratch.zeroed;
+    zeroed.assign(attributes.size(), nullptr);
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
         if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
@@ -1217,21 +1234,23 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
-    for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
-    plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    auto& isSolo = scratch.isSolo;
+    isSolo.assign(fetches.size(), 0);
+    for (const auto f : soloFetches) isSolo[f] = 1;
+    auto& plannedFetches = scratch.plannedFetches;
+    plannedFetches.clear();
+    auto& plannedOf = scratch.plannedOf;
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
     const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
-    rangeHandles.reserve(plan.copies.size());
-    rangeOffsets.reserve(plan.copies.size());
+    auto& rangeHandles = scratch.rangeHandles;
+    auto& rangeOffsets = scratch.rangeOffsets;
+    rangeHandles.clear();
+    rangeOffsets.clear();
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1249,7 +1268,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    auto& soloHandles = scratch.soloHandles;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -1316,9 +1336,12 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
     std::vector<ShaderResources::MovedBuffer> moved;
-    ResourceCache::Key contentKey;
+    // The content key: the prepared draw's (which outlives the draw) when it has one, else built here.
+    const ResourceCache::Key* preparedKey = nullptr;
+    ResourceCache::Key builtKey;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
+    const ResourceCache::Key& ContentKey() const { return preparedKey != nullptr ? *preparedKey : builtKey; }
 };
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const PreparedDraw* prepared) {
@@ -1337,9 +1360,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     const bool trimKey = TrimmedDrawKey();
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        if (prepared != nullptr && !prepared->contentKey.empty()) resolved.contentKey = prepared->contentKey;
-        else resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        if (prepared != nullptr && !prepared->contentKey.empty()) resolved.preparedKey = &prepared->contentKey;
+        else resolved.builtKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        if (auto cached = SharedResourceCache().Find(resolved.ContentKey())) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -1353,7 +1376,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
             } else {
-                SharedResourceCache().Remove(resolved.contentKey);
+                SharedResourceCache().Remove(resolved.ContentKey());
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
@@ -2082,6 +2105,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static std::map<std::uint64_t, int> dumped;
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
+    targetViews.reserve(state.colors.size() + 1);
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -2200,7 +2224,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             }
         }
     }
-    const auto& contentKey = resolved.contentKey;
+    const auto& contentKey = resolved.ContentKey();
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
     // The memory-state decision of an indirect draw, made here after the resource build (which may
@@ -2367,7 +2391,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
-        record.targets = owners;
+        // The owners go to the recorder with the draw; the recipe below takes them from `targets`.
+        record.targets = std::move(owners);
+        record.targetSlices.reserve(targets.size());
         for (const auto& binding : targets) record.targetSlices.push_back(binding.color.arraySlice);
         for (const auto& binding : targets) {
             if (binding.proxied) record.proxies.push_back(binding.resident);
@@ -2389,7 +2415,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->key = contentKey;
             recipe->pipeline = pipeline;
             recipe->framebuffer = framebuffer;
-            for (const auto& owner : owners) recipe->targets.emplace_back(owner);
+            for (const auto& binding : targets) recipe->targets.emplace_back(binding.resident);
             recipe->targetViews = targetViews;
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
             recipe->vertexInput = inputs.VertexLayout();

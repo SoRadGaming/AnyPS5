@@ -4958,7 +4958,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             constexpr std::size_t MovedWordBufferSlots = 8;
-            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
+            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
             std::shared_ptr<Buffer> buffer;
             if (held != movedWordBuffers.end()) {
                 buffer = held->buffer;
@@ -4968,7 +4968,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
-                MovedWordBuffer entry{index, override->words, override->size, buffer};
+                MovedWordBuffer entry{index, std::vector<std::uint32_t>(override->words.begin(), override->words.end()), override->size, buffer};
                 if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                 else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
             }
@@ -5147,7 +5147,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+        auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+        guestMemory.InPlaceReads(reads);
+        recorder.NotePendingReads(reads, kind);
     }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
