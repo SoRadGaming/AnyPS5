@@ -1943,13 +1943,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, 0, bound);
     else {
+        // The replay sets stencil references, push blocks and buffer binds of its own: the next
+        // draw records everything. Cleared first, so a throw inside the replay cannot leave a
+        // record that holds what the replay replaced.
+        if (bound != nullptr) bound->Clear();
         recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
         for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
-        // The replay set stencil references, push blocks and buffer binds of its own: the next
-        // draw records everything.
-        if (bound != nullptr) bound->Clear();
     }
-    // The splits bind and set without the record and clear it (Pipeline::ContinueBackFaces).
+    // The splits clear the record, then bind and set without it (Pipeline::ContinueBackFaces).
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state, bound);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);

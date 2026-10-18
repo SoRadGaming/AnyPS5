@@ -58,7 +58,7 @@ public:
     void Continue(VkCommandBuffer commands, const State& state, BoundState* bound = nullptr) const;
     bool SplitsFaces() const { return backFaces != VK_NULL_HANDLE; }
     bool Optimized() const { return optimized != nullptr && optimized->handle.load() != VK_NULL_HANDLE; }
-    // The face and channel splits bind and set without asking the record and then clear it.
+    // The face and channel splits clear the record, then bind and set without asking it.
     void ContinueBackFaces(VkCommandBuffer commands, const State& state, BoundState* bound = nullptr) const;
     bool SplitsSecondChannel() const { return secondChannel != VK_NULL_HANDLE; }
     void ContinueSecondChannel(VkCommandBuffer commands, BoundState* bound = nullptr) const;

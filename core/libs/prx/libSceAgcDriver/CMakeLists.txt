@@ -2065,7 +2065,9 @@ if(BUILD_TESTING)
     endif()
     # LOCAL EXPERIMENT APS5_EXPERIMENT_PASS_STATE_FILTER: draw suites whose passes hold continued
     # draws, face splits, second channels and stencil replays, again with the bound-state filter
-    # (_pass_state_filter, =1) and its count-only form (_pass_state_count, =2). Each case is
+    # (_pass_state_filter, =1) and its count-only form (_pass_state_count, =2). address_passes
+    # asserts that a draw of another pipeline continues the pass and checks its pixels, and
+    # srgb8_color_target checks the pixels of two blends recorded into one pass. Each case is
     # name|test target|argument|extra environment (comma separated).
     set(passStateFilterCases
             "agc_driver_graphics|agc_driver_graphics_tests||"
@@ -2074,7 +2076,9 @@ if(BUILD_TESTING)
             "agc_driver_stencil_replay|agc_driver_stencil_replay_tests||"
             "agc_driver_stencil_replay_no_gpl|agc_driver_stencil_replay_tests||APS5_NO_GPL=1"
             "agc_driver_presentation_pass|agc_driver_presentation_pass_tests||"
-            "agc_driver_draw_cache_reuse|agc_driver_draw_cache_reuse_tests||APS5_VERIFY_DRAW_RECIPE=1,APS5_VERIFY_REGISTER_KEYS=1")
+            "agc_driver_draw_cache_reuse|agc_driver_draw_cache_reuse_tests||APS5_VERIFY_DRAW_RECIPE=1,APS5_VERIFY_REGISTER_KEYS=1"
+            "agc_driver_address_passes|agc_driver_address_passes_tests||"
+            "agc_driver_srgb8_color_target|agc_driver_srgb8_color_target_tests||")
     foreach(passStateFilterCase IN LISTS passStateFilterCases)
         string(REPLACE "|" ";" passStateFilterCase "${passStateFilterCase}")
         list(GET passStateFilterCase 0 passStateFilterName)

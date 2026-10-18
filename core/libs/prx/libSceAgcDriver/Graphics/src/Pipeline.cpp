@@ -887,22 +887,25 @@ void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state, Bou
 
 void Pipeline::ContinueSecondChannel(VkCommandBuffer commands, BoundState* bound) const {
     Require(secondChannel != VK_NULL_HANDLE, "the pipeline blends every channel in one pass");
+    // The second channel's pipeline (static state) stays bound: the next draw records everything.
+    // Cleared before the bind, so a throw cannot leave a record that names another pipeline.
+    if (bound != nullptr) bound->Clear();
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, secondChannel);
     noteBound(context, secondChannel);
-    // The second channel's pipeline (static state) stays bound: the next draw records everything.
-    if (bound != nullptr) bound->Clear();
 }
 
 void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state, BoundState* bound) const {
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
+    // The back faces' pipeline and depth bias stay: the next draw records everything. Cleared
+    // before the bind, so a throw below (HostDepthBiasConstant) cannot leave a record that names
+    // the front faces' pipeline while the back faces' one is bound.
+    if (bound != nullptr) bound->Clear();
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, backFaces);
     noteBound(context, backFaces);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
     if (depthBounds) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
-    // The back faces' pipeline and depth bias stay: the next draw records everything.
-    if (bound != nullptr) bound->Clear();
 }
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes, BoundState* bound) const {
