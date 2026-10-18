@@ -60,10 +60,14 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_ROOM_WAKE): a producer waiting for room waits here instead
+    // of on `idle`, so a pop wakes it only at half depth and wakes a drain only once empty.
+    std::condition_variable room;
     std::deque<Item> items;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
+    std::uint32_t roomWaiters = 0;
     bool committerWaiting = false;
     bool stopped = false;
     bool closing = false;

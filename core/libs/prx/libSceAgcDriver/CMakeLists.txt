@@ -2062,6 +2062,59 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_draw_ahead_verify agc_driver_draw_ahead_small_cache PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT: the draw committer's switches, each on its own: the pipeline's own tests (its
+    # waiters, a failing commit, the stop) and the queue-0 tests that fill, store labels, raise
+    # end-of-pipe interrupts and draw through it. A case is "name|environment" (variables split by
+    # commas); a run is "test|target|argument" ("none" for no argument).
+    set(committerExperimentCases
+            "room_wake|APS5_EXPERIMENT_ROOM_WAKE=1"
+            "room_spin|APS5_EXPERIMENT_ROOM_WAKE=2")
+    set(committerExperimentRuns
+            "draw_pipeline_commits|draw_pipeline_commits|none"
+            "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
+            "draw_pipeline_commits_closing|draw_pipeline_commits|--closing"
+            "pipelined_fill|pipelined_fill|none"
+            "pipelined_dma|pipelined_dma|none"
+            "pipelined_dispatch|pipelined_dispatch|none"
+            "pipelined_predicated_label_order|pipelined_predicated_label_order|none"
+            "unimported_label_order|unimported_label_order|none"
+            "same_queue_label_wait|same_queue_label_wait|none"
+            "queue_zero_late_interrupt|queue_zero_late_interrupt|none"
+            "shutdown_threads_draw_committer|shutdown_threads|--draw-committer"
+            "draw_cache_reuse|draw_cache_reuse|none")
+    add_test(NAME agc_driver_draw_pipeline_commits_failure COMMAND agc_driver_draw_pipeline_commits_tests --failure)
+    add_test(NAME agc_driver_draw_pipeline_commits_closing COMMAND agc_driver_draw_pipeline_commits_tests --closing)
+    set(committerExperimentTests agc_driver_draw_pipeline_commits_failure agc_driver_draw_pipeline_commits_closing)
+    set_tests_properties(${committerExperimentTests} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
+    foreach(committerCase IN LISTS committerExperimentCases)
+        string(REPLACE "|" ";" committerCase "${committerCase}")
+        list(GET committerCase 0 committerCaseName)
+        list(GET committerCase 1 committerCaseEnvironment)
+        string(REPLACE "," ";" committerCaseEnvironment "${committerCaseEnvironment}")
+        foreach(committerRun IN LISTS committerExperimentRuns)
+            string(REPLACE "|" ";" committerRun "${committerRun}")
+            list(GET committerRun 0 committerRunName)
+            list(GET committerRun 1 committerRunTarget)
+            list(GET committerRun 2 committerRunArgument)
+            set(committerTest agc_driver_${committerRunName}_${committerCaseName})
+            if(committerRunArgument STREQUAL "none")
+                add_test(NAME ${committerTest} COMMAND agc_driver_${committerRunTarget}_tests)
+            else()
+                add_test(NAME ${committerTest} COMMAND agc_driver_${committerRunTarget}_tests ${committerRunArgument})
+            endif()
+            set_tests_properties(${committerTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${committerCaseEnvironment}")
+            if(committerRunTarget STREQUAL "draw_cache_reuse")
+                set_property(TEST ${committerTest} APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_DRAW_RECIPE=1" "APS5_VERIFY_REGISTER_KEYS=1")
+                set_tests_properties(${committerTest} PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
+            endif()
+            list(APPEND committerExperimentTests ${committerTest})
+        endforeach()
+    endforeach()
+    set_tests_properties(${committerExperimentTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+    if(WIN32)
+        set_tests_properties(${committerExperimentTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 
     foreach(agcTest IN ITEMS agc_spirv_narrow_constant_store_tests agc_spirv13_image_tests agc_spirv_optimizer_tests agc_driver_constant_store_tests)
         if(NOT TARGET ${agcTest})

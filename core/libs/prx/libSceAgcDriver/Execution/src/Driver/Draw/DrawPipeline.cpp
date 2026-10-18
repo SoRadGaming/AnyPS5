@@ -25,6 +25,19 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_ROOM_WAKE=1): a producer waiting for room is woken once the
+// committer brought the queue down to half its depth instead of after every pop, and a drain only
+// once the queue is empty, so the committer pays one wake per several commits. =2 also spins the
+// producer for the hand-off window before it blocks: a slot usually frees within a commit or two.
+int roomWake() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_ROOM_WAKE");
+        if (text == nullptr) return 0;
+        return std::strtol(text, nullptr, 10) == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
 }
 
 DrawPipeline& DrawPipeline::Queue0() {
@@ -89,9 +102,21 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() < Depth(); });
-        --idleWaiters;
+        if (roomWake() == 0) {
+            ++idleWaiters;
+            idle.wait(lock, [&] { return items.size() < Depth(); });
+            --idleWaiters;
+        } else {
+            if (roomWake() == 2) {
+                // Spun without the lock, as Drain spins; the wait below checks the queue again.
+                lock.unlock();
+                SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) < Depth(); });
+                lock.lock();
+            }
+            ++roomWaiters;
+            room.wait(lock, [&] { return items.size() < Depth(); });
+            --roomWaiters;
+        }
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -183,7 +208,15 @@ void DrawPipeline::run() {
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
             outstanding.fetch_sub(1, std::memory_order_release);
-            if (idleWaiters != 0) idle.notify_all();
+            if (roomWake() == 0) {
+                if (idleWaiters != 0) idle.notify_all();
+            } else {
+                // Only drains wait on `idle` here. Every queued item is popped in turn (a stopped
+                // committer pops without committing), so while a producer waits for room the queue
+                // passes half depth and that pop wakes it.
+                if (idleWaiters != 0 && items.empty()) idle.notify_all();
+                if (roomWaiters != 0 && items.size() <= Depth() / 2) room.notify_all();
+            }
         }
         retire(std::move(done));
     }
