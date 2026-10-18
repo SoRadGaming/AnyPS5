@@ -2987,9 +2987,31 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+    const bool deviceWriter = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
+    const bool drawWriter = !deviceWriter && overlaps(*drawWriters);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRECISE_LABEL_SYNC=1): only a label that lands through a
+    // completion action (CPU-stored behind write-backs) or is still queued by a worker makes the
+    // range wait, not every tracked label while some completion label is pending elsewhere.
+    static const bool preciseLabels = std::getenv("APS5_EXPERIMENT_PRECISE_LABEL_SYNC") != nullptr;
+    const bool labelPending = !deviceWriter && !drawWriter && labels && (preciseLabels ? recorder->CompletionLabelIn(address, bytes) : recorder->PendingLabelIn(address, bytes));
+    if (deviceWriter || drawWriter || labelPending) {
         Recorder::CountSync(4);
+        // LOCAL DEBUG (APS5_DEBUG_SYNC_STATS=1): why dispatch and draw resources wait for the GPU here.
+        static const bool syncStats = std::getenv("APS5_DEBUG_SYNC_STATS") != nullptr;
+        const auto syncStart = syncStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         recorder->SyncThrough(address, bytes);
+        if (syncStats) {
+            static std::atomic<std::uint64_t> counts[3]{}, waitedNs[3]{};
+            static std::atomic<std::int64_t> lastMs{0};
+            const int reason = deviceWriter ? 0 : drawWriter ? 1 : 2;
+            counts[reason].fetch_add(1, std::memory_order_relaxed);
+            waitedNs[reason].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - syncStart).count()), std::memory_order_relaxed);
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto last = lastMs.load();
+            if (nowMs - last >= 10000 && lastMs.compare_exchange_strong(last, nowMs)) {
+                std::fprintf(stderr, "[sync-stats] pending CPU write syncs (10 s): device copied writers %llu (%.1f ms), draw copied writers %llu (%.1f ms), completion labels %llu (%.1f ms)\n", static_cast<unsigned long long>(counts[0].exchange(0)), waitedNs[0].exchange(0) / 1e6, static_cast<unsigned long long>(counts[1].exchange(0)), waitedNs[1].exchange(0) / 1e6, static_cast<unsigned long long>(counts[2].exchange(0)), waitedNs[2].exchange(0) / 1e6);
+            }
+        }
         return true;
     }
     return false;

@@ -318,6 +318,12 @@ bool MemoryProfiled() {
     return profile;
 }
 
+// Memo hits are counted only for the [guestmem] line: a shared atomic bumped on every hit by every
+// collecting thread moves its cache line between them millions of times per second.
+void noteCollectMemoHit() {
+    if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+}
+
 class TimedAccess {
 public:
     TimedAccess(MemoryCounterKind kind, std::uint64_t bytes) : kind(kind), bytes(bytes), start(MemoryProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
@@ -1280,7 +1286,7 @@ void reportMissStats() {
     const auto now = std::chrono::steady_clock::now();
     if (now - st.last < std::chrono::seconds(10)) return;
     if (st.uncached + st.memoHits + st.missSerial + st.missEpoch + st.missNone != 0) std::fprintf(stderr, "[miss-stats] thread %lu: uncached walks %llu (%.1f ms), memo hits %llu, memoized walks: serial changed %llu, epoch changed %llu, no entry %llu (%.1f ms), unwatch serial changes seen %llu\n", GetCurrentThreadId(), static_cast<unsigned long long>(st.uncached), st.uncachedNs / 1e6, static_cast<unsigned long long>(st.memoHits), static_cast<unsigned long long>(st.missSerial), static_cast<unsigned long long>(st.missEpoch), static_cast<unsigned long long>(st.missNone), st.missNs / 1e6, static_cast<unsigned long long>(st.serialChanges));
-    std::fprintf(stderr, "[miss-stats] thread %lu: epochs %llu, failed walks %llu, distinct walked ranges %zu\n", GetCurrentThreadId(), static_cast<unsigned long long>(st.epochs), static_cast<unsigned long long>(st.failed), st.ranges.size());
+    std::fprintf(stderr, "[miss-stats] thread %lu (queue tag 0x%x): epochs %llu, failed walks %llu, distinct walked ranges %zu\n", GetCurrentThreadId(), GpuLockThreadTag(), static_cast<unsigned long long>(st.epochs), static_cast<unsigned long long>(st.failed), st.ranges.size());
     if (!st.ranges.empty()) {
         std::vector<std::pair<std::uint64_t, std::array<std::uint64_t, 3>>> top(st.ranges.begin(), st.ranges.end());
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second[2] > b.second[2]; });
@@ -1351,14 +1357,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         if (epochCoverageEnabled() && epochCovers(epoch, unwatched, first, stop)) {
-            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            noteCollectMemoHit();
             if (missStatsEnabled()) ++missStats.memoHits;
             return tracker.generation.load(std::memory_order_relaxed);
         }
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                noteCollectMemoHit();
                 if (missStatsEnabled()) ++missStats.memoHits;
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -1368,7 +1374,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                noteCollectMemoHit();
                 if (missStatsEnabled()) ++missStats.memoHits;
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -1429,7 +1435,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                noteCollectMemoHit();
                 return tracker.generation;
             }
         }
@@ -1897,7 +1903,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
         return entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
-        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        noteCollectMemoHit();
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;

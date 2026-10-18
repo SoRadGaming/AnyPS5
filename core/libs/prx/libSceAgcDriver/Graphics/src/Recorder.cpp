@@ -1122,6 +1122,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     }
 }
 
+
 Recorder::~Recorder() {
     try {
         Sync();
@@ -2630,6 +2631,7 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 }
 
+
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
@@ -2705,7 +2707,10 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     differing.clear();
     spans.clear();
     const bool sole = entry.buffer.use_count() == 1;
-    GuestMemory::ChangedBlocks(address, bytes, generations, changed);
+    static const bool snapshotStatsCpu = std::getenv("APS5_DEBUG_SNAPSHOT_STATS") != nullptr;
+    thread_local std::vector<std::uint8_t> cpuStamped;
+    if (snapshotStatsCpu) cpuStamped.assign(count, 1);
+    GuestMemory::ChangedBlocks(address, bytes, generations, changed, snapshotStatsCpu ? std::span<std::uint8_t>(cpuStamped) : std::span<std::uint8_t>{});
     for (std::size_t k = 0; k < count; ++k) {
         if (changed[k] == GuestMemory::BlockUnchanged) continue;
         const auto from = std::max(address, aligned + k * block);
@@ -2715,6 +2720,34 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     }
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
+    // LOCAL DEBUG (APS5_DEBUG_SNAPSHOT_STATS=1): what the refresh compares, every 10 s.
+    static const bool snapshotStats = std::getenv("APS5_DEBUG_SNAPSHOT_STATS") != nullptr;
+    if (snapshotStats) {
+        static std::atomic<std::uint64_t> refreshes{0}, soles{0}, blocks{0}, equalBlocks{0}, compared{0}, totalBytes{0}, cpuBlocks{0}, cpuEqual{0};
+        std::size_t spanIndex = 0;
+        for (std::size_t k = 0; k < count; ++k) {
+            if (changed[k] == GuestMemory::BlockUnchanged) continue;
+            if (cpuStamped[k] != 0) {
+                cpuBlocks.fetch_add(1, std::memory_order_relaxed);
+                if (equal[spanIndex] != 0) cpuEqual.fetch_add(1, std::memory_order_relaxed);
+            }
+            ++spanIndex;
+        }
+        static std::atomic<std::int64_t> lastMs{0};
+        refreshes.fetch_add(1, std::memory_order_relaxed);
+        if (sole) soles.fetch_add(1, std::memory_order_relaxed);
+        blocks.fetch_add(spans.size(), std::memory_order_relaxed);
+        totalBytes.fetch_add(bytes, std::memory_order_relaxed);
+        for (std::size_t k = 0; k < spans.size(); ++k) {
+            compared.fetch_add(spans[k].bytes, std::memory_order_relaxed);
+            if (equal[k] != 0) equalBlocks.fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastMs.load();
+        if (nowMs - last >= 10000 && lastMs.compare_exchange_strong(last, nowMs)) {
+            std::fprintf(stderr, "[snapshot-stats] refreshes %llu (sole %llu), snapshot bytes %.1f MiB, blocks compared %llu (%.1f MiB), equal %llu; CPU-stamped %llu (equal %llu)\n", static_cast<unsigned long long>(refreshes.exchange(0)), static_cast<unsigned long long>(soles.exchange(0)), totalBytes.exchange(0) / 1048576.0, static_cast<unsigned long long>(blocks.exchange(0)), compared.exchange(0) / 1048576.0, static_cast<unsigned long long>(equalBlocks.exchange(0)), static_cast<unsigned long long>(cpuBlocks.exchange(0)), static_cast<unsigned long long>(cpuEqual.exchange(0)));
+        }
+    }
     for (std::size_t k = 0; k < spans.size(); ++k) {
         if (equal[k] != 0) continue;
         const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - held.data());
