@@ -1418,16 +1418,74 @@ void notePassStart(std::size_t kind, bool fenced) {
     std::fwrite(line.data(), 1, line.size(), stderr);
 }
 
+// APS5_EXPERIMENT_PASS_STATE_FILTER: the tallies of the passes' bound-state records, added up as
+// each pass ends or starts and reported every 10 s. Every caller holds GuestMemory::GpuMutex, as
+// for any recording, so plain counters do.
+std::array<std::array<std::uint64_t, 2>, static_cast<std::size_t>(BoundState::Call::Count)> passStateCalls{};
+std::chrono::steady_clock::time_point passStateReported{};
+
+void foldPassState(BoundState& bound) {
+    for (std::size_t call = 0; call < passStateCalls.size(); ++call) {
+        passStateCalls[call][0] += bound.tally[call][0];
+        passStateCalls[call][1] += bound.tally[call][1];
+    }
+    bound.tally = {};
+    const auto now = std::chrono::steady_clock::now();
+    if (passStateReported == std::chrono::steady_clock::time_point{}) {
+        passStateReported = now;
+        return;
+    }
+    if (now - passStateReported < std::chrono::seconds(10)) return;
+    passStateReported = now;
+    static constexpr const char* names[] = {"pipeline", "viewport", "scissor", "library", "sets", "push", "vertex", "index"};
+    static_assert(std::size(names) == static_cast<std::size_t>(BoundState::Call::Count));
+    std::string line = Recorder::PassStateFilter() == 2 ? "[pass-state] (10 s, count only) repeated of all:" : "[pass-state] (10 s) left out of all:";
+    for (std::size_t call = 0; call < passStateCalls.size(); ++call) {
+        char text[64];
+        const auto repeated = passStateCalls[call][0];
+        std::snprintf(text, sizeof(text), " %s %llu/%llu", names[call], static_cast<unsigned long long>(repeated), static_cast<unsigned long long>(repeated + passStateCalls[call][1]));
+        line += text;
+    }
+    line += '\n';
+    std::fwrite(line.data(), 1, line.size(), stderr);
+    passStateCalls = {};
+}
+
+}
+
+int Recorder::PassStateFilter() {
+    static const int mode = [] {
+        const char* value = std::getenv("APS5_EXPERIMENT_PASS_STATE_FILTER");
+        if (value == nullptr || value[0] == '0') return 0;
+        return value[0] == '2' ? 2 : 1;
+    }();
+    return mode;
+}
+
+BoundState* Recorder::PassBoundState() {
+    const int mode = PassStateFilter();
+    if (mode == 0 || open == nullptr) return nullptr;
+    auto& bound = open->renderPass.bound;
+    bound.countOnly = mode == 2;
+    return &bound;
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
+    // A new pass starts with an empty bound-state record: nothing it holds is known yet (the end
+    // of the previous pass cleared it already, unless a draw failed between start and leave).
+    const auto clearBound = [&] {
+        if (PassStateFilter() == 0) return;
+        foldPassState(open->renderPass.bound);
+        open->renderPass.bound.Clear();
+    };
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         notePassStart(!pass.open ? PassNotOpen : PassForced, fenced);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
+        clearBound();
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
@@ -1442,6 +1500,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
+    clearBound();
     return {commands, false, !elide};
 }
 
@@ -1472,6 +1531,8 @@ void Recorder::endOpenRenderPass(bool barrier) {
     EndGpuTiming(pass.timing);
     open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
+    // The reset below also clears the bound-state record: the next pass starts knowing nothing.
+    if (PassStateFilter() != 0) foldPassState(pass.bound);
     pass = {};
 }
 

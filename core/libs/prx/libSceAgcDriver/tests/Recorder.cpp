@@ -8678,6 +8678,341 @@ void denormalClearTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// Counts the vkCmd* calls the bound-state filter decides on in Pipeline (binds, viewport and
+// scissor, the library state, push constants), forwarding each to the device: the context's entry
+// point table is swapped for one of counting shims while the object lives.
+class BoundStateCalls {
+public:
+    enum Entry : std::size_t { BindPipeline = 0, Viewport, Scissor, Library, Push, EntryCount };
+    explicit BoundStateCalls(Context& context) : context(context), previous(context.functions) {
+        Require(active == nullptr, "nested bound-state call counts");
+        if (previous != nullptr) functions = *previous;
+        install<&DeviceFunctions::cmdBindPipeline, BindPipeline, 0>("vkCmdBindPipeline");
+        install<&DeviceFunctions::cmdSetViewport, Viewport, 1>("vkCmdSetViewport");
+        install<&DeviceFunctions::cmdSetScissor, Scissor, 2>("vkCmdSetScissor");
+        install<&DeviceFunctions::cmdPushConstants, Push, 3>("vkCmdPushConstants");
+        install<&DeviceFunctions::cmdSetDepthBias, Library, 4>("vkCmdSetDepthBias");
+        install<&DeviceFunctions::cmdSetDepthBounds, Library, 5>("vkCmdSetDepthBounds");
+        install<&DeviceFunctions::cmdSetStencilCompareMask, Library, 6>("vkCmdSetStencilCompareMask");
+        install<&DeviceFunctions::cmdSetStencilWriteMask, Library, 7>("vkCmdSetStencilWriteMask");
+        install<&DeviceFunctions::cmdSetStencilReference, Library, 8>("vkCmdSetStencilReference");
+        // The extended dynamic state is enabled with the pipeline libraries only.
+        if (context.graphicsPipelineLibrary) {
+            install<&DeviceFunctions::cmdSetCullMode, Library, 9>("vkCmdSetCullModeEXT");
+            install<&DeviceFunctions::cmdSetFrontFace, Library, 10>("vkCmdSetFrontFaceEXT");
+            install<&DeviceFunctions::cmdSetDepthTestEnable, Library, 11>("vkCmdSetDepthTestEnableEXT");
+            install<&DeviceFunctions::cmdSetDepthWriteEnable, Library, 12>("vkCmdSetDepthWriteEnableEXT");
+            install<&DeviceFunctions::cmdSetDepthCompareOp, Library, 13>("vkCmdSetDepthCompareOpEXT");
+            install<&DeviceFunctions::cmdSetDepthBoundsTestEnable, Library, 14>("vkCmdSetDepthBoundsTestEnableEXT");
+            install<&DeviceFunctions::cmdSetStencilTestEnable, Library, 15>("vkCmdSetStencilTestEnableEXT");
+            install<&DeviceFunctions::cmdSetStencilOp, Library, 16>("vkCmdSetStencilOpEXT");
+        }
+        context.functions = &functions;
+        active = this;
+    }
+    ~BoundStateCalls() {
+        context.functions = previous;
+        active = nullptr;
+    }
+    BoundStateCalls(const BoundStateCalls&) = delete;
+    BoundStateCalls& operator=(const BoundStateCalls&) = delete;
+    void Reset() { counts = {}; }
+    std::size_t Total() const {
+        std::size_t total = 0;
+        for (const auto count : counts) total += count;
+        return total;
+    }
+    std::array<std::size_t, EntryCount> counts{};
+
+private:
+    template<typename TFunction>
+    struct Forward;
+    template<typename... TArgs>
+    struct Forward<void (VKAPI_PTR*)(TArgs...)> {
+        template<std::size_t Index, std::size_t Slot>
+        static VKAPI_ATTR void VKAPI_CALL Call(TArgs... args) {
+            ++active->counts[Index];
+            reinterpret_cast<void (VKAPI_PTR*)(TArgs...)>(active->real[Slot])(args...);
+        }
+    };
+    template<auto Member, std::size_t Index, std::size_t Slot>
+    void install(const char* name) {
+        const auto resolved = context.Resolved(Member, name);
+        using Function = std::remove_const_t<decltype(resolved)>;
+        real[Slot] = reinterpret_cast<PFN_vkVoidFunction>(resolved);
+        functions.*Member = &Forward<Function>::template Call<Index, Slot>;
+    }
+    Context& context;
+    const DeviceFunctions* previous;
+    DeviceFunctions functions{};
+    std::array<PFN_vkVoidFunction, 17> real{};
+    static inline BoundStateCalls* active = nullptr;
+};
+
+// The bound-state record's own decisions for descriptor sets, push constants, vertex and index
+// buffers and the dynamic states a pipeline bind keeps or forgets. Without `countOnly` a call that
+// repeats what the record holds is left out; with it every call records.
+void boundStateRecordTests(bool countOnly) {
+    using Dynamic = BoundState::Dynamic;
+    BoundState record;
+    record.countOnly = countOnly;
+    const bool skips = !countOnly;
+    const auto handle = [](std::uintptr_t value) { return value; };
+    const auto layoutA = reinterpret_cast<VkPipelineLayout>(handle(0x1000));
+    const auto layoutB = reinterpret_cast<VkPipelineLayout>(handle(0x2000));
+    const auto pipelineA = reinterpret_cast<VkPipeline>(handle(0x3000));
+    const auto pipelineB = reinterpret_cast<VkPipeline>(handle(0x4000));
+    const auto setA = reinterpret_cast<VkDescriptorSet>(handle(0x5000));
+    const auto setB = reinterpret_cast<VkDescriptorSet>(handle(0x6000));
+    Require(record.ChangesSet(layoutA, 0, setA) && record.ChangesSet(layoutA, 1, setB), "a first set bind was left out");
+    Require(record.ChangesSet(layoutA, 0, setA) != skips && record.ChangesSet(layoutA, 1, setB) != skips, "a repeated set bind was not decided by the record");
+    Require(record.ChangesSet(layoutB, 0, setA), "a set bound under another layout was left out");
+    Require(record.ChangesSet(layoutA, 1, setB), "a set that a bind under another layout may have disturbed was left out");
+    std::array<std::byte, BoundState::PushBytes> block{};
+    Require(record.ChangesPush(layoutA, VK_SHADER_STAGE_VERTEX_BIT, block), "a first push was left out");
+    Require(record.ChangesPush(layoutA, VK_SHADER_STAGE_VERTEX_BIT, block) != skips, "a repeated push was not decided by the record");
+    Require(record.ChangesPush(layoutA, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, block), "a push for other stages was left out");
+    block[7] = std::byte{1};
+    Require(record.ChangesPush(layoutA, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, block), "a push of other bytes was left out");
+    Require(record.ChangesPipeline(pipelineA, layoutB, true, false, false), "a first pipeline bind was left out");
+    Require(record.ChangesPush(layoutA, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, block), "a push the bind of another layout's pipeline may have disturbed was left out");
+    Require(record.ChangesSet(layoutA, 1, setB), "a set the bind of another layout's pipeline may have disturbed was left out");
+    Require(record.ChangesPipeline(pipelineA, layoutB, true, false, false) != skips, "a repeated pipeline bind was not decided by the record");
+    const VkViewport viewport{0, 0, 8, 8, 0, 1};
+    const VkCullModeFlags back = VK_CULL_MODE_BACK_BIT;
+    const std::array<float, 3> bias{1.0f, 0.0f, 2.0f};
+    Require(record.Changes(Dynamic::Viewport, viewport) && record.Changes(Dynamic::CullMode, back) && record.Changes(Dynamic::DepthBias, bias), "a first dynamic state was left out");
+    Require(record.Changes(Dynamic::Viewport, viewport) != skips && record.Changes(Dynamic::CullMode, back) != skips && record.Changes(Dynamic::DepthBias, bias) != skips, "a repeated dynamic state was not decided by the record");
+    Require(record.Changes(Dynamic::CullMode, VkCullModeFlags{VK_CULL_MODE_FRONT_BIT}) && record.Changes(Dynamic::CullMode, back), "another cull mode was left out");
+    // A whole pipeline that keeps depth bias dynamic: viewport and depth bias stay, the cull mode
+    // (static there) is forgotten.
+    Require(record.ChangesPipeline(pipelineB, layoutB, false, true, false), "a whole pipeline's bind was left out");
+    Require(record.Changes(Dynamic::Viewport, viewport) != skips && record.Changes(Dynamic::DepthBias, bias) != skips, "a whole pipeline's bind forgot a state it keeps dynamic");
+    Require(record.Changes(Dynamic::CullMode, back), "a whole pipeline's bind kept a state it declares static");
+    Require(record.ChangesPipeline(pipelineA, layoutB, false, false, false), "a whole pipeline's bind was left out");
+    Require(record.Changes(Dynamic::DepthBias, bias), "a whole pipeline's bind kept a depth bias it declares static");
+    const std::array<VkBuffer, 3> buffers{reinterpret_cast<VkBuffer>(handle(0x7000)), reinterpret_cast<VkBuffer>(handle(0x8000)), reinterpret_cast<VkBuffer>(handle(0x9000))};
+    const std::array<VkDeviceSize, 3> offsets{0, 16, 32};
+    const auto vertex = [&](std::size_t count, std::span<const VkDeviceSize> at) { return record.ChangesVertexBuffers(std::span(buffers.data(), count), at.first(count)); };
+    Require(vertex(2, offsets), "a first vertex buffer bind was left out");
+    Require(vertex(2, offsets) != skips, "a repeated vertex buffer bind was not decided by the record");
+    Require(vertex(1, offsets) != skips, "a bind of fewer slots than the record holds was not decided by the record");
+    Require(vertex(3, offsets), "a bind of a slot the record does not hold was left out");
+    const std::array<VkDeviceSize, 3> moved{0, 48, 32};
+    Require(vertex(2, moved), "a vertex buffer bind at another offset was left out");
+    std::array<VkBuffer, BoundState::VertexSlots + 1> many{};
+    many.fill(buffers[0]);
+    const std::array<VkDeviceSize, BoundState::VertexSlots + 1> manyOffsets{};
+    Require(record.ChangesVertexBuffers(many, manyOffsets), "a bind of more slots than the record follows was left out");
+    Require(record.ChangesVertexBuffers(std::span(many.data(), 1), std::span(manyOffsets.data(), 1)), "the record kept slots a bind of more than it follows overwrote");
+    Require(record.ChangesIndexBuffer(buffers[0], 0, VK_INDEX_TYPE_UINT16), "a first index buffer bind was left out");
+    Require(record.ChangesIndexBuffer(buffers[0], 0, VK_INDEX_TYPE_UINT16) != skips, "a repeated index buffer bind was not decided by the record");
+    Require(record.ChangesIndexBuffer(buffers[0], 0, VK_INDEX_TYPE_UINT32) && record.ChangesIndexBuffer(buffers[0], 4, VK_INDEX_TYPE_UINT32) && record.ChangesIndexBuffer(buffers[1], 4, VK_INDEX_TYPE_UINT32), "an index buffer bind of another type, offset or buffer was left out");
+    record.Clear();
+    Require(record.countOnly == countOnly, "clearing the record changed its mode");
+    Require(record.ChangesPipeline(pipelineA, layoutB, false, false, false) && record.Changes(Dynamic::Viewport, viewport) && record.ChangesSet(layoutB, 0, setA) && record.ChangesPush(layoutB, VK_SHADER_STAGE_VERTEX_BIT, block) && vertex(1, offsets) && record.ChangesIndexBuffer(buffers[1], 4, VK_INDEX_TYPE_UINT32), "a cleared record left a call out");
+    Require(record.tally[static_cast<std::size_t>(BoundState::Call::Index)][0] == 1 && record.tally[static_cast<std::size_t>(BoundState::Call::Index)][1] == 5, "the record miscounted repeated index buffer binds");
+}
+
+// LOCAL EXPERIMENT APS5_EXPERIMENT_PASS_STATE_FILTER (registered unset, =1 and =2): with the
+// filter a draw continuing the open pass records only what its predecessors did not bind or set,
+// and what the record does not follow clears it: the pass's end, a new batch, a pipeline with
+// static state (its library states), a face split and a second channel. Unset and under =2 every
+// call records (=2 still counts the repeats).
+int boundStateTests(const Device& device, Recorder& recorder) {
+    const int mode = Recorder::PassStateFilter();
+    const bool filters = mode == 1;
+    boundStateRecordTests(false);
+    boundStateRecordTests(true);
+    if (!device.Graphics()) {
+        std::cout << "skipped, the device has no graphics queue\n";
+        return 77;
+    }
+    auto context = device.GetContext();
+    BoundStateCalls calls(context);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedPipelines(device); }
+    } cleanup{context.device};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 31;
+    fragment.variantId = 32;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color = ColorTarget{0, {8, 8}, VK_FORMAT_R8G8B8A8_UNORM, 8 * 8 * 4, 0};
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    state.renderExtent = {8, 8};
+    state.viewport = {0, 0, 8, 8, 0, 1};
+    state.scissor = {{0, 0}, {8, 8}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    ShaderResources resources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0);
+    VertexInputLayout input;
+    auto culledState = state;
+    culledState.cullMode = VK_CULL_MODE_BACK_BIT;
+    // The alternate component order with a separate alpha blend: a whole pipeline (static state)
+    // with a second channel, even where pipelines are built from libraries.
+    auto splitState = state;
+    splitState.colors.front().componentMapping = 0xecu;
+    splitState.blends.front().blendEnable = VK_TRUE;
+    splitState.blends.front().srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    splitState.blends.front().dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    splitState.blends.front().srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    splitState.blends.front().dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    auto faceState = state;
+    faceState.depth = DepthTarget{0, 0, {8, 8}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    faceState.depthBias = true;
+    faceState.depthBiasPerFace = true;
+    faceState.depthBiasConstant = 1.0f;
+    faceState.backDepthBiasConstant = 2.0f;
+    Pipeline first(context, state, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Pipeline culled(context, culledState, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Pipeline split(context, splitState, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Pipeline faces(context, faceState, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Require(split.SplitsSecondChannel() && faces.SplitsFaces(), "the split pipelines do not split");
+    // The optimized pipelines are ready before the first bind, so every draw binds the same handle.
+    WaitForOptimizedPipelines(context.device);
+    RenderTarget target(context, state.color, false);
+    const std::array<VkImageView, 1> views{target.View()};
+    const std::array<std::shared_ptr<StorageTexture>, 1> owners{};
+    const auto framebuffer = first.AcquireFramebuffer(views, owners, state.renderExtent);
+    {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = target.Image();
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(recorder.Commands(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+    // Pipelines built from libraries set 17 library states; whole ones set none here (no depth).
+    const std::size_t library = context.graphicsPipelineLibrary ? 17u : 0u;
+    // Only pipeline layouts of library pipelines have push constant ranges for these shaders.
+    const bool pushes = context.graphicsPipelineLibrary;
+    const std::array<std::byte, PipelinePushConstantBytes> block{};
+    constexpr std::uint64_t key = 0xb0d5;
+    const auto expect = [&](std::size_t filtered, std::size_t full, const char* what) {
+        if (calls.Total() == (filters ? filtered : full)) return;
+        throw std::runtime_error(std::string("AGC graphics: ") + what + ": " + std::to_string(calls.Total()) + " calls recorded, expected " + std::to_string(filters ? filtered : full));
+    };
+    const auto begin = [&](const char* what) {
+        const auto start = recorder.StartDrawPass(key, false, false, PassAccess{});
+        Require(!start.continued, what);
+        auto* bound = recorder.PassBoundState();
+        Require((bound != nullptr) == (mode != 0), "the bound-state record is handed out without the switch, or withheld under it");
+        if (bound != nullptr) Require(bound->held.pipeline == VK_NULL_HANDLE && bound->held.known == 0 && bound->held.pushLayout == VK_NULL_HANDLE && bound->held.vertexSlots == 0 && !bound->held.indexKnown, "a pass started with a filled bound-state record");
+        calls.Reset();
+        first.Begin(start.commands, *framebuffer, state.renderExtent, state, bound);
+        if (pushes) first.PushConstants(start.commands, VK_SHADER_STAGE_VERTEX_BIT, block, bound);
+        expect(3 + library + (pushes ? 2 : 0), 3 + library + (pushes ? 2 : 0), what);
+        recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
+        return bound;
+    };
+    const auto next = [&](BoundState* bound) {
+        const auto start = recorder.StartDrawPass(key, false, false, PassAccess{});
+        Require(start.continued, "a draw into the open pass did not continue it");
+        Require(recorder.PassBoundState() == bound, "a continued draw got another bound-state record");
+        calls.Reset();
+        return start.commands;
+    };
+    auto* bound = begin("the first draw continued a pass");
+    {
+        const auto before = bound != nullptr ? bound->tally : decltype(bound->tally){};
+        const auto commands = next(bound);
+        first.Continue(commands, state, bound);
+        if (pushes) first.PushConstants(commands, VK_SHADER_STAGE_VERTEX_BIT, block, bound);
+        expect(0, 3 + library + (pushes ? 2 : 0), "an identical continued draw");
+        if (bound != nullptr) {
+            const auto repeated = [&](BoundState::Call call) { return bound->tally[static_cast<std::size_t>(call)][0] - before[static_cast<std::size_t>(call)][0]; };
+            Require(repeated(BoundState::Call::Pipeline) == 1 && repeated(BoundState::Call::Viewport) == 1 && repeated(BoundState::Call::Scissor) == 1 && repeated(BoundState::Call::Library) == library && repeated(BoundState::Call::Push) == (pushes ? 1u : 0u), "the record did not count every call of an identical draw as a repeat");
+        }
+        recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
+    }
+    {
+        // Another pipeline that differs in its cull mode alone: its bind and (from libraries) the
+        // cull mode; its push constants follow another layout.
+        const auto commands = next(bound);
+        culled.Continue(commands, culledState, bound);
+        expect(1 + (library != 0 ? 1 : 0), 3 + library, "a continued draw of another cull mode");
+        if (pushes) {
+            calls.Reset();
+            culled.PushConstants(commands, VK_SHADER_STAGE_VERTEX_BIT, block, bound);
+            expect(2, 2, "a push under another pipeline's layout");
+            calls.Reset();
+            culled.PushConstants(commands, VK_SHADER_STAGE_VERTEX_BIT, block, bound);
+            expect(0, 2, "a repeated push");
+            auto changed = block;
+            changed[4] = std::byte{1};
+            calls.Reset();
+            culled.PushConstants(commands, VK_SHADER_STAGE_VERTEX_BIT, changed, bound);
+            expect(2, 2, "a push of other bytes");
+        }
+        recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
+    }
+    {
+        // A pipeline with static state: its bind alone (viewport and scissor are dynamic in every
+        // pipeline), after which a library pipeline sets its library states again.
+        const auto commands = next(bound);
+        split.Continue(commands, splitState, bound);
+        expect(1, 3, "a continued draw of a whole pipeline");
+        calls.Reset();
+        first.Continue(commands, state, bound);
+        expect(1 + library, 3 + library, "a library pipeline's draw after a whole pipeline's");
+        recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
+    }
+    {
+        // A second channel clears the record: the next draw records everything.
+        const auto commands = next(bound);
+        split.Continue(commands, splitState, bound);
+        split.ContinueSecondChannel(commands, bound);
+        if (bound != nullptr) Require(bound->held.pipeline == VK_NULL_HANDLE && bound->held.known == 0, "a second channel did not clear the bound-state record");
+        calls.Reset();
+        first.Continue(commands, state, bound);
+        expect(3 + library, 3 + library, "a draw after a second channel");
+        recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
+    }
+    // The pass's end clears the record, and so does a new batch.
+    static_cast<void>(recorder.Commands());
+    if (bound != nullptr) Require(recorder.PassBoundState() == bound && bound->held.pipeline == VK_NULL_HANDLE && bound->held.known == 0, "the end of a pass did not clear its bound-state record");
+    bound = begin("a draw after the end of the pass continued it");
+    {
+        const auto commands = next(bound);
+        first.Continue(commands, state, bound);
+        expect(0, 3 + library, "an identical draw in the second pass");
+        recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
+    }
+    recorder.Submit();
+    static_cast<void>(begin("the first draw of a new batch continued a pass"));
+    // A face split clears the record (recorded outside a pass: binds and dynamic state need none).
+    {
+        const auto commands = recorder.Commands();
+        BoundState local;
+        local.countOnly = !filters;
+        calls.Reset();
+        faces.Continue(commands, faceState, &local);
+        expect(4, 4, "a whole pipeline with depth bias");
+        calls.Reset();
+        faces.Continue(commands, faceState, &local);
+        expect(0, 4, "a repeated whole pipeline with depth bias");
+        faces.ContinueBackFaces(commands, faceState, &local);
+        Require(local.held.pipeline == VK_NULL_HANDLE && local.held.known == 0, "a face split did not clear the bound-state record");
+        calls.Reset();
+        faces.Continue(commands, faceState, &local);
+        expect(4, 4, "a draw after a face split");
+    }
+    recorder.Sync();
+    std::cout << "Bound-state filter tests passed (" << (mode == 0 ? "switch unset" : mode == 1 ? "filter" : "count only") << ", " << (context.graphicsPipelineLibrary ? "pipeline libraries" : "whole pipelines") << ")\n";
+    return 0;
+}
+
 void pipelineLibraryTests(const Device& device) {
     std::lock_guard gpu(GpuMutex());
     const auto& context = device.GetContext();
@@ -9202,6 +9537,7 @@ int main(int argc, char** argv) {
             fmaskDecompressMsaaTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--bound-state-only") return boundStateTests(device, recorder);
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
             drawDescriptorWriteTests(device, recorder);
             drawSnapshotTableSetTests(device, recorder);

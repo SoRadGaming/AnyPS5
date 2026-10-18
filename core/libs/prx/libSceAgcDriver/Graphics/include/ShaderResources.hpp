@@ -158,6 +158,10 @@ public:
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    // The sets Bind binds (VK_NULL_HANDLE for none), for a draw that leaves out repeated binds
+    // (APS5_EXPERIMENT_PASS_STATE_FILTER).
+    VkDescriptorSet MainSet() const { return _set; }
+    VkDescriptorSet FragmentSet() const { return fragment.set; }
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;

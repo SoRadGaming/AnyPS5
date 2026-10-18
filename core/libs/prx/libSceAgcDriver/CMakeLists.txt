@@ -1165,6 +1165,21 @@ if(BUILD_TESTING)
         set_tests_properties(agc_pipeline_library agc_pipeline_library_off agc_pipeline_library_fast_only PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT APS5_EXPERIMENT_PASS_STATE_FILTER: the bound-state record with the switch
+    # unset, on (=1, also with whole pipelines only) and counting only (=2).
+    add_test(NAME agc_bound_state COMMAND agc_driver_recorder_tests --bound-state-only)
+    add_test(NAME agc_bound_state_filter COMMAND agc_driver_recorder_tests --bound-state-only)
+    add_test(NAME agc_bound_state_filter_no_gpl COMMAND agc_driver_recorder_tests --bound-state-only)
+    add_test(NAME agc_bound_state_count COMMAND agc_driver_recorder_tests --bound-state-only)
+    set_tests_properties(agc_bound_state agc_bound_state_filter agc_bound_state_filter_no_gpl agc_bound_state_count PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_bound_state PROPERTIES ENVIRONMENT_MODIFICATION "APS5_EXPERIMENT_PASS_STATE_FILTER=unset:")
+    set_tests_properties(agc_bound_state_filter PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PASS_STATE_FILTER=1")
+    set_tests_properties(agc_bound_state_filter_no_gpl PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PASS_STATE_FILTER=1;APS5_NO_GPL=1")
+    set_tests_properties(agc_bound_state_count PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PASS_STATE_FILTER=2")
+    if(WIN32)
+        set_property(TEST agc_bound_state agc_bound_state_filter agc_bound_state_filter_no_gpl agc_bound_state_count APPEND PROPERTY ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file PROPERTIES ENVIRONMENT_MODIFICATION
@@ -2072,6 +2087,48 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_stencil_replay_no_gpl PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT APS5_EXPERIMENT_PASS_STATE_FILTER: draw suites whose passes hold continued
+    # draws, face splits, second channels and stencil replays, again with the bound-state filter
+    # (_pass_state_filter, =1) and its count-only form (_pass_state_count, =2). address_passes
+    # asserts that a draw of another pipeline continues the pass and checks its pixels, and
+    # srgb8_color_target checks the pixels of two blends recorded into one pass. Each case is
+    # name|test target|argument|extra environment (comma separated).
+    set(passStateFilterCases
+            "agc_driver_graphics|agc_driver_graphics_tests||"
+            "agc_driver_alpha_to_coverage_state|agc_driver_graphics_tests|--alpha-to-coverage-state|"
+            "agc_driver_depth_bias_per_face|agc_driver_depth_bias_per_face_tests||"
+            "agc_driver_stencil_replay|agc_driver_stencil_replay_tests||"
+            "agc_driver_stencil_replay_no_gpl|agc_driver_stencil_replay_tests||APS5_NO_GPL=1"
+            "agc_driver_presentation_pass|agc_driver_presentation_pass_tests||"
+            "agc_driver_draw_cache_reuse|agc_driver_draw_cache_reuse_tests||APS5_VERIFY_DRAW_RECIPE=1,APS5_VERIFY_REGISTER_KEYS=1"
+            "agc_driver_address_passes|agc_driver_address_passes_tests||"
+            "agc_driver_srgb8_color_target|agc_driver_srgb8_color_target_tests||")
+    foreach(passStateFilterCase IN LISTS passStateFilterCases)
+        string(REPLACE "|" ";" passStateFilterCase "${passStateFilterCase}")
+        list(GET passStateFilterCase 0 passStateFilterName)
+        list(GET passStateFilterCase 1 passStateFilterTarget)
+        list(GET passStateFilterCase 2 passStateFilterArgument)
+        list(GET passStateFilterCase 3 passStateFilterExtra)
+        string(REPLACE "," ";" passStateFilterExtra "${passStateFilterExtra}")
+        foreach(passStateFilterMode IN ITEMS filter count)
+            set(passStateFilterValue 1)
+            if(passStateFilterMode STREQUAL "count")
+                set(passStateFilterValue 2)
+            endif()
+            set(passStateFilterTest "${passStateFilterName}_pass_state_${passStateFilterMode}")
+            add_test(NAME ${passStateFilterTest} COMMAND ${passStateFilterTarget} ${passStateFilterArgument})
+            set_tests_properties(${passStateFilterTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_PASS_STATE_FILTER=${passStateFilterValue}"
+                SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            if(passStateFilterExtra)
+                set_property(TEST ${passStateFilterTest} APPEND PROPERTY ENVIRONMENT ${passStateFilterExtra})
+            endif()
+            if(WIN32)
+                set_tests_properties(${passStateFilterTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endif()
+        endforeach()
+    endforeach()
+    set_tests_properties(agc_driver_draw_cache_reuse_pass_state_filter agc_driver_draw_cache_reuse_pass_state_count PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
     add_test(NAME agc_driver_pipelined_dispatch_item COMMAND agc_driver_pipelined_dispatch_tests)
     set_tests_properties(agc_driver_pipelined_dispatch_item PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_DISPATCH=1" SKIP_RETURN_CODE 77)
     if(WIN32)

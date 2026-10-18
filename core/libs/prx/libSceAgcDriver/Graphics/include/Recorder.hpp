@@ -5,10 +5,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <unordered_map>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <type_traits>
 #include <array>
 #include <deque>
 #include <mutex>
@@ -43,6 +46,142 @@ public:
 private:
     std::shared_ptr<Buffer> chunk;
     VkDeviceSize cursor = 0;
+};
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PASS_STATE_FILTER): what the draws of the open render pass
+// bound and set last, so a draw that continues the pass records only the binds and the dynamic
+// state that differ from what its predecessors left (Recorder::PassBoundState hands it to the
+// draw). This is exact because inside an open pass only a draw records (every other recorder goes
+// through Recorder::Commands, which ends the pass first), and a bound pipeline, dynamic state,
+// descriptor sets, push constants and vertex and index buffers stay in the command buffer until
+// they are changed, or, for a dynamic state, until a pipeline that declares the state static is
+// bound (ChangesPipeline forgets those). Anything the record does not know makes the next call
+// record. The pass's end, a new batch and every pass start clear it, and so do the draws that
+// bind or set what it does not follow (a face split, a second channel, a stencil replay). Under
+// =2 every call still records and the record only counts the calls it would have left out.
+struct BoundState {
+    // The kinds of call counted on the [pass-state] line.
+    enum class Call : std::uint8_t { Pipeline = 0, Viewport, Scissor, Library, Sets, Push, Vertex, Index, Count };
+    // The dynamic states a draw sets, by their bit in `known`: viewport and scissor (every
+    // pipeline) and the 17 calls of a pipeline built from libraries (Pipeline::setLibraryState),
+    // whose depth bias and depth bounds a whole pipeline also keeps dynamic when it uses them.
+    enum class Dynamic : std::uint8_t { Viewport = 0, Scissor, CullMode, FrontFace, DepthBias, DepthBounds, DepthTest, DepthWrite, DepthCompare, DepthBoundsTest, StencilTest, StencilOpFront, StencilOpBack, CompareMaskFront, CompareMaskBack, WriteMaskFront, WriteMaskBack, ReferenceFront, ReferenceBack, Count };
+    struct StencilOps {
+        VkStencilOp fail;
+        VkStencilOp pass;
+        VkStencilOp depthFail;
+        VkCompareOp compare;
+    };
+    // PipelinePushConstantBytes (Shaders.hpp, checked in Pipeline.cpp).
+    static constexpr std::size_t PushBytes = 256;
+    // Vertex buffer slots the record follows; a bind of more forgets them all.
+    static constexpr std::size_t VertexSlots = 32;
+    static constexpr std::uint32_t Bit(Dynamic which) { return 1u << static_cast<std::uint32_t>(which); }
+
+    // What the command buffer holds (Clear forgets it all).
+    struct Held {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::uint32_t known = 0;
+        std::array<std::array<std::uint32_t, 6>, static_cast<std::size_t>(Dynamic::Count)> dynamic{};
+        std::array<VkDescriptorSet, 2> sets{};
+        std::array<VkPipelineLayout, 2> setLayouts{};
+        VkPipelineLayout pushLayout = VK_NULL_HANDLE;
+        VkShaderStageFlags pushStages = 0;
+        std::array<std::byte, PushBytes> push{};
+        std::size_t vertexSlots = 0;
+        std::array<VkBuffer, VertexSlots> vertexBuffers{};
+        std::array<VkDeviceSize, VertexSlots> vertexOffsets{};
+        bool indexKnown = false;
+        VkBuffer indexBuffer = VK_NULL_HANDLE;
+        VkDeviceSize indexOffset = 0;
+        VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+    } held;
+    // =2: every call records, the record only counts (set by Recorder::PassBoundState).
+    bool countOnly = false;
+    // Per kind of call: [0] the calls whose value the record already held, [1] the others. The
+    // recorder adds them to the [pass-state] report when the pass ends.
+    std::array<std::array<std::uint64_t, 2>, static_cast<std::size_t>(Call::Count)> tally{};
+
+    void Clear() { held = {}; }
+    // Whether a call whose value equals the record's (`same`) may be left out.
+    bool Skip(Call call, bool same) {
+        ++tally[static_cast<std::size_t>(call)][same ? 0 : 1];
+        return same && !countOnly;
+    }
+    // Whether the bind of `pipeline` must be recorded. A recorded bind of a pipeline not built
+    // from libraries replaces every library state but viewport and scissor (and depth bias and
+    // bounds when it keeps them dynamic). Sets and push constants recorded under another layout
+    // are forgotten too: a compatible layout would keep them, but the record cannot tell.
+    bool ChangesPipeline(VkPipeline pipeline, VkPipelineLayout layout, bool libraries, bool depthBias, bool depthBounds) {
+        if (Skip(Call::Pipeline, held.pipeline == pipeline)) return false;
+        held.pipeline = pipeline;
+        if (!libraries) held.known &= Bit(Dynamic::Viewport) | Bit(Dynamic::Scissor) | (depthBias ? Bit(Dynamic::DepthBias) : 0u) | (depthBounds ? Bit(Dynamic::DepthBounds) : 0u);
+        if (held.pushLayout != layout) held.pushLayout = VK_NULL_HANDLE;
+        for (std::size_t index = 0; index < held.sets.size(); ++index) {
+            if (held.setLayouts[index] != layout) held.sets[index] = VK_NULL_HANDLE;
+        }
+        return true;
+    }
+    // Whether the call that sets `which` to `value` must be recorded; the record then holds it.
+    template<typename TValue>
+    bool Changes(Dynamic which, const TValue& value) {
+        static_assert(std::is_trivially_copyable_v<TValue> && sizeof(TValue) <= sizeof(held.dynamic[0]));
+        const auto& slot = held.dynamic[static_cast<std::size_t>(which)];
+        const bool same = (held.known & Bit(which)) != 0 && std::memcmp(slot.data(), &value, sizeof(TValue)) == 0;
+        if (Skip(which == Dynamic::Viewport ? Call::Viewport : which == Dynamic::Scissor ? Call::Scissor : Call::Library, same)) return false;
+        Note(which, value);
+        return true;
+    }
+    // A call recorded without asking (the stencil reference of both faces at once).
+    template<typename TValue>
+    void Note(Dynamic which, const TValue& value) {
+        static_assert(std::is_trivially_copyable_v<TValue> && sizeof(TValue) <= sizeof(held.dynamic[0]));
+        std::memcpy(held.dynamic[static_cast<std::size_t>(which)].data(), &value, sizeof(TValue));
+        held.known |= Bit(which);
+    }
+    // Whether the bind of `set` at `index` under `layout` must be recorded. A bind under a layout
+    // other than the one another index was bound with may disturb that index, which is forgotten.
+    bool ChangesSet(VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set) {
+        const bool followed = index < held.sets.size();
+        if (Skip(Call::Sets, followed && held.sets[index] == set && held.setLayouts[index] == layout)) return false;
+        for (std::size_t other = 0; other < held.sets.size(); ++other) {
+            if (other != index && held.setLayouts[other] != layout) held.sets[other] = VK_NULL_HANDLE;
+        }
+        if (followed) {
+            held.sets[index] = set;
+            held.setLayouts[index] = layout;
+        }
+        return true;
+    }
+    bool ChangesPush(VkPipelineLayout layout, VkShaderStageFlags stages, std::span<const std::byte, PushBytes> bytes) {
+        if (Skip(Call::Push, held.pushLayout == layout && held.pushStages == stages && std::memcmp(held.push.data(), bytes.data(), PushBytes) == 0)) return false;
+        held.pushLayout = layout;
+        held.pushStages = stages;
+        std::memcpy(held.push.data(), bytes.data(), PushBytes);
+        return true;
+    }
+    // A bind of buffers.size() slots from slot 0; the slots after them keep what they held.
+    bool ChangesVertexBuffers(std::span<const VkBuffer> buffers, std::span<const VkDeviceSize> offsets) {
+        const auto count = buffers.size();
+        const bool same = count <= held.vertexSlots && offsets.size() >= count && std::equal(buffers.begin(), buffers.end(), held.vertexBuffers.begin()) && std::equal(offsets.begin(), offsets.begin() + count, held.vertexOffsets.begin());
+        if (Skip(Call::Vertex, same)) return false;
+        if (count > VertexSlots || offsets.size() < count) {
+            held.vertexSlots = 0;
+            return true;
+        }
+        std::copy(buffers.begin(), buffers.end(), held.vertexBuffers.begin());
+        std::copy(offsets.begin(), offsets.begin() + count, held.vertexOffsets.begin());
+        held.vertexSlots = std::max(held.vertexSlots, count);
+        return true;
+    }
+    bool ChangesIndexBuffer(VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
+        if (Skip(Call::Index, held.indexKnown && held.indexBuffer == buffer && held.indexOffset == offset && held.indexType == type)) return false;
+        held.indexKnown = true;
+        held.indexBuffer = buffer;
+        held.indexOffset = offset;
+        held.indexType = type;
+        return true;
+    }
 };
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
@@ -87,6 +226,13 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    // LOCAL EXPERIMENT APS5_EXPERIMENT_PASS_STATE_FILTER (see BoundState): 0 unset, 1 the filter,
+    // 2 count only (=0 is unset too). With it StartDrawPass clears the record at every pass start
+    // and the [pass-state] line reports, every 10 s, the calls that repeated what the pass held.
+    static int PassStateFilter();
+    // The open pass's record, for the draw StartDrawPass just placed (null when the switch is
+    // unset or no batch is open).
+    BoundState* PassBoundState();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -669,6 +815,8 @@ private:
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
+            // What the pass's draws bound and set (see BoundState; followed only under the switch).
+            BoundState bound;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
