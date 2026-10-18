@@ -50,6 +50,8 @@ private:
     };
     DrawPipeline() = default;
     void run();
+    void retire(Item&& item);
+    void reap();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
 
@@ -64,6 +66,11 @@ private:
     bool stopped = false;
     bool closing = false;
     std::thread thread;
+    std::mutex retireMutex;
+    std::condition_variable reapWake;
+    std::deque<Item> retired;
+    std::thread reaper;
+    bool reaperWaiting = false;
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;
