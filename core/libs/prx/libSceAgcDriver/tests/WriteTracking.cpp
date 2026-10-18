@@ -666,6 +666,7 @@ void CheckVersionRanges() {
         void* memory;
         ~Cleanup() {
 #ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
             GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
 #else
             GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
@@ -725,6 +726,7 @@ void CheckCollectBoundaries() {
         void* memory;
         ~Cleanup() {
 #ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
             GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
 #else
             Unwatch(reinterpret_cast<std::uint64_t>(memory), bytes);
@@ -780,7 +782,10 @@ void CheckWidenedCollectBesideUncommittedPages() {
     void* range = GuestArena::GuestArenaAllocate_nid_postfix(reserved, Block);
     struct Cleanup {
         void* range;
-        ~Cleanup() { GuestArena::GuestArenaRelease_nid_postfix(range, reserved); }
+        ~Cleanup() {
+            GuestArena::GuestArenaReset_nid_postfix(range, reserved);
+            GuestArena::GuestArenaRelease_nid_postfix(range, reserved);
+        }
     } cleanup{range};
     void* memory = static_cast<std::uint8_t*>(range) + reserved - Block;
     MEMORY_BASIC_INFORMATION tail{};
