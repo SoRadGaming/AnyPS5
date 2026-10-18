@@ -350,6 +350,23 @@ void CheckWatchedMiddleStore() {
 }
 #endif
 
+void CheckCoarseRuns() {
+    constexpr std::size_t bytes = 192 * Block;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    BumpCollectEpoch();
+    const auto collected = CollectWrites(base, bytes);
+    Require(collected != 0 && UnchangedSince(base, bytes, collected), "a range nothing wrote after its collect reports a change");
+    const auto stored = MarkWritten(base + bytes / 2, 4);
+    Require(stored > collected && !UnchangedSince(base, bytes, collected), "a driver store inside whole 4 MiB runs of the range is not seen");
+    Require(UnchangedSince(base, bytes / 2, collected), "a driver store after a range made it changed");
+    Require(UnchangedSince(base, bytes, stored), "a range checked at its newest stamp reports a change");
+    static_cast<volatile std::uint8_t*>(memory)[bytes - 1] = 0x22;
+    CollectWritesUncached(base + bytes - Block, Block);
+    Require(!UnchangedSince(base, bytes, stored), "a CPU store into the last block of the range is not seen");
+}
+
 #ifdef _WIN32
 void CheckDeferredSharedImports() {
     constexpr std::size_t bytes = 4 * Block;
@@ -1097,6 +1114,7 @@ int main() {
         CheckWatchOverlaps();
         CheckWatchedMiddleStore();
 #endif
+        CheckCoarseRuns();
 #ifdef _WIN32
         CheckDeferredSharedImports();
         CheckPrivateMappingReuse();
