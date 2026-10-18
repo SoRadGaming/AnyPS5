@@ -180,6 +180,30 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 }
             }
         }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_TARGETED_SYNC=1): a DMA store into the GDS waits only
+        // for the recorded work that writes the GDS (every GDS binding is writable, so a pending
+        // write of its range names every unfinished user) and for its source range, instead of
+        // draining the device; the store itself then runs on the CPU (Pm4::Execute, GuestMemory::Write).
+        static const bool gdsTargeted = std::getenv("APS5_EXPERIMENT_GDS_TARGETED_SYNC") != nullptr;
+        if (drained && gdsTargeted && opcode == 0x50 && packet.size() >= 7 && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) {
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                // Waited for without the mutex where the recorder allows it (as the drain does), so
+                // the other workers keep recording; the recorder is looked up again after each wait.
+                if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(Pm4::GdsAddress(), Pm4::GdsBytes, true);
+                const auto source = Pm4::DmaSource(packet);
+                if (source != Pm4::DmaSelectGds && source != 2) {
+                    const auto from = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+                    const auto bytes = Pm4::DmaBytes(packet);
+                    Graphics::StorageTexture::FlushPending(from, bytes, nullptr, "GDS store source", Graphics::PublishScope::Whole);
+                    if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(from, bytes, true);
+                }
+                orderedAlready = true;
+                drained = false;
+            }
+        }
         if (drained) ++storesDrained;
     }
 
