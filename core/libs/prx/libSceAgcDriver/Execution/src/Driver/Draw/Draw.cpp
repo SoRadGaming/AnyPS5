@@ -647,6 +647,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+        if (exactBatchCap()) drawCountedAtCommit() = true;
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -672,6 +673,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     return drawn();
 }
 
+bool Driver::exactBatchCap() {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_EXACT_BATCH_CAP=1): the packet loop counts every draw toward
+    // the batch cap (APS5_BATCH_CAP) when it handles the packet, which for a pipelined draw is
+    // before the committer recorded it, so a batch closed up to a pipeline depth of draws early.
+    // The commit counts the draw instead, right after recording it and before its submit check.
+    static const bool exact = std::getenv("APS5_EXPERIMENT_EXACT_BATCH_CAP") != nullptr;
+    return exact;
+}
+
+bool& Driver::drawCountedAtCommit() {
+    static thread_local bool counted = false;
+    return counted;
+}
+
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const Graphics::PreparedDraw* prepared) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -679,10 +694,13 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
+        bool countWork;
         ~SubmitDue() noexcept(false) {
-            if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            if (std::uncaught_exceptions() != 0) return;
+            if (countWork) Graphics::Recorder::CountRecordedWork();
+            driver.submitDueAfterCommit(device.get());
         }
-    } submitDue{*this, localDevice};
+    } submitDue{*this, localDevice, exactBatchCap()};
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
     if (recipe != nullptr) {

@@ -415,7 +415,10 @@ void Driver::execute(const Submission& submission) {
             }
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
-        if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
+        if (drawPacket || (sampleDump && wroteOnGpu)) {
+            // A draw the committer counts itself (APS5_EXPERIMENT_EXACT_BATCH_CAP) is not counted here.
+            if (!(exactBatchCap() && std::exchange(drawCountedAtCommit(), false))) Graphics::Recorder::CountRecordedWork();
+        }
         timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();
