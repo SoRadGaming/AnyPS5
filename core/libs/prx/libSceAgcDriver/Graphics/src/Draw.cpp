@@ -1729,20 +1729,47 @@ struct Kept {
     std::unique_ptr<DeviceBuffer> scratch;
 };
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_BINDINGS, COMMITTER-PLAN S7): a recorded draw keeps the
+// objects consecutive draws share (template, pipeline, framebuffer, targets) once per batch
+// (Recorder::KeepOnce) and only its own copies per draw, and its pass image lists live in the
+// thread's scratch; see ShaderResources.cpp for the template's side.
+bool ReplayBindings() {
+    static const bool enabled = std::getenv("APS5_EXPERIMENT_REPLAY_BINDINGS") != nullptr;
+    return enabled;
+}
+
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::uint32_t> slices, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
-    auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
-    kept->pipeline = std::move(pipeline);
-    kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
-    kept->scratch = std::move(scratch);
-    kept->targets = std::move(targets);
-    const auto& residents = kept->targets;
-    recorder.Keep(kept);
+    std::shared_ptr<Kept> kept;
+    if (ReplayBindings()) {
+        // The draw's own copies first and the template last, as a Kept releases them (a batch
+        // releases its kept objects front to back). An object a draw earlier in the batch kept is
+        // not kept again: the batch holds it until it completes either way.
+        if (inputs.indices != nullptr || !inputs.vertexBuffers.empty() || scratch != nullptr) {
+            auto copies = std::make_shared<Kept>();
+            copies->indices = std::move(inputs.indices);
+            copies->vertexBuffers = std::move(inputs.vertexBuffers);
+            copies->scratch = std::move(scratch);
+            recorder.Keep(std::move(copies));
+        }
+        for (const auto& target : targets) recorder.KeepOnce(target);
+        recorder.KeepOnce(framebuffer);
+        recorder.KeepOnce(pipeline);
+        recorder.KeepOnce(resources);
+    } else {
+        kept = std::make_shared<Kept>();
+        kept->resources = resources;
+        kept->pipeline = std::move(pipeline);
+        kept->framebuffer = std::move(framebuffer);
+        kept->indices = std::move(inputs.indices);
+        kept->vertexBuffers = std::move(inputs.vertexBuffers);
+        kept->scratch = std::move(scratch);
+        kept->targets = std::move(targets);
+        recorder.Keep(kept);
+    }
+    const auto& residents = kept != nullptr ? kept->targets : targets;
     if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
@@ -1990,8 +2017,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
+    // APS5_EXPERIMENT_REPLAY_BINDINGS (COMMITTER-PLAN S7): the image lists go into the thread's
+    // scratch like passReads (the pass hazards copy what they keep), not into new vectors per draw.
+    std::vector<std::pair<VkImage, bool>> ownImages;
+    std::vector<std::pair<VkImage, bool>> ownAttachments;
+    struct PassImagesTag {};
+    struct PassAttachmentsTag {};
+    auto& passImages = ReplayBindings() ? ThreadScratch<std::vector<std::pair<VkImage, bool>>, PassImagesTag>() : ownImages;
+    auto& passAttachments = ReplayBindings() ? ThreadScratch<std::vector<std::pair<VkImage, bool>>, PassAttachmentsTag>() : ownAttachments;
+    resources.StorageImages(passImages);
+    passAttachments.clear();
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);

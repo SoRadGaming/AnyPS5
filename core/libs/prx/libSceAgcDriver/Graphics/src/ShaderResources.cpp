@@ -2070,6 +2070,19 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
     return result;
 }
 
+namespace {
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_BINDINGS, COMMITTER-PLAN S7): what every use of a template
+// derived again from its fixed build is derived once: PrepareDrawBindings' pool sizes come from the
+// build (DrawSetSizes), and Revalidate skips its CompletePendingCpuWrites loops when no call of
+// them could do anything (pendingCpuWritesPossible).
+bool ReplayBindings() {
+    static const bool enabled = std::getenv("APS5_EXPERIMENT_REPLAY_BINDINGS") != nullptr;
+    return enabled;
+}
+
+}
+
 void ShaderResources::buildComplete() {
     PerformanceTimer frameTiming("Resources.Complete");
     Require(!completed, "cannot update a published descriptor heap");
@@ -2200,6 +2213,14 @@ void ShaderResources::buildComplete() {
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
+        // APS5_EXPERIMENT_REPLAY_BINDINGS: the bindings are final now, and so are the pool sizes
+        // every PrepareDrawBindings of this object would compute from them.
+        if (ReplayBindings() && (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) && !usesBda) {
+            DrawSetSizes sized;
+            describeDrawSets(sized.sizes, sized.described);
+            for (std::size_t set = 0; set < sized.variable.size(); ++set) sized.variable[set] = drawVariableCount(set);
+            drawSetSizes = std::move(sized);
+        }
         completed = true;
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -3017,6 +3038,20 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     return false;
 }
 
+namespace {
+
+// Whether some CompletePendingCpuWrites call could sync: false exactly when its checks that do not
+// depend on the range return false (inside a completion, no recorder, or no copied writer of the
+// device or of a draw and no completion label pending), so every call would return at once.
+bool pendingCpuWritesPossible(const Context& context) {
+    if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
+    if (Recorder::PendingCompletionLabels() != 0) return true;
+    if (context.copiedWriters != nullptr && !context.copiedWriters->empty()) return true;
+    return !DrawCopiedWriters()->empty();
+}
+
+}
+
 const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage) {
     for (const auto& shader : shaders) {
         if (shader.stage != stage || shader.program == nullptr) continue;
@@ -3032,14 +3067,18 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    for (const auto& range : describedRanges) {
-        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
-        if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
-    }
-    for (const auto& image : storageTextures) {
-        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-        if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    // APS5_EXPERIMENT_REPLAY_BINDINGS: the loops only when a call can sync. While no call can, none
+    // syncs, so nothing they could change moves between the gate and the calls it skips.
+    if (!ReplayBindings() || pendingCpuWritesPossible(context)) {
+        for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        for (const auto& range : describedRanges) {
+            CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
+            if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+        }
+        for (const auto& image : storageTextures) {
+            CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+            if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        }
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
@@ -5063,6 +5102,25 @@ std::span<std::byte> ShaderResources::DrawBindings::Snapshot::Contents() const {
     return sliced ? buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes) : buffer->Bytes();
 }
 
+void ShaderResources::describeDrawSets(std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) const {
+    for (auto& sizes : counts) sizes.clear();
+    for (const auto& binding : bindings) {
+        const auto set = setOf(binding);
+        described[set] = true;
+        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+        if (count == 0) continue;
+        auto& sizes = counts[set];
+        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+        if (held != sizes.end()) held->descriptorCount += count;
+        else sizes.push_back({binding.layout.descriptorType, count});
+    }
+    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+}
+
+std::optional<std::uint32_t> ShaderResources::drawVariableCount(std::size_t set) const {
+    return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt;
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     struct ReadsTag {};
@@ -5174,23 +5232,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    // APS5_EXPERIMENT_REPLAY_BINDINGS: the sizes the build kept (DrawSetSizes), else computed here.
+    const auto* sized = drawSetSizes.has_value() ? &*drawSetSizes : nullptr;
     std::array<bool, 2> described{};
     struct CountsTag {};
     auto& counts = ThreadScratch<std::array<std::vector<VkDescriptorPoolSize>, 2>, CountsTag>();
-    for (auto& sizes : counts) sizes.clear();
-    for (const auto& binding : bindings) {
-        const auto set = setOf(binding);
-        described[set] = true;
-        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
-        if (count == 0) continue;
-        auto& sizes = counts[set];
-        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
-        if (held != sizes.end()) held->descriptorCount += count;
-        else sizes.push_back({binding.layout.descriptorType, count});
-    }
-    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
-    const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
-    const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
+    if (sized != nullptr) described = sized->described;
+    else describeDrawSets(counts, described);
+    const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(sized != nullptr ? sized->sizes[set] : counts[set]); };
+    const auto variableOf = [&](std::size_t set) { return sized != nullptr ? sized->variable[set] : drawVariableCount(set); };
     result->cache = context.descriptorCache;
     if (described[0] || splitSets) {
         result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
@@ -5319,13 +5369,18 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
+    StorageImages(images);
+    return images;
+}
+
+void ShaderResources::StorageImages(std::vector<std::pair<VkImage, bool>>& images) const {
+    images.clear();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageTextures[index] != nullptr) images.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
     }
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
     }
-    return images;
 }
 
 bool ShaderResources::HasCachedStorageImages() const {

@@ -2584,6 +2584,11 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
 
+bool Recorder::noteKeptOnce(const void* object) {
+    ensureOpen();
+    return open->keptOnce.insert(object).second;
+}
+
 SnapshotArena::Slice SnapshotArena::Allocate(const Context& context, std::size_t bytes) {
     Require(bytes != 0 && bytes <= InputLimit, "a draw snapshot slice must hold 1 to InputLimit bytes");
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 64);

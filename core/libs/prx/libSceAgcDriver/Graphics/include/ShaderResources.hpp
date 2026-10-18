@@ -246,6 +246,8 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.InPlaceReads(out); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
+    // The same into `out` (cleared first), for a caller that keeps the vector between uses.
+    void StorageImages(std::vector<std::pair<VkImage, bool>>& out) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
@@ -586,6 +588,19 @@ private:
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    // PrepareDrawBindings' pool sizes per set (by descriptor type, sorted), whether a binding of
+    // the object lies in the set, and the variable count of the set's image table, all fixed once
+    // the build completed. describeDrawSets and drawVariableCount compute them from the bindings;
+    // under APS5_EXPERIMENT_REPLAY_BINDINGS (COMMITTER-PLAN S7) the build keeps them here instead
+    // of every draw recomputing them.
+    struct DrawSetSizes {
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        std::array<bool, 2> described{};
+        std::array<std::optional<std::uint32_t>, 2> variable{};
+    };
+    std::optional<DrawSetSizes> drawSetSizes;
+    void describeDrawSets(std::array<std::vector<VkDescriptorPoolSize>, 2>& sizes, std::array<bool, 2>& described) const;
+    std::optional<std::uint32_t> drawVariableCount(std::size_t set) const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
