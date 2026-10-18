@@ -393,6 +393,24 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     }
     static const bool noLabelBump = std::getenv("APS5_DEBUG_NO_LABEL_BUMP") != nullptr;
     if (endOfPipeInterrupt && !noLabelBump) bumpEpoch(&EpochBumps::drains);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_LABEL_COALESCE=1): the label rides on the newest queued draw
+    // or label when the committer has not started it (DrawPipeline::AppendLabel), so it needs no
+    // slot, closure or hold of its own and never waits for room. It still runs right after its
+    // predecessor in the stream, and the pipeline answers waits on it until it ran.
+    static const bool coalesce = std::getenv("APS5_EXPERIMENT_LABEL_COALESCE") != nullptr;
+    if (coalesce) {
+        static const bool registered = [] {
+            DrawPipeline::Queue0().SetLabelCommit([](const DrawPipeline::LabelPart& label) {
+                GuestMemory::SetCurrentPacket(label.opcode, label.queue);
+                Get().commitLabel(label.queue, label.address, label.bytes, label.endOfPipeInterrupt);
+            });
+            return true;
+        }();
+        static_cast<void>(registered);
+        DrawPipeline::LabelPart part{queue, opcode, address, std::move(bytes), endOfPipeInterrupt};
+        if (DrawPipeline::Queue0().AppendLabel(part)) return true;
+        bytes = std::move(part.bytes);
+    }
     auto stored = bytes;
     DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
         GuestMemory::SetCurrentPacket(opcode, queue);

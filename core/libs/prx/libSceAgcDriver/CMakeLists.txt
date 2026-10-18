@@ -2070,7 +2070,9 @@ if(BUILD_TESTING)
             "room_wake|APS5_EXPERIMENT_ROOM_WAKE=1"
             "room_spin|APS5_EXPERIMENT_ROOM_WAKE=2"
             "exact_batch_cap|APS5_EXPERIMENT_EXACT_BATCH_CAP=1,APS5_BATCH_CAP=2"
-            "commit_runs|APS5_EXPERIMENT_COMMIT_RUNS=1")
+            "commit_runs|APS5_EXPERIMENT_COMMIT_RUNS=1"
+            "label_coalesce|APS5_EXPERIMENT_LABEL_COALESCE=1"
+            "committer_all|APS5_EXPERIMENT_ROOM_WAKE=2,APS5_EXPERIMENT_EXACT_BATCH_CAP=1,APS5_BATCH_CAP=2,APS5_EXPERIMENT_COMMIT_RUNS=1,APS5_EXPERIMENT_LABEL_COALESCE=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

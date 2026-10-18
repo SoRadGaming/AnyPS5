@@ -51,6 +51,27 @@ public:
     // check itself; LabelReapDue lets only the run's first label reap finished batches.
     static bool DeferToRunEnd(void (*check)());
     static bool LabelReapDue();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_LABEL_COALESCE=1): a label queued behind a draw or a label
+    // the committer has not started rides on that item instead of taking a slot of its own. It runs
+    // right after the item's commit, inside the same GPU-mutex hold, through the committer the
+    // driver registered (no closure per label), and until then it is one of the item's writes for
+    // PendingLabel, Overlaps and OverlapsAny, the item's newest.
+    struct LabelPart {
+        std::uint32_t queue = 0;
+        std::uint32_t opcode = 0;
+        std::uint64_t address = 0;
+        std::vector<std::byte> bytes;
+        bool endOfPipeInterrupt = false;
+    };
+    using LabelCommit = void (*)(const LabelPart& label);
+    static constexpr std::size_t MaxAppendedLabels = 8;
+    void SetLabelCommit(LabelCommit commit) { labelCommit.store(commit, std::memory_order_release); }
+    // Appends the label to the newest queued item and moves from it; false, leaving it as it was,
+    // when that item may already be running (fewer than two items queued), is not a draw or a
+    // label, already carries MaxAppendedLabels, when the pipeline is closing or no committer is
+    // registered: the caller then enqueues the label as an item of its own. Like Enqueue, it first
+    // rethrows the failure of an earlier commit.
+    bool AppendLabel(LabelPart& label);
 
 private:
     struct Item {
@@ -59,6 +80,9 @@ private:
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
         ItemKind kind = ItemKind::Other;
+        // Appended labels, in the order they were queued; only the producer adds them, under the
+        // mutex and only while the item is not the front, so the committer reads them unlocked.
+        std::vector<LabelPart> labels;
     };
     struct CommitRun;
     DrawPipeline() = default;
@@ -102,6 +126,8 @@ private:
     std::uint64_t depthSum = 0;
     std::uint64_t runs = 0;
     std::uint64_t runCommits = 0;
+    std::atomic<LabelCommit> labelCommit{nullptr};
+    std::uint64_t labelsAppended = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

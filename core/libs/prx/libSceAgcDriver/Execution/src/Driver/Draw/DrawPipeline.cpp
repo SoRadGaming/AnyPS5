@@ -67,6 +67,13 @@ struct CommitOutcome {
     bool shutdown = false;
 };
 
+// The bytes a label appended to an item stores (APS5_EXPERIMENT_LABEL_COALESCE); an end-of-pipe
+// label that stores nothing is the empty range at 0, which overlaps nothing.
+DrawPipeline::Range labelRange(const DrawPipeline::LabelPart& label) {
+    if (label.bytes.empty()) return {0, 0};
+    return {label.address, label.address + label.bytes.size()};
+}
+
 template<typename TWork>
 CommitOutcome guarded(TWork&& work) {
     CommitOutcome outcome;
@@ -178,7 +185,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -216,8 +223,13 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::snprintf(item, sizeof(item), "; %llu commit runs of %.1f commits on average", static_cast<unsigned long long>(runs), static_cast<double>(runCommits) / static_cast<double>(runs));
         drainText += item;
     }
+    if (labelsAppended != 0) {
+        char item[80];
+        std::snprintf(item, sizeof(item), "; %llu labels appended to queued commits", static_cast<unsigned long long>(labelsAppended));
+        drainText += item;
+    }
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = runs = runCommits = 0;
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = runs = runCommits = labelsAppended = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -246,10 +258,20 @@ void DrawPipeline::run() {
 DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
     const auto start = std::chrono::steady_clock::now();
     auto outcome = guarded([&] {
-        if (front != nullptr) {
-            PerformanceTimer itemTiming("Committer.Item");
+        if (front == nullptr) return;
+        PerformanceTimer itemTiming("Committer.Item");
+        if (front->labels.empty()) {
             front->commit();
+            return;
         }
+        // Labels appended to the item (APS5_EXPERIMENT_LABEL_COALESCE) run right after its commit,
+        // in the order they were queued, inside one GPU-mutex hold with it; a commit or label that
+        // throws skips the labels after it, as a stopped pipeline skips label items.
+        GuestMemory::TagGpuLockSite(front->kind == ItemKind::Label ? GuestMemory::GpuLockSite::Label : GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        front->commit();
+        const auto commitLabel = labelCommit.load(std::memory_order_acquire);
+        for (const auto& label : front->labels) commitLabel(label);
     });
     const auto finished = std::chrono::steady_clock::now();
     auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - start).count());
@@ -410,6 +432,16 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        // Appended labels run after the item's own commit, the newest last: newest first, they are
+        // the item's newest writes.
+        for (auto label = item->labels.rbegin(); label != item->labels.rend(); ++label) {
+            const auto [begin, limit] = labelRange(*label);
+            if (address >= limit || begin >= end) continue;
+            if (address < begin || end > limit) return std::nullopt;
+            std::uint64_t value = 0;
+            std::memcpy(&value, label->bytes.data() + (address - begin), bytes);
+            return value;
+        }
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
         if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;
@@ -428,11 +460,18 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
         low = std::min(low, begin);
         high = std::max(high, end);
     }
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t limit) {
+        if (begin >= high || limit <= low) return false;
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < limit && begin < range.second; });
+    };
     std::lock_guard lock(mutex);
     for (const auto& item : items) {
         for (const auto& [begin, limit] : item.writes) {
-            if (begin >= high || limit <= low) continue;
-            if (std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < limit && begin < range.second; })) return true;
+            if (overlaps(begin, limit)) return true;
+        }
+        for (const auto& label : item.labels) {
+            const auto [begin, limit] = labelRange(label);
+            if (overlaps(begin, limit)) return true;
         }
     }
     return false;
@@ -445,8 +484,26 @@ bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
         for (const auto& [begin, limit] : item.writes) {
             if (address < limit && begin < end) return true;
         }
+        for (const auto& label : item.labels) {
+            const auto [begin, limit] = labelRange(label);
+            if (address < limit && begin < end) return true;
+        }
     }
     return false;
+}
+
+bool DrawPipeline::AppendLabel(LabelPart& label) {
+    std::lock_guard lock(mutex);
+    rethrowFailure();
+    // With two or more items queued the newest is not the front, the only item the committer ever
+    // starts, so the label runs right after the newest item's commit and before anything queued
+    // later, as an item of its own would.
+    if (closing || items.size() < 2 || labelCommit.load(std::memory_order_relaxed) == nullptr) return false;
+    auto& newest = items.back();
+    if (newest.kind == ItemKind::Other || newest.labels.size() >= MaxAppendedLabels) return false;
+    newest.labels.push_back(std::move(label));
+    ++labelsAppended;
+    return true;
 }
 
 }

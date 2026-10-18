@@ -2,15 +2,19 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,9 +22,11 @@
 #include <vector>
 
 // The draw pipeline's hand-off without a device: plain commits stand in for draws and labels, so
-// the waits for room and for an empty queue, failures, the stop and the commit runs are checked on
-// their own. Run with and without the committer experiments (APS5_EXPERIMENT_ROOM_WAKE,
-// APS5_EXPERIMENT_COMMIT_RUNS); only what a commit sees of the GPU-mutex hold may differ.
+// the waits for room and for an empty queue, failures, the stop, the commit runs and the labels
+// appended to queued items are checked on their own. Run with and without the committer
+// experiments (APS5_EXPERIMENT_ROOM_WAKE, APS5_EXPERIMENT_COMMIT_RUNS); only what a commit sees of
+// the GPU-mutex hold may differ. The tests append labels themselves, with their own committer in
+// place of the driver's, so the label tests run whether or not APS5_EXPERIMENT_LABEL_COALESCE is set.
 
 namespace {
 
@@ -98,6 +104,32 @@ struct Gate {
     void Open() { opened.set_value(); }
 };
 
+// The label committer the test registers in place of the driver's: it logs the label's value, plus
+// EndOfPipeFlag when the label raises an end-of-pipe interrupt.
+constexpr int EndOfPipeFlag = 0x10000;
+Log* labelLog = nullptr;
+
+void LogLabel(const DrawPipeline::LabelPart& label) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, label.bytes.data(), std::min(label.bytes.size(), sizeof(value)));
+    labelLog->Add(static_cast<int>(value) | (label.endOfPipeInterrupt ? EndOfPipeFlag : 0));
+}
+
+DrawPipeline::LabelPart LabelAt(std::uint64_t address, std::uint32_t value, bool endOfPipeInterrupt = false) {
+    DrawPipeline::LabelPart label;
+    label.opcode = 0x49;
+    label.address = address;
+    label.bytes.resize(sizeof(value));
+    std::memcpy(label.bytes.data(), &value, sizeof(value));
+    label.endOfPipeInterrupt = endOfPipeInterrupt;
+    return label;
+}
+
+bool Append(DrawPipeline& pipeline, std::uint64_t address, std::uint32_t value, bool endOfPipeInterrupt = false) {
+    auto label = LabelAt(address, value, endOfPipeInterrupt);
+    return pipeline.AppendLabel(label);
+}
+
 // A producer waiting for room and a drain waiting for an empty queue at the same time: both wake,
 // and the commits run in the order they were queued.
 void WaitersBothWake() {
@@ -128,18 +160,24 @@ void WaitersBothWake() {
     Require(log.Take() == Sequence(1, depth), "the commits did not run in the order they were queued");
 }
 
-// A commit that throws stops the pipeline: the commits behind it are dropped (with commit runs, the
-// failing draw is in the middle of a run), and the failure is rethrown once, to the producer that
-// waited for room or to the next producer.
+// A commit that throws stops the pipeline: the commits behind it and the labels appended to it are
+// dropped (with commit runs, the failing draw is in the middle of a run), and the failure is
+// rethrown once, to the producer that waited for room or to the next producer.
 void FailureReachesWaiters() {
     auto& pipeline = DrawPipeline::Queue0();
     const auto depth = static_cast<int>(RequireDepth());
+    constexpr std::uint64_t Label = 0x700000002000;
     std::atomic<int> ranBeforeFailure{0};
     std::atomic<int> ranAfterFailure{0};
+    Log labels;
+    labelLog = &labels;
+    pipeline.SetLabelCommit(&LogLabel);
     Gate gate;
     gate.Enqueue(pipeline);
     pipeline.Enqueue([&ranBeforeFailure] { ++ranBeforeFailure; }, {}, 0, {}, Draw);
+    Require(Append(pipeline, Label, 1), "a label behind the draw before the failing one was not appended");
     pipeline.Enqueue([] { throw std::runtime_error(std::string(InjectedFailure)); }, {}, 0, {}, Draw);
+    Require(Append(pipeline, Label, 2), "a label behind the failing draw was not appended");
     for (int i = 3; i < depth; ++i) pipeline.Enqueue([&ranAfterFailure] { ++ranAfterFailure; }, {}, 0, {}, Draw);
     std::string producerError;
     std::atomic<bool> producerDone{false};
@@ -166,6 +204,8 @@ void FailureReachesWaiters() {
     Require((producerError == InjectedFailure) != (laterError == InjectedFailure), "the failure was not rethrown exactly once (waiting producer: '" + producerError + "', next producer: '" + laterError + "')");
     Require(ranBeforeFailure == 1, "the commit queued before the failed commit did not run");
     Require(ranAfterFailure == 0, "a commit queued behind the failed commit ran");
+    Require(labels.Take() == std::vector<int>{1}, "a label appended to the failed commit ran, or the one appended before it did not");
+    labelLog = nullptr;
     try {
         AgcDriverShutdown_nid_postfix();
     } catch (const std::exception&) {
@@ -243,6 +283,50 @@ void WaiterEndsRun() {
     Require(mutex.Waiters() == 0, "a thread is still counted as waiting for the free GPU mutex");
 }
 
+// Labels appended to queued draws: they answer PendingLabel as their item's newest writes and count
+// for the overlap checks until they ran, they are refused where they could run out of order or
+// grow an item past the cap, and they run right after their item's commit, in queue order, with
+// their end-of-pipe flag.
+void AppendedLabels() {
+    auto& pipeline = DrawPipeline::Queue0();
+    constexpr std::uint64_t Label = 0x700000001000;
+    constexpr std::uint64_t Other = Label + 0x100;
+    constexpr std::uint64_t Target = Label + 0x1000;
+    constexpr auto Cap = static_cast<std::uint32_t>(DrawPipeline::MaxAppendedLabels);
+    Log log;
+    labelLog = &log;
+    pipeline.SetLabelCommit(&LogLabel);
+    Gate gate;
+    gate.Enqueue(pipeline);
+    Require(!Append(pipeline, Label, 1), "a label was appended to the item the committer runs");
+    pipeline.Enqueue([&log] { log.Add(100); }, {});
+    Require(!Append(pipeline, Label, 2), "a label was appended to an item that is neither a draw nor a label");
+    pipeline.Enqueue([&log] { log.Add(200); }, {{Target, Target + 64}}, 0, {}, Draw);
+    Require(Append(pipeline, Label, 0x11), "a label behind a queued draw was not appended");
+    Require(pipeline.PendingLabel(Label, 4) == 0x11u, "PendingLabel does not answer with an appended label's value");
+    Require(!pipeline.PendingLabel(Label, 8).has_value(), "PendingLabel answers a wait wider than the appended label");
+    Require(!pipeline.PendingLabel(Label + 2, 4).has_value(), "PendingLabel answers a wait the appended label covers in part");
+    Require(!pipeline.PendingLabel(Target, 4).has_value(), "PendingLabel answers a wait on the draw's own writes");
+    const std::array<DrawPipeline::Range, 2> runs{{{Other, Other + 4}, {Label + 3, Label + 4}}};
+    Require(pipeline.Overlaps(Label, 4) && pipeline.OverlapsAny(runs) && !pipeline.Overlaps(Label + 4, 4) && !pipeline.OverlapsAny(std::span(runs).first(1)), "an appended label's bytes do not count as a queued write, exactly");
+    Require(Append(pipeline, Label, 0x22, true), "a second label behind the queued draw was not appended");
+    Require(pipeline.PendingLabel(Label, 4) == 0x22u, "PendingLabel does not answer with the newest appended label");
+    pipeline.Enqueue([&log] { log.Add(300); }, {{Label, Label + 4}}, 0, {}, Draw);
+    Require(!pipeline.PendingLabel(Label, 4).has_value(), "PendingLabel answers with a label that a later draw overwrites");
+    Require(Append(pipeline, Label, 0x33), "a label behind the second draw was not appended");
+    Require(pipeline.PendingLabel(Label, 4) == 0x33u, "PendingLabel does not answer with the label appended after the later draw");
+    for (std::uint32_t i = 1; i < Cap; ++i) Require(Append(pipeline, Other, 0x40 + i), "a label within the cap was not appended");
+    Require(!Append(pipeline, Other, 0x80), "an item took more than MaxAppendedLabels labels");
+    Require(pipeline.PendingLabel(Other, 4) == std::uint64_t{0x40 + Cap - 1}, "PendingLabel does not answer with the newest label at another address");
+    gate.Open();
+    pipeline.Drain(DrawPipeline::DrainReason::Flush);
+    std::vector<int> expected{100, 200, 0x11, 0x22 | EndOfPipeFlag, 300, 0x33};
+    for (std::uint32_t i = 1; i < Cap; ++i) expected.push_back(static_cast<int>(0x40 + i));
+    Require(log.Take() == expected, "the appended labels did not run right after their draws in the order they were queued");
+    Require(!pipeline.Overlaps(Label, 4) && !pipeline.PendingLabel(Label, 4).has_value(), "a label that ran still counts as queued");
+    labelLog = nullptr;
+}
+
 // The stop with a drain waiting: the committer still runs every queued commit, the drain wakes, and
 // a commit queued after the stop runs on its caller.
 void ClosingWakesDrain() {
@@ -288,6 +372,7 @@ int main(int argc, char** argv) {
             WaitersBothWake();
             RunsShareOneHold();
             WaiterEndsRun();
+            AppendedLabels();
         }
         std::cout << "draw pipeline commit tests passed\n";
         return 0;
