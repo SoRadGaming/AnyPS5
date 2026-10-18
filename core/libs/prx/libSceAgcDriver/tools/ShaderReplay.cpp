@@ -48,6 +48,7 @@ bool g_materialize = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_robust2 = false;
+bool g_noRegistration = false;
 bool g_code = false;
 
 bool Replay(const char* path) {
@@ -147,6 +148,8 @@ bool Replay(const char* path) {
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         if (g_robust2) request.request.target.robustBufferAccess2 = true;
+        // --no-registration: the module a device without graphics pipeline libraries gets (APS5_NO_GPL).
+        if (g_noRegistration) request.request.target.registrationModules = false;
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
@@ -199,6 +202,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--cfg") {
             g_graph = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--no-registration") {
+            g_noRegistration = true;
             continue;
         }
         if (std::string(argv[i]) == "--maintenance8") {

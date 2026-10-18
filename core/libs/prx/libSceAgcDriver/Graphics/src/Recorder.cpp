@@ -1385,18 +1385,58 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
+namespace {
+
+// LOCAL DEBUG (APS5_DEBUG_PASS_STATS=1): how each draw starts its pass, reported every 10 s.
+enum PassStart : std::size_t { PassContinued, PassNotOpen, PassForced, PassKeyMerged, PassKeyFenced, PassHazardBase, PassStartCount = PassHazardBase + 7 };
+std::atomic<std::uint64_t> passStarts[PassStartCount]{};
+std::atomic<std::uint64_t> passStartsFenced{0};
+
+void notePassStart(std::size_t kind, bool fenced) {
+    static const bool enabled = std::getenv("APS5_DEBUG_PASS_STATS") != nullptr;
+    if (!enabled) return;
+    passStarts[kind].fetch_add(1, std::memory_order_relaxed);
+    if (fenced && kind != PassContinued) passStartsFenced.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        lastReport.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10 || !lastReport.compare_exchange_strong(last, now)) return;
+    static constexpr const char* names[PassStartCount] = {"continued", "not-open", "forced", "key-merged", "key-fenced", "hazard-none", "raw", "waw", "war", "image", "unknown-read", "unknown-write"};
+    std::string line = "[pass-starts] (10 s)";
+    for (std::size_t i = 0; i < PassStartCount; ++i) {
+        char text[48];
+        std::snprintf(text, sizeof(text), " %s %llu", names[i], static_cast<unsigned long long>(passStarts[i].exchange(0, std::memory_order_relaxed)));
+        line += text;
+    }
+    char text[48];
+    std::snprintf(text, sizeof(text), "; fenced breaks %llu\n", static_cast<unsigned long long>(passStartsFenced.exchange(0, std::memory_order_relaxed)));
+    line += text;
+    std::fwrite(line.data(), 1, line.size(), stderr);
+}
+
+}
+
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        notePassStart(!pass.open ? PassNotOpen : PassForced, fenced);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard == PassHazard::None && pass.key == key) {
+        notePassStart(PassContinued, fenced);
+        return {open->commands, true, false};
+    }
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
+    notePassStart(hazard != PassHazard::None ? PassHazardBase + static_cast<std::size_t>(hazard) : merge ? PassKeyMerged : PassKeyFenced, fenced || pass.fenced);
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
     const auto commands = Commands();
