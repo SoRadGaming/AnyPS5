@@ -3556,9 +3556,14 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
 }
 
 Graphics::Context VulkanDevice::graphicsContext() const {
+    std::optional<Graphics::Context> built;
+    return graphicsContext(built);
+}
+
+const Graphics::Context& VulkanDevice::graphicsContext(std::optional<Graphics::Context>& built) const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
-    return buildContext();
+    return built.emplace(buildContext());
 }
 
 Graphics::Context VulkanDevice::buildContext() const {
@@ -3661,7 +3666,8 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
-    return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
+    std::optional<Graphics::Context> built;
+    return Graphics::KnownValidationFailure(graphicsContext(built), shaders, graphics);
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
@@ -3706,7 +3712,12 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
     return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
+std::shared_ptr<const Graphics::PreparedDraw> VulkanDevice::PrepareDraw(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    std::optional<Graphics::Context> built;
+    return Graphics::PrepareDraw(graphicsContext(built), graphics, shaders);
+}
+
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const Graphics::PreparedDraw* prepared) {
     startJournalReplay();
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
@@ -3716,8 +3727,8 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
+    std::optional<Graphics::Context> built;
+    Graphics::Draw(graphicsContext(built), graphics, draw, shaders, snapshots, recipe, prepared);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
@@ -4250,8 +4261,8 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
-    const auto context = graphicsContext();
-    const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe);
+    std::optional<Graphics::Context> built;
+    const auto outcome = Graphics::DrawWithRecipe(graphicsContext(built), graphics, draw, shaders, snapshots, *recipe);
     if (!outcome.recorded) {
         switch (outcome.miss) {
             case Graphics::DrawRecipeMiss::NotRecordable: counters.precheckMisses[MissNotRecordable].fetch_add(1, std::memory_order_relaxed); break;
@@ -4559,7 +4570,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.resources != nullptr) recorder.KeepBytes(record.resources.get(), record.resources->CopiedBytes());
     if (record.bindings != nullptr) {
         recorder.Keep(record.bindings);
-        for (const auto& snapshot : record.bindings->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        for (const auto& snapshot : record.bindings->snapshots) {
+            if (!snapshot.sliced) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        }
     }
     recordStep(PhaseRecordKeeps);
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) {
