@@ -283,6 +283,51 @@ void WaiterEndsRun() {
     Require(mutex.Waiters() == 0, "a thread is still counted as waiting for the free GPU mutex");
 }
 
+// The after-commit checks of a run: each commit leaves its check to the run's end, which runs it
+// once, under the run's own hold (depth 1), before the drain returns; only the run's first label
+// reaps. Without commit runs every commit runs its own check and every label reaps, and an item
+// that is neither a draw nor a label never runs in a run.
+int runEndChecks = 0;
+std::uint32_t runEndCheckDepth = 0;
+
+void RunEndCheck() {
+    ++runEndChecks;
+    runEndCheckDepth = GuestMemory::GpuMutex().DepthOnThisThread();
+}
+
+void ChecksAtRunEnd() {
+    auto& pipeline = DrawPipeline::Queue0();
+    const auto commits = std::min<std::size_t>(RequireDepth() - 2, 4);
+    std::vector<int> deferred(commits, -1);
+    std::vector<int> reaped(commits, -1);
+    bool otherDeferred = true;
+    runEndChecks = 0;
+    runEndCheckDepth = 0;
+    Gate gate;
+    gate.Enqueue(pipeline);
+    for (std::size_t i = 0; i < commits; ++i) {
+        pipeline.Enqueue([&deferred, &reaped, i] {
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            deferred[i] = DrawPipeline::DeferToRunEnd(&RunEndCheck) ? 1 : 0;
+            reaped[i] = DrawPipeline::LabelReapDue() ? 1 : 0;
+        }, {}, 0, {}, i % 2 == 0 ? Draw : DrawPipeline::ItemKind::Label);
+    }
+    pipeline.Enqueue([&otherDeferred] { otherDeferred = DrawPipeline::DeferToRunEnd(&RunEndCheck); }, {});
+    gate.Open();
+    pipeline.Drain(DrawPipeline::DrainReason::Flush);
+    Require(!otherDeferred, "a commit that is neither a draw nor a label left its check to a run");
+    const auto reaps = static_cast<int>(std::count(reaped.begin(), reaped.end(), 1));
+    if (!CommitRuns()) {
+        Require(std::count(deferred.begin(), deferred.end(), 0) == static_cast<std::ptrdiff_t>(commits) && reaps == static_cast<int>(commits) && runEndChecks == 0, "without commit runs a commit left its check to a run or a label did not reap");
+        return;
+    }
+    Require(std::count(deferred.begin(), deferred.end(), 1) == static_cast<std::ptrdiff_t>(commits), "a commit inside a run did not leave its check to the run's end");
+    // A run may end early (its window, a preempted committer): every run reaps once and runs the
+    // checks once.
+    Require(reaped[0] == 1 && reaps >= 1 && runEndChecks == reaps, "the runs reaped " + std::to_string(reaps) + " times and ran their checks " + std::to_string(runEndChecks) + " times, expected once each per run");
+    Require(runEndCheckDepth == 1, "the run's check ran at GPU-mutex depth " + std::to_string(runEndCheckDepth) + ", expected under the run's own hold");
+}
+
 // Labels appended to queued draws: they answer PendingLabel as their item's newest writes and count
 // for the overlap checks until they ran, they are refused where they could run out of order or
 // grow an item past the cap, and they run right after their item's commit, in queue order, with
@@ -372,6 +417,7 @@ int main(int argc, char** argv) {
             WaitersBothWake();
             RunsShareOneHold();
             WaiterEndsRun();
+            ChecksAtRunEnd();
             AppendedLabels();
         }
         std::cout << "draw pipeline commit tests passed\n";
