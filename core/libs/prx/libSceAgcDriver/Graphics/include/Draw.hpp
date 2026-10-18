@@ -102,8 +102,9 @@ struct DrawRecipeOutcome {
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
 // miss records nothing. Under APS5_EXPERIMENT_MOVED_RECIPES the hit also retires the depth
-// surfaces over its targets, lists its moved read-only buffers after the proof (bound from
-// per-draw snapshots, as a template hit's) and repeats Draw's native depth feedback check.
+// surfaces over its targets, misses on a linear target without its host import (Draw would copy
+// it), lists its moved read-only buffers after the proof (bound from per-draw snapshots, as a
+// template hit's) and repeats Draw's native depth feedback check.
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();

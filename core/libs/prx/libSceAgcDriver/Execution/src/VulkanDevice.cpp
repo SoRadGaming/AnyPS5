@@ -3990,7 +3990,7 @@ enum RecipeMiss : std::size_t { MissNoRecipe, MissDevice, MissTemplateGone, Miss
 constexpr std::array<const char*, RecipeMissCount> RecipeMissNames{"no recipe", "device", "template gone", "objects gone", "not recordable", "moved refused"};
 // The draw rows name the miss reasons of DrawWithRecipe (a target or a pipeline gone is the
 // objects-gone slot; a moved buffer the template cannot read, APS5_EXPERIMENT_MOVED_RECIPES, the
-// moved-refused slot, which only the draw rows print).
+// moved-refused slot, which only the draw rows print, and only under that switch).
 constexpr std::array<const char*, RecipeMissCount> DrawRecipeMissNames{"no recipe", "device", "template gone", "targets gone", "not recordable", "moved refused"};
 constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResources::ProofPath::Count)> ProofPathNames{"fast", "T1 refreshed", "full"};
 constexpr std::array<const char*, static_cast<std::size_t>(Graphics::ShaderResources::ProofFailure::Count)> ProofFailureNames{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
@@ -4079,13 +4079,16 @@ void reportRecipes() {
     auto last = recipes.lastReport.load();
     if (nowMs - last < 10000 || !recipes.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    // The moved-refused slot is printed only under APS5_EXPERIMENT_MOVED_RECIPES, the one switch
+    // whose recipe hits can refuse moved buffers, so the line stays as it was without it.
+    static const bool movedRecipes = std::getenv("APS5_EXPERIMENT_MOVED_RECIPES") != nullptr;
     for (std::size_t kind = 0; kind < 3; ++kind) {
         auto& counters = recipes.kinds[kind];
         const auto hits = take(counters.hits);
         std::string misses, proofs, rebuilds;
         char text[64];
         for (std::size_t i = 0; i < RecipeMissCount; ++i) {
-            if (i == MissMovedRefused && kind != 2) continue;
+            if (i == MissMovedRefused && (kind != 2 || !movedRecipes)) continue;
             std::snprintf(text, sizeof(text), "%s%s %llu", i == 0 ? "" : ", ", (kind == 2 ? DrawRecipeMissNames : RecipeMissNames)[i], take(counters.precheckMisses[i]));
             misses += text;
         }
