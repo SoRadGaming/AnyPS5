@@ -2041,6 +2041,16 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS): the recipe round trips with the replay input
+    # memos, every reused answer checked against the ordinary computation (=2 aborts on a difference).
+    foreach(agcReplayTest IN ITEMS agc_driver_depth_bias_per_face agc_driver_draw_cache_reuse agc_driver_draw_cache_relocation)
+        add_test(NAME ${agcReplayTest}_replay_inputs COMMAND ${agcReplayTest}_tests)
+        set_tests_properties(${agcReplayTest}_replay_inputs PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_REPLAY_INPUTS=2;APS5_VERIFY_DRAW_RECIPE=1;APS5_VERIFY_REGISTER_KEYS=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcReplayTest}_replay_inputs PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
 
     add_test(NAME agc_driver_stencil_replay_no_gpl COMMAND agc_driver_stencil_replay_tests)
     set_tests_properties(agc_driver_stencil_replay_no_gpl PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" TIMEOUT 30 SKIP_RETURN_CODE 77)

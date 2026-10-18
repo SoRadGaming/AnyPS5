@@ -186,7 +186,33 @@ public:
         std::span<const std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
-    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS, COMMITTER-PLAN S6): what the checks of
+    // MovedReadOnlyBuffers that depend only on the shader words and this object made of the words
+    // of one caller's last call (a draw recipe's replays): the words, in the order the checks read
+    // them, and either a refusal or the elements to move, in order. A call with the same words on
+    // the same object (whose data buffers still hash the same, see DataWordsHash) takes them from
+    // here and only repeats the checks against memory and recorded work (mapping, pending writes,
+    // pending storage results, shadows), which can change between calls with the same words.
+    struct MovedWordsMemo {
+        struct Candidate {
+            std::size_t allocation;
+            std::uint64_t address;
+            std::size_t size;
+            std::uint64_t begin;
+            std::size_t bytes;
+            std::uint32_t shader;
+            std::uint32_t binding;
+            bool data;
+        };
+        const ShaderResources* owner = nullptr;
+        std::uint64_t dataWordsHash = 0;
+        std::vector<std::uint32_t> words;
+        bool refused = false;
+        std::vector<Candidate> candidates;
+    };
+    // With `memo` (a recipe's, see DrawReplayInputs) the word compares are taken from it when the
+    // words repeat; the answer is the same as without it.
+    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, MovedWordsMemo* memo = nullptr) const;
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
@@ -315,6 +341,10 @@ public:
 
 private:
     friend class AgcDriver::VulkanDevice;
+    // MovedReadOnlyBuffers' walk: the checks that depend only on the shader words and this object,
+    // with every element to move handed to `accept` in order (false refuses the whole move, as a
+    // failed check against memory does). False when a check refused.
+    template <typename Accept> bool movedCandidates(std::span<const CompiledShader> shaders, Accept&& accept) const;
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     struct DescribedRange {
         const char* kind;

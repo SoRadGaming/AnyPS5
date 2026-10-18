@@ -4,6 +4,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HighestIndexMemo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -58,6 +59,39 @@ struct Recipe {
 // object went away, the caller runs the ordinary path (the recipe is re-attached after it).
 enum class RecipeOutcome { Recorded, Rebuild };
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS, COMMITTER-PLAN S6): what the replays of one draw
+// recipe (Graphics::DrawWithRecipe) remember of their inputs from one draw to the next. It is the
+// only state of a recipe that changes after the attach: created and used under GuestMemory::GpuMutex
+// only (every replay runs under it, on the committer or on a queue worker), so two replays of a
+// recipe never touch it at once. Every answer is reused only under the rule of what it remembers:
+// the highest index while its range is unchanged since the collect before its scan, a fetch plan
+// for the same attributes, vertex and instance range and color target, the moved-buffer word checks
+// for the same words. It owns no device object (a recipe outlives a device replacement, see
+// DrawRecipe): the zero vertex buffers are weak, kept alive by the batches whose draws bind them.
+struct DrawReplayInputs {
+    Graphics::HighestIndexMemo highestIndex;
+    struct FetchPlan {
+        bool valid = false;
+        std::vector<ShaderRecompiler::VertexAttribute> attributes;
+        std::uint32_t maxIndex = 0;
+        std::uint32_t firstVertex = 0;
+        std::uint32_t instanceCount = 0;
+        std::uint32_t firstInstance = 0;
+        bool hasColorTarget = false;
+        std::uint64_t colorAddress = 0;
+        std::uint64_t colorBytes = 0;
+        Graphics::VertexFetchPlan plan;
+    };
+    std::array<FetchPlan, 4> fetchPlans{};
+    std::size_t nextFetchPlan = 0;
+    struct ZeroBuffer {
+        std::size_t bytes;
+        std::weak_ptr<Graphics::Buffer> buffer;
+    };
+    std::vector<ZeroBuffer> zeroBuffers;
+    Graphics::ShaderResources::MovedWordsMemo moved;
+};
+
 // What a recorded draw needs to record again from its draw-cache hit without looking anything up
 // (design_cpu_final M8, step 8b): the resource-cache template the draw's stages were served with
 // (weak, as a dispatch recipe's), its pipeline and framebuffer (weak, R10: the pipeline store owns
@@ -85,6 +119,8 @@ struct DrawRecipe {
     std::set<std::uint32_t> fragmentOutputs;
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
+    // APS5_EXPERIMENT_REPLAY_INPUTS: made by the first replay (null without the switch).
+    mutable std::unique_ptr<DrawReplayInputs> replay;
 };
 
 }
