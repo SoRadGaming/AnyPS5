@@ -2045,8 +2045,10 @@ if(BUILD_TESTING)
     # template hits whose read-only buffers moved (=1), and with the first recipe hit and every 64th
     # checked against the ordinary path (=2). depth_bias_per_face holds the moved-buffer recipe test
     # itself (its default run checks that such a hit builds no recipe without the switch); the
-    # stencil replay draws must stay without recipes.
-    foreach(movedRecipesSuite IN ITEMS depth_bias_per_face draw_cache_reuse draw_cache_relocation mesh_draw_relocation stencil_replay)
+    # stencil replay draws must stay without recipes. draw_ahead repeats draws whose stages were
+    # compiled ahead, which take the same draw-cache hits. draw_cache_reuse fails on a logged
+    # FATAL: like its other runs.
+    foreach(movedRecipesSuite IN ITEMS depth_bias_per_face draw_cache_reuse draw_cache_relocation mesh_draw_relocation stencil_replay draw_ahead)
         foreach(movedRecipesMode IN ITEMS 1 2)
             set(movedRecipesTest agc_driver_${movedRecipesSuite}_moved_recipes)
             if(movedRecipesMode EQUAL 2)
@@ -2054,6 +2056,9 @@ if(BUILD_TESTING)
             endif()
             add_test(NAME ${movedRecipesTest} COMMAND agc_driver_${movedRecipesSuite}_tests)
             set_tests_properties(${movedRecipesTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_MOVED_RECIPES=${movedRecipesMode}" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            if(movedRecipesSuite STREQUAL "draw_cache_reuse")
+                set_tests_properties(${movedRecipesTest} PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
+            endif()
             if(WIN32)
                 set_tests_properties(${movedRecipesTest} PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

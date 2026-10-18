@@ -428,6 +428,11 @@ void MovedBufferDrawRecipe(AgcDriver::VulkanDevice& device) {
     const auto hit = [&](const std::shared_ptr<const AgcDriver::DrawRecipe>& recipe, std::size_t index) {
         return device.DrawFromRecipe(state, draw, shadersAt(index), {}, recipe);
     };
+    // The refusals go to DrawWithRecipe itself, which names its miss (DrawFromRecipe only answers
+    // Rebuild): a failed template proof or a lost target must not pass for a refused buffer.
+    const auto refused = [&](const std::shared_ptr<const AgcDriver::DrawRecipe>& recipe, std::size_t index) {
+        return AgcDriver::Graphics::DrawWithRecipe(context, state, draw, shadersAt(index), {}, *recipe).miss == AgcDriver::Graphics::DrawRecipeMiss::MovedRefused;
+    };
 
     std::shared_ptr<const AgcDriver::DrawRecipe> recipeA;
     device.Draw(state, draw, shadersAt(SlotA), {}, &recipeA);
@@ -462,7 +467,7 @@ void MovedBufferDrawRecipe(AgcDriver::VulkanDevice& device) {
         Require(recorder != nullptr, "no recorder is active");
         recorder->NotePendingWrite(slotAddress(SlotP), ConstantBytes);
     }
-    Require(hit(recipeA, SlotP) == RecipeOutcome::Rebuild, "a recipe hit read a moved buffer behind a pending GPU write");
+    Require(refused(recipeA, SlotP), "a recipe hit did not refuse a moved buffer behind a pending GPU write");
     device.WaitIdle();
     Require(hit(recipeA, SlotP) == RecipeOutcome::Recorded, "a recipe hit refused a moved buffer whose GPU write completed");
     expect(Values[SlotP], "a recipe hit after the moved buffer's GPU write completed");
@@ -470,13 +475,13 @@ void MovedBufferDrawRecipe(AgcDriver::VulkanDevice& device) {
     Require(hit(recipeA, SlotB) == RecipeOutcome::Recorded, "a recipe hit refused a settled moved buffer");
     const auto label = std::bit_cast<std::array<std::byte, 4>>(LabelValue);
     Require(device.WriteLabelOnGpu(slotAddress(SlotL), label, 1, 0, false) == 0, "the label store over the moved buffer was not recorded on the GPU");
-    Require(hit(recipeA, SlotL) == RecipeOutcome::Rebuild, "a recipe hit read a moved buffer under a queued label store");
+    Require(refused(recipeA, SlotL), "a recipe hit did not refuse a moved buffer under a queued label store");
     device.WaitIdle();
     Require(hit(recipeA, SlotL) == RecipeOutcome::Recorded, "a recipe hit refused a moved buffer whose label store landed");
     expect(LabelValue, "a recipe hit reading the label's value");
 
     device.Draw(otherState, draw, shadersAt(SlotA));
-    Require(hit(recipeA, AtOther) == RecipeOutcome::Rebuild, "a recipe hit read a moved buffer under pending storage-image results");
+    Require(refused(recipeA, AtOther), "a recipe hit did not refuse a moved buffer under pending storage-image results");
     AgcDriver::Graphics::StorageTexture::FlushPending(guestOther.Address(), GuestBlock::BlockBytes, nullptr, "test");
     device.WaitIdle();
     Require(hit(recipeA, AtOther) == RecipeOutcome::Recorded, "a recipe hit refused a moved buffer whose storage-image results were stored");
