@@ -474,6 +474,24 @@ DrawProfile& Profile() {
     return profile;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_MOVED_RECIPES=1): a template hit whose read-only buffers moved
+// (MovableBuffers keeps their addresses out of the content key; in the Astro Bot hub nearly every
+// template hit is one) builds a draw recipe too, and every recipe hit lists the buffers its own
+// V#s moved away from the template's, as a template hit does in resolveDrawResources. The hit
+// also retires the depth surfaces over its targets and repeats the native depth feedback check,
+// the two registry steps Draw makes that the recipe path skipped, misses on a linear target
+// without its host import as Draw's residency rule does, and refers to the recipe's vertex
+// layout and fragment outputs instead of copying them. =2 additionally checks the first hit and
+// every 64th against the ordinary path's lookups and aborts on a disagreement. 0 when unset.
+int MovedRecipes() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_MOVED_RECIPES");
+        if (text == nullptr) return 0;
+        return std::atoi(text) == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
 void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
@@ -571,6 +589,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; recipe hits %llu, misses by reason:", static_cast<unsigned long long>(profile.recipeHits));
     for (std::size_t i = 1; i < profile.recipeMisses.size() && room(); ++i) {
+        // Only APS5_EXPERIMENT_MOVED_RECIPES refuses moved buffers, so without it the line stays
+        // as it was.
+        if (i == static_cast<std::size_t>(DrawRecipeMiss::MovedRefused) && MovedRecipes() == 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
@@ -887,7 +908,7 @@ bool DrawRecipes() {
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "moved refused"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -1084,7 +1105,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (draw.indexed) RequireNoMultisampleTarget(draw.indexAddress, static_cast<std::size_t>(indexBytes), "an index buffer read");
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
     if (recipe != nullptr) {
-        inputs.fragmentOutputs = recipe->fragmentOutputs;
+        // Nothing on the recipe path reads the fragment outputs after this (the recipe's pipeline
+        // already has them masked), so under APS5_EXPERIMENT_MOVED_RECIPES the set is not copied.
+        if (MovedRecipes() == 0) inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
     } else if (prepared != nullptr) {
         inputs.fragmentOutputs = prepared->fragmentOutputs;
@@ -1179,7 +1202,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
-        inputs.vertexInput = recipe->vertexInput;
+        // APS5_EXPERIMENT_MOVED_RECIPES: the recipe's layout is immutable and shared, so the hit
+        // refers to it as a prepared draw's is referred to.
+        if (MovedRecipes() != 0) inputs.retainedVertexInput = recipe->vertexInput;
+        else inputs.vertexInput = *recipe->vertexInput;
     } else if (prepared != nullptr) {
         inputs.retainedVertexInput = prepared->vertexInput;
         preparedDrawUses.fetch_add(1, std::memory_order_relaxed);
@@ -2001,6 +2027,86 @@ bool RecordDraws() {
     return recordDraws;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_MOVED_RECIPES=2): what Draw would resolve for a recipe hit,
+// compared with what the recipe gives it, after the hit's own proofs and before anything of it is
+// recorded: the resident targets with their views, the content key and the template the cache
+// serves under it, the moved buffers listed again, the fragment outputs, the pipeline, the
+// framebuffer and the push constants. A difference, or a lookup that throws where the recipe
+// would record, aborts the process. A template the cache no longer serves under the key is no
+// disagreement (the batch or the recipe keeps it alive, Draw would build anew): it is only
+// reported, and the moved buffers then have nothing to compare with. A configuration the pipeline
+// store keeps no entry for, and every configuration under APS5_NO_PIPELINE_CACHE=1, gets a
+// private pipeline from every lookup, so its identity is not compared. The lookups refresh or
+// make objects as Draw's do, which is why only sampled hits run this.
+void verifyRecipeHit(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, std::uint64_t indexBytes, const std::shared_ptr<ShaderResources>& resources, std::span<const std::shared_ptr<StorageTexture>> targets, const std::shared_ptr<Pipeline>& pipeline, const std::shared_ptr<Framebuffer>& framebuffer, std::span<const ShaderResources::MovedBuffer> moved, Recorder& recorder, DrawRecipeOutcome& result) {
+    const char* disagreement = nullptr;
+    const auto differ = [&](bool different, const char* what) {
+        if (different && disagreement == nullptr) disagreement = what;
+    };
+    std::string thrown;
+    try {
+        for (std::size_t index = 0; index < targets.size(); ++index) {
+            const auto& color = state.colors[index];
+            const ColorTargetLayout layout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+            const bool gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
+            const bool linearResident = color.tileMode == ColorTileMode::Linear && ExistingHostImportFor(context, color.address, layout.Bytes()) != nullptr;
+            differ(color.samples > 1 || !(gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)), "the target's residency");
+            differ(AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED, "the attachment proxy");
+            if (disagreement != nullptr) break;
+            const auto found = CachedStorageSurface(context, color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color));
+            differ(found != targets[index], "the resident target");
+            differ(found == targets[index] && found->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != recipe.targetViews[index], "the attachment view");
+        }
+        const auto key = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !TrimmedDrawKey());
+        differ(key != recipe.key, "the content key");
+        if (disagreement == nullptr) {
+            if (SharedResourceCache().Find(key) != resources) {
+                result.verifyReplaced = true;
+            } else {
+                const auto again = resources->MovedReadOnlyBuffers(shaders, recorder);
+                const auto same = [](const ShaderResources::MovedBuffer& left, const ShaderResources::MovedBuffer& right) { return left.allocation == right.allocation && left.address == right.address && left.size == right.size && std::ranges::equal(left.words, right.words); };
+                differ(!again.has_value() || !std::ranges::equal(*again, moved, same), "the moved buffers");
+            }
+        }
+        bool memoized = false;
+        bool hit = false;
+        const auto outputs = CachedFragmentOutputs(context, shaders, state, memoized, hit);
+        differ(outputs != recipe.fragmentOutputs, "the fragment outputs");
+        differ(PipelineStages(shaders) != recipe.shaderStages, "the pipeline stages");
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        std::shared_ptr<const VertexInputLayout> retained;
+        VertexInputLayout built;
+        if (!attributes.empty()) {
+            if (context.vertexInputs != nullptr) retained = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+            if (retained == nullptr) built = BuildVertexInputLayout(context, attributes);
+        }
+        const auto& vertexInput = retained != nullptr ? *retained : built;
+        const auto masked = maskedState(state, outputs);
+        const State& pipelineState = masked.has_value() ? *masked : state;
+        static const bool noPipelineCache = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+        std::vector<std::byte> storeKey;
+        BuildPipelineStoreKey(storeKey, context, pipelineState, vertexInput, resources->SetLayouts(), shaders, VK_IMAGE_LAYOUT_GENERAL);
+        if (!storeKey.empty() && !noPipelineCache) differ(CachedPipeline(context, pipelineState, vertexInput, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL) != pipeline, "the pipeline");
+        const std::vector<std::uint8_t> persistent(targets.size(), 0u);
+        if (disagreement == nullptr) differ(pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, state.renderLayers, persistent) != framebuffer, "the framebuffer");
+        const auto pushStages = PushConstantStages(shaders);
+        std::array<std::byte, PipelinePushConstantBytes> pushBytes{};
+        if (pushStages != 0) {
+            pushBytes = AssemblePushConstants(shaders);
+            resources->PatchPushConstants(pushBytes);
+        }
+        differ(pushStages != recipe.pushStages || pushBytes != recipe.pushBytes, "the push constants");
+    } catch (const std::exception& error) {
+        thrown = error.what();
+        differ(true, "a lookup that throws");
+    }
+    result.verified = true;
+    if (disagreement == nullptr) return;
+    std::fprintf(stderr, "[recipe] APS5_EXPERIMENT_MOVED_RECIPES=2: %s of the draw recipe disagrees with the ordinary path (target 0x%llx, %zu moved buffers)%s%s\n", disagreement, static_cast<unsigned long long>(state.color.address), moved.size(), thrown.empty() ? "" : ": ", thrown.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
@@ -2407,8 +2513,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
-        // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled) {
+        // hit's proof is the template's ProveCurrent and nothing needs completion work. A hit whose
+        // read-only buffers moved builds one only under APS5_EXPERIMENT_MOVED_RECIPES, whose hits
+        // list their moved buffers again (DrawWithRecipe).
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (resolved.moved.empty() || MovedRecipes() != 0) && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2418,7 +2526,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             for (const auto& binding : targets) recipe->targets.emplace_back(binding.resident);
             recipe->targetViews = targetViews;
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
-            recipe->vertexInput = inputs.VertexLayout();
+            recipe->vertexInput = inputs.retainedVertexInput != nullptr ? inputs.retainedVertexInput : std::make_shared<const VertexInputLayout>(inputs.vertexInput);
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {
                 recipe->pushBytes = AssemblePushConstants(shaders);
@@ -2728,10 +2836,19 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
+    const int movedRecipes = MovedRecipes();
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
+        // APS5_EXPERIMENT_MOVED_RECIPES: a depth surface made over the target's memory since the
+        // recipe was built is retired before the target is proved, as Draw does before its lookup.
+        // Draw also attaches a linear target's resident image only while the target has a host
+        // import, and copies the target without one, so such a hit misses then.
+        const auto& color = state.colors[index];
+        const std::size_t colorBytes = movedRecipes != 0 ? ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes() : 0;
+        if (movedRecipes != 0 && color.samples <= 1) RetireDepthSurfaces(context.device, color.address, colorBytes);
         timer.phase(PhaseSetup);
+        if (movedRecipes != 0 && color.tileMode == ColorTileMode::Linear && ExistingHostImportFor(context, color.address, colorBytes) == nullptr) return miss(DrawRecipeMiss::TargetGone);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, state.colors[index].dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
@@ -2766,6 +2883,21 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         return miss(DrawRecipeMiss::Proof);
     }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    // APS5_EXPERIMENT_MOVED_RECIPES: the read-only buffers this draw's V#s moved away from the
+    // template's, listed as a template hit lists them (resolveDrawResources). Their overlap tests
+    // read the recorder's pending writes and the pending storage-image results, which every
+    // earlier item has registered by now, as for the ordinary path at this point of GPU order. A
+    // buffer that cannot move is a miss: Draw then refuses the template the same way and builds.
+    // The native depth feedback check follows the proof, as in Draw.
+    std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
+    if (movedRecipes != 0) {
+        moved = resources->MovedReadOnlyBuffers(shaders, *recorder);
+        if (!moved.has_value()) {
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::MovedRefused);
+        }
+        if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+    }
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
@@ -2780,11 +2912,17 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto framebuffer = recipe.framebuffer.lock();
     if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, state.renderLayers);
     timer.phase(PhasePipeline);
+    // APS5_EXPERIMENT_MOVED_RECIPES=2: the first hit and every 64th is checked against Draw's own
+    // lookups before it records.
+    static std::atomic<std::uint64_t> verifyHits{0};
+    if (movedRecipes == 2 && verifyHits.fetch_add(1, std::memory_order_relaxed) % 64 == 0) verifyRecipeHit(context, state, draw, shaders, recipe, inputs.indexBytes, resources, targets, pipeline, framebuffer, *moved, *recorder, result);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;
     record.recorder = recorder;
     record.completion = outcome.completion;
     record.resources = std::move(resources);
+    // The moved list stays alive here until recordDraw has made the draw's bindings from it.
+    if (moved.has_value()) record.moved = *moved;
     record.pipeline = std::move(pipeline);
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
