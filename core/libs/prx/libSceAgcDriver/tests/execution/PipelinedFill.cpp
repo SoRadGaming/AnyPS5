@@ -93,11 +93,13 @@ void SubmitBehind(Blocker& blocker, std::vector<std::uint32_t>& words) {
     blocker.Enqueue();
 }
 
-void ReleaseWhen(Blocker& blocker, std::size_t reached, std::size_t passed) {
+// Returns how many items were queued when the blocker was released.
+std::size_t ReleaseWhen(Blocker& blocker, std::size_t reached, std::size_t passed) {
     const auto start = std::chrono::steady_clock::now();
     auto reachedAt = std::chrono::steady_clock::time_point{};
+    std::size_t outstanding = 0;
     for (;;) {
-        const auto outstanding = DrawPipeline::Queue0().Outstanding();
+        outstanding = DrawPipeline::Queue0().Outstanding();
         const auto now = std::chrono::steady_clock::now();
         if (outstanding >= passed) break;
         if (outstanding >= reached && reachedAt == std::chrono::steady_clock::time_point{}) reachedAt = now;
@@ -106,6 +108,7 @@ void ReleaseWhen(Blocker& blocker, std::size_t reached, std::size_t passed) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     blocker.release = true;
+    return outstanding;
 }
 
 void Finish() {
@@ -167,7 +170,12 @@ void FillIntoFullPipeline() {
     AppendOutputFill(words);
     Blocker blocker;
     SubmitBehind(blocker, words);
-    ReleaseWhen(blocker, depth, depth + 1);
+    // With APS5_EXPERIMENT_LABEL_COALESCE the labels behind the first one ride on it instead of
+    // taking slots, so the pipeline does not fill: it holds the blocker, the scratch fill, one label
+    // item, the output fill and the submission's completion.
+    const bool coalesced = std::getenv("APS5_EXPERIMENT_LABEL_COALESCE") != nullptr;
+    const auto queued = ReleaseWhen(blocker, coalesced ? 4 : depth, coalesced ? 5 : depth + 1);
+    Require(!coalesced || queued <= 5, "the labels behind a queued label took " + std::to_string(queued) + " pipeline slots, expected them to ride on it");
     Finish();
     for (std::size_t i = 0; i + 2 < depth; ++i) Require(Labels[i] == i + 1, "a queued label was not stored");
     for (std::size_t i = 0; i < Output.size(); ++i) Require(Output[i] == (i < 256 ? 0x5a5a5a5au : 0xcafebabeu), "a fill behind a full draw pipeline did not land at " + std::to_string(i));
