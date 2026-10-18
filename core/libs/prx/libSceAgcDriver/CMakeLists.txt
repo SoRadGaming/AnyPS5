@@ -573,9 +573,12 @@ configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_write_tracking_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_write_tracking COMMAND agc_write_tracking_tests)
-    set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION): the same with the bump at a walk's first stamp.
+    add_test(NAME agc_write_tracking_lazy_generation COMMAND agc_write_tracking_tests)
+    set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_write_tracking_lazy_generation PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_LAZY_GENERATION=1")
     if(WIN32)
-        set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1314,6 +1317,18 @@ if(BUILD_TESTING)
     set_tests_properties(agc_draw_snapshots_replay_bindings agc_draw_snapshot_epoch_replay_bindings agc_draw_inputs_in_place_replay_bindings PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_EXPERIMENT_REPLAY_BINDINGS=1")
     if(WIN32)
         set_tests_properties(agc_draw_snapshots_replay_bindings agc_draw_snapshot_epoch_replay_bindings agc_draw_inputs_in_place_replay_bindings PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION): the suites whose memos are keyed by the
+    # tracker generation, with the bump at a walk's first stamp.
+    add_test(NAME agc_draw_snapshots_lazy_generation COMMAND agc_driver_recorder_tests --draw-snapshots-only)
+    add_test(NAME agc_draw_snapshot_epoch_lazy_generation COMMAND agc_driver_recorder_tests --draw-snapshot-epoch-only)
+    add_test(NAME agc_draw_snapshots_watched_imports_lazy_generation COMMAND agc_driver_recorder_tests --draw-snapshots-only)
+    add_test(NAME agc_unchanged_cpu_stamps_lazy_generation COMMAND agc_driver_recorder_tests --unchanged-cpu-stamps-only)
+    set_tests_properties(agc_draw_snapshots_lazy_generation agc_draw_snapshot_epoch_lazy_generation agc_unchanged_cpu_stamps_lazy_generation PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_EXPERIMENT_LAZY_GENERATION=1")
+    set_tests_properties(agc_draw_snapshots_watched_imports_lazy_generation PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_EXPERIMENT_LAZY_GENERATION=1;APS5_WRITE_WATCH_IMPORTS=watch")
+    if(WIN32)
+        set_tests_properties(agc_draw_snapshots_lazy_generation agc_draw_snapshot_epoch_lazy_generation agc_draw_snapshots_watched_imports_lazy_generation agc_unchanged_cpu_stamps_lazy_generation PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_pending_key_stores COMMAND agc_driver_recorder_tests --pending-key-stores-only)

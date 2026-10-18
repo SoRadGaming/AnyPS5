@@ -14,6 +14,7 @@
 #endif
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -1160,6 +1161,42 @@ void CheckHighestIndexMemo() {
     Require(!find(), "a guest allocation change kept the memo");
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION): with the switch a walk that finds nothing
+// written leaves the tracker generation where it was, without it every walk moves it; either way a
+// walk that stamps returns the next generation, and only the blocks it stamped read as changed
+// since the generation before it.
+void CheckLazyGeneration() {
+    const bool lazy = std::getenv("APS5_EXPERIMENT_LAZY_GENERATION") != nullptr;
+    constexpr std::size_t bytes = 2 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() {
+#ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+            munmap(memory, bytes);
+#endif
+        }
+    } cleanup{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto synced = CollectWritesUncached(base, bytes);
+    Require(synced != 0 && UnchangedSince(base, bytes, synced), "the test block is not collected");
+
+    const auto clean = CollectWritesUncached(base, bytes);
+    Require(lazy ? clean == synced : clean == synced + 1, lazy ? "a walk that found nothing written moved the tracker generation" : "a walk that found nothing written did not move the tracker generation");
+    Require(TrackerGeneration() == clean && UnchangedSince(base, bytes, clean), "a clean walk's generation is not current");
+
+    static_cast<volatile std::uint8_t*>(memory)[8] = 0x22;
+    const auto stamped = CollectWritesUncached(base, bytes);
+    Require(stamped == clean + 1, "a walk that stamped did not return the next generation");
+    Require(!UnchangedSince(base, Block, clean) && UnchangedSince(base, bytes, stamped), "a stamping walk's block does not read as changed since the generation before it");
+    Require(UnchangedSince(base + Block, Block, clean), "a stamping walk stamped a block it did not find written");
+}
+
 int main() {
     try {
         if (!WriteWatched()) {
@@ -1202,6 +1239,7 @@ int main() {
         CheckUnwatchedImport();
         CheckCommittedRanges();
         CheckHighestIndexMemo();
+        CheckLazyGeneration();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;
