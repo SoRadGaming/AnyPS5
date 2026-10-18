@@ -5014,7 +5014,9 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
         same = same && cursor == memo->words.size();
     }
     if (!same) {
-        memo->owner = this;
+        // Owned by no object until rebuilt in full: a throw on the way must not leave the new words
+        // over part of their candidates for the next call to take.
+        memo->owner = nullptr;
         memo->dataWordsHash = dataWordsHash;
         memo->words.clear();
         visitMovedWords(shaders, [&](std::uint32_t word) { memo->words.push_back(word); });
@@ -5023,6 +5025,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             memo->candidates.push_back(candidate);
             return true;
         });
+        memo->owner = this;
     }
     std::optional<std::vector<MovedBuffer>> result;
     if (!memo->refused && std::all_of(memo->candidates.begin(), memo->candidates.end(), accept)) result = std::move(moved);

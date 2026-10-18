@@ -1162,7 +1162,9 @@ const VertexFetchPlan* replayFetchPlan(const DrawReplayInputs& replay, std::span
 
 void keepFetchPlan(DrawReplayInputs& replay, std::span<const ShaderRecompiler::VertexAttribute> attributes, const State& state, const Pm4::DrawParameters& draw, std::uint32_t maxIndex, const VertexFetchPlan& planned) {
     auto& entry = replay.fetchPlans[replay.nextFetchPlan++ % replay.fetchPlans.size()];
-    entry.valid = true;
+    // Valid only once the copy is whole: a copy that throws leaves an empty slot, not half a plan
+    // under a new key.
+    entry.valid = false;
     entry.attributes.assign(attributes.begin(), attributes.end());
     entry.maxIndex = maxIndex;
     entry.firstVertex = draw.firstVertex;
@@ -1172,6 +1174,7 @@ void keepFetchPlan(DrawReplayInputs& replay, std::span<const ShaderRecompiler::V
     entry.colorAddress = state.color.address;
     entry.colorBytes = state.color.bytes;
     entry.plan = planned;
+    entry.valid = true;
 }
 
 bool sameFetches(std::span<const VertexFetch> first, std::span<const VertexFetch> second) {
