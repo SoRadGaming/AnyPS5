@@ -11,8 +11,42 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <set>
+
+namespace AgcDriver::Graphics {
+VkPipeline& LastBoundPipeline();
+}
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// LOCAL DEBUG (APS5_PIPELINE_ISA): which guest programs each bound graphics pipeline runs, so the
+// isa-<pipeline>.txt dumps of the costliest pipelines can be traced to shader_<address>.req files.
+void notePipelinePrograms(const std::vector<DrawProgram>& programs) {
+    static const bool enabled = std::getenv("APS5_PIPELINE_ISA") != nullptr;
+    if (!enabled) return;
+    const auto pipeline = reinterpret_cast<std::uintptr_t>(Graphics::LastBoundPipeline());
+    if (pipeline == 0) return;
+    static std::mutex mutex;
+    static std::set<std::uintptr_t> seen;
+    {
+        std::lock_guard lock(mutex);
+        if (!seen.insert(pipeline).second) return;
+    }
+    char text[48];
+    std::snprintf(text, sizeof(text), " isa-%016llx:", static_cast<unsigned long long>(pipeline));
+    std::string line = std::string("[pipeline-map]") + text;
+    for (const auto& program : programs) {
+        std::snprintf(text, sizeof(text), " stage%u=0x%llx", static_cast<unsigned>(program.binary.stage), static_cast<unsigned long long>(program.binary.codeAddress));
+        line += text;
+    }
+    line += '\n';
+    std::fwrite(line.data(), 1, line.size(), stderr);
+}
+
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -574,6 +608,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
             localDevice->Draw(graphics, direct, stages, snapshots);
+            notePipelinePrograms(programs);
             phaseTiming.Phase(DrawRowGraphics);
         }
         timing.Mark("draw_and_resource_release");
@@ -608,6 +643,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared);
+            notePipelinePrograms(programs);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
@@ -629,6 +665,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared);
+    notePipelinePrograms(programs);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");

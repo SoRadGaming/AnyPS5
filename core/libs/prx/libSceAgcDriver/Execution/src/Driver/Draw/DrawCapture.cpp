@@ -106,6 +106,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         const auto slot0 = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
         if ((graphics.hasColorTarget && graphics.color.address == dumpTarget) || slot0 == dumpTarget) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
     }
+    // LOCAL DEBUG: APS5_DUMP_STAGE_CODE=<hex code address>[,...] saves those stages' requests for agc_shader_replay.
+    static const std::string dumpCode = [] { const char* text = std::getenv("APS5_DUMP_STAGE_CODE"); return text ? std::string(text) : std::string(); }();
+    if (!dumpCode.empty()) {
+        char address[32];
+        std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(program.binary.codeAddress));
+        if (dumpCode.find(address) != std::string::npos) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
+    }
     if (dumpSlot1 != 0) {
         const auto value = [&](std::uint32_t offset) -> std::uint64_t { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
         const auto slot1 = (value(0x391) << 40u) | (value(0x327) << 8u);
