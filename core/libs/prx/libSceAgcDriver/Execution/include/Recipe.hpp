@@ -78,7 +78,9 @@ struct DrawRecipe {
     std::vector<std::weak_ptr<Graphics::StorageTexture>> targets;
     std::vector<VkImageView> targetViews;
     std::uint64_t passKey = 0;
-    Graphics::VertexInputLayout vertexInput;
+    // Shared with the draw's own layout (the vertex input cache's or the prepared draw's) when it
+    // had one, so a hit can refer to it instead of copying it (APS5_EXPERIMENT_MOVED_RECIPES).
+    std::shared_ptr<const Graphics::VertexInputLayout> vertexInput;
     std::array<std::byte, Graphics::PipelinePushConstantBytes> pushBytes{};
     VkShaderStageFlags pushStages = 0;
     std::optional<Graphics::State> masked;

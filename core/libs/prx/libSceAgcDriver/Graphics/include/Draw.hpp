@@ -75,10 +75,13 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 
 // Why DrawWithRecipe did not record from the recipe (the caller then runs Draw): the draw is not
 // recordable (no recorder, APS5_SYNC_DRAWS, APS5_DUMP_TARGETS), a resident target is gone from the
-// storage cache, the template is gone, the pipeline is gone from the pipeline store, or the
+// storage cache, the template is gone, the pipeline is gone from the pipeline store, the
 // template's proof failed (ShaderResources::ProveCurrent; the template is removed from the
-// resource cache and kept by the batch).
-enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Count };
+// resource cache and kept by the batch), or (APS5_EXPERIMENT_MOVED_RECIPES) the template cannot
+// take the draw's moved read-only buffers (ShaderResources::MovedReadOnlyBuffers: another binding
+// shape, a written or emptied element, or a range behind a pending GPU write or label store, or
+// under pending storage-image or unit-shadow results).
+enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, MovedRefused, Count };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {
     bool recorded = false;
@@ -87,13 +90,20 @@ struct DrawRecipeOutcome {
     // APS5_PROFILE_DRAW: the proof's and the record's time.
     double proofUs = 0;
     double recordUs = 0;
+    // APS5_EXPERIMENT_MOVED_RECIPES=2: the hit was checked against the ordinary path's lookups,
+    // and whether the resource cache no longer served the recipe's template under its key (no
+    // disagreement: the batch or the recipe keeps it alive, the ordinary path would build anew).
+    bool verified = false;
+    bool verifyReplaced = false;
 };
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and
 // vertex work as Draw's, the resident-target proof on the stored images (Refresh while Cached()),
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
-// miss records nothing.
+// miss records nothing. Under APS5_EXPERIMENT_MOVED_RECIPES the hit also retires the depth
+// surfaces over its targets, lists its moved read-only buffers after the proof (bound from
+// per-draw snapshots, as a template hit's) and repeats Draw's native depth feedback check.
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
