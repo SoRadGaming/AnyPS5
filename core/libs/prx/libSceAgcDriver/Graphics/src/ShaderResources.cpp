@@ -2070,6 +2070,19 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
     return result;
 }
 
+namespace {
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_BINDINGS, COMMITTER-PLAN S7): what every use of a template
+// derived again from its fixed build is derived once: PrepareDrawBindings' pool sizes come from the
+// build (DrawSetSizes), and Revalidate skips its CompletePendingCpuWrites loops when no call of
+// them could do anything (pendingCpuWritesPossible).
+bool ReplayBindings() {
+    static const bool enabled = std::getenv("APS5_EXPERIMENT_REPLAY_BINDINGS") != nullptr;
+    return enabled;
+}
+
+}
+
 void ShaderResources::buildComplete() {
     PerformanceTimer frameTiming("Resources.Complete");
     Require(!completed, "cannot update a published descriptor heap");
@@ -2200,6 +2213,14 @@ void ShaderResources::buildComplete() {
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
+        // APS5_EXPERIMENT_REPLAY_BINDINGS: the bindings are final now, and so are the pool sizes
+        // every PrepareDrawBindings of this object would compute from them.
+        if (ReplayBindings() && (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) && !usesBda) {
+            DrawSetSizes sized;
+            describeDrawSets(sized.sizes, sized.described);
+            for (std::size_t set = 0; set < sized.variable.size(); ++set) sized.variable[set] = drawVariableCount(set);
+            drawSetSizes = std::move(sized);
+        }
         completed = true;
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -3017,6 +3038,20 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     return false;
 }
 
+namespace {
+
+// Whether some CompletePendingCpuWrites call could sync: false exactly when its checks that do not
+// depend on the range return false (inside a completion, no recorder, or no copied writer of the
+// device or of a draw and no completion label pending), so every call would return at once.
+bool pendingCpuWritesPossible(const Context& context) {
+    if (Recorder::InCompletion() || Recorder::Active() == nullptr) return false;
+    if (Recorder::PendingCompletionLabels() != 0) return true;
+    if (context.copiedWriters != nullptr && !context.copiedWriters->empty()) return true;
+    return !DrawCopiedWriters()->empty();
+}
+
+}
+
 const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage) {
     for (const auto& shader : shaders) {
         if (shader.stage != stage || shader.program == nullptr) continue;
@@ -3032,14 +3067,18 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    for (const auto& range : describedRanges) {
-        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
-        if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
-    }
-    for (const auto& image : storageTextures) {
-        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-        if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    // APS5_EXPERIMENT_REPLAY_BINDINGS: the loops only when a call can sync. While no call can, none
+    // syncs, so nothing they could change moves between the gate and the calls it skips.
+    if (!ReplayBindings() || pendingCpuWritesPossible(context)) {
+        for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        for (const auto& range : describedRanges) {
+            CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
+            if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+        }
+        for (const auto& image : storageTextures) {
+            CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+            if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        }
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
@@ -4846,28 +4885,30 @@ ShaderResources::DrawBindings::~DrawBindings() {
     release(fragmentLayout, fragmentAllocation);
 }
 
-std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
-    std::vector<MovedBuffer> moved;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
-    for (const auto& shader : shaders) {
-        if (shader.program == nullptr) return std::nullopt;
-        for (const auto& binding : shader.program->bindings) {
+template <typename Accept>
+bool ShaderResources::movedCandidates(std::span<const CompiledShader> shaders, Accept&& accept) const {
+    for (std::size_t stage = 0; stage < shaders.size(); ++stage) {
+        const auto& shader = shaders[stage];
+        if (shader.program == nullptr) return false;
+        const auto& programBindings = shader.program->bindings;
+        for (std::size_t position = 0; position < programBindings.size(); ++position) {
+            const auto& binding = programBindings[position];
             if (DataRole(binding.role)) {
                 const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-                if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
+                if (kept == bindings.end() || kept->allocations.size() != 1) return false;
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
-                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
+                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return false;
                 const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
-                if (item.dataWords.empty() && patched) return std::nullopt;
-                moved.push_back({index, 0, item.size, binding.guestDescriptor});
+                if (item.dataWords.empty() && patched) return false;
+                if (!accept(MovedWordsMemo::Candidate{index, 0, item.size, 0, 0, static_cast<std::uint32_t>(stage), static_cast<std::uint32_t>(position), true})) return false;
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
             const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return false;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
@@ -4878,20 +4919,122 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const bool empty = size == 0 || address == 0;
                 if (!item.guest) {
                     if (empty) continue;
-                    return std::nullopt;
+                    return false;
                 }
                 if (item.address == address && item.size == size) continue;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return false;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
-                moved.push_back({index, address, static_cast<std::size_t>(size)});
+                if (!accept(MovedWordsMemo::Candidate{index, address, static_cast<std::size_t>(size), begin, bytes, static_cast<std::uint32_t>(stage), static_cast<std::uint32_t>(position), false})) return false;
             }
         }
     }
-    return moved;
+    return true;
+}
+
+namespace {
+
+// APS5_EXPERIMENT_REPLAY_INPUTS=2: every answer of the replay memos is checked against the full
+// computation, and a disagreement aborts.
+bool ReplayInputsVerify() {
+    static const bool verify = [] { const char* text = std::getenv("APS5_EXPERIMENT_REPLAY_INPUTS"); return text != nullptr && text[0] == '2'; }();
+    return verify;
+}
+
+// The shader words MovedReadOnlyBuffers' word checks read, in their order, each binding led by its
+// position, number, role and sizes so two word lists are equal only for equal inputs (the memo key).
+template <typename Visit>
+void visitMovedWords(std::span<const CompiledShader> shaders, Visit&& visit) {
+    for (std::size_t stage = 0; stage < shaders.size(); ++stage) {
+        const auto& programBindings = shaders[stage].program->bindings;
+        for (std::size_t position = 0; position < programBindings.size(); ++position) {
+            const auto& binding = programBindings[position];
+            if (!DataRole(binding.role) && binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            visit(static_cast<std::uint32_t>(stage));
+            visit(static_cast<std::uint32_t>(position));
+            visit(binding.binding);
+            visit(static_cast<std::uint32_t>(binding.role));
+            visit(binding.count);
+            visit(static_cast<std::uint32_t>(binding.guestDescriptor.size()));
+            visit(static_cast<std::uint32_t>(binding.bufferWritten.size()));
+            std::uint32_t bits = 0;
+            for (std::size_t element = 0; element < binding.bufferWritten.size(); ++element) {
+                if (binding.bufferWritten[element]) bits |= 1u << (element % 32u);
+                if (element % 32u == 31u || element + 1 == binding.bufferWritten.size()) {
+                    visit(bits);
+                    bits = 0;
+                }
+            }
+            for (const auto word : binding.guestDescriptor) visit(word);
+        }
+    }
+}
+
+bool sameMovedBuffers(const std::optional<std::vector<ShaderResources::MovedBuffer>>& first, const std::optional<std::vector<ShaderResources::MovedBuffer>>& second) {
+    if (first.has_value() != second.has_value()) return false;
+    if (!first.has_value()) return true;
+    return std::ranges::equal(*first, *second, [](const ShaderResources::MovedBuffer& a, const ShaderResources::MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && std::ranges::equal(a.words, b.words); });
+}
+
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, MovedWordsMemo* memo) const {
+    std::vector<MovedBuffer> moved;
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
+    // An element to move: a data buffer takes the draw's own words; a guest buffer's new range must
+    // be mapped and clear of this object's writes, recorded writes, pending storage results and
+    // shadows.
+    const auto accept = [&](const MovedWordsMemo::Candidate& candidate) {
+        if (candidate.data) {
+            moved.push_back({candidate.allocation, 0, candidate.size, shaders[candidate.shader].program->bindings[candidate.binding].guestDescriptor});
+            return true;
+        }
+        const auto begin = candidate.begin;
+        const auto bytes = candidate.bytes;
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
+        if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return false;
+        moved.push_back({candidate.allocation, candidate.address, candidate.size});
+        return true;
+    };
+    if (memo == nullptr || std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) {
+        if (!movedCandidates(shaders, accept)) return std::nullopt;
+        return moved;
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS): the word checks from the memo while the
+    // words and this object's data buffers repeat; the checks against memory and recorded work run
+    // on every call, in the walk's order.
+    bool same = memo->owner == this && memo->dataWordsHash == dataWordsHash;
+    if (same) {
+        std::size_t cursor = 0;
+        visitMovedWords(shaders, [&](std::uint32_t word) {
+            same = same && cursor < memo->words.size() && memo->words[cursor] == word;
+            ++cursor;
+        });
+        same = same && cursor == memo->words.size();
+    }
+    if (!same) {
+        // Owned by no object until rebuilt in full: a throw on the way must not leave the new words
+        // over part of their candidates for the next call to take.
+        memo->owner = nullptr;
+        memo->dataWordsHash = dataWordsHash;
+        memo->words.clear();
+        visitMovedWords(shaders, [&](std::uint32_t word) { memo->words.push_back(word); });
+        memo->candidates.clear();
+        memo->refused = !movedCandidates(shaders, [&](const MovedWordsMemo::Candidate& candidate) {
+            memo->candidates.push_back(candidate);
+            return true;
+        });
+        memo->owner = this;
+    }
+    std::optional<std::vector<MovedBuffer>> result;
+    if (!memo->refused && std::all_of(memo->candidates.begin(), memo->candidates.end(), accept)) result = std::move(moved);
+    if (ReplayInputsVerify() && !sameMovedBuffers(result, MovedReadOnlyBuffers(shaders, recorder))) {
+        std::fprintf(stderr, "[replay] APS5_EXPERIMENT_REPLAY_INPUTS=2: the moved buffers from the word memo (%s) disagree with the full checks\n", same ? "repeated words" : "new words");
+        std::fflush(stderr);
+        std::abort();
+    }
+    return result;
 }
 
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {
@@ -4960,6 +5103,25 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 
 std::span<std::byte> ShaderResources::DrawBindings::Snapshot::Contents() const {
     return sliced ? buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes) : buffer->Bytes();
+}
+
+void ShaderResources::describeDrawSets(std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) const {
+    for (auto& sizes : counts) sizes.clear();
+    for (const auto& binding : bindings) {
+        const auto set = setOf(binding);
+        described[set] = true;
+        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+        if (count == 0) continue;
+        auto& sizes = counts[set];
+        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+        if (held != sizes.end()) held->descriptorCount += count;
+        else sizes.push_back({binding.layout.descriptorType, count});
+    }
+    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+}
+
+std::optional<std::uint32_t> ShaderResources::drawVariableCount(std::size_t set) const {
+    return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt;
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
@@ -5073,23 +5235,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    // APS5_EXPERIMENT_REPLAY_BINDINGS: the sizes the build kept (DrawSetSizes), else computed here.
+    const auto* sized = drawSetSizes.has_value() ? &*drawSetSizes : nullptr;
     std::array<bool, 2> described{};
     struct CountsTag {};
     auto& counts = ThreadScratch<std::array<std::vector<VkDescriptorPoolSize>, 2>, CountsTag>();
-    for (auto& sizes : counts) sizes.clear();
-    for (const auto& binding : bindings) {
-        const auto set = setOf(binding);
-        described[set] = true;
-        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
-        if (count == 0) continue;
-        auto& sizes = counts[set];
-        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
-        if (held != sizes.end()) held->descriptorCount += count;
-        else sizes.push_back({binding.layout.descriptorType, count});
-    }
-    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
-    const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
-    const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
+    if (sized != nullptr) described = sized->described;
+    else describeDrawSets(counts, described);
+    const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(sized != nullptr ? sized->sizes[set] : counts[set]); };
+    const auto variableOf = [&](std::size_t set) { return sized != nullptr ? sized->variable[set] : drawVariableCount(set); };
     result->cache = context.descriptorCache;
     if (described[0] || splitSets) {
         result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
@@ -5218,13 +5372,18 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
+    StorageImages(images);
+    return images;
+}
+
+void ShaderResources::StorageImages(std::vector<std::pair<VkImage, bool>>& images) const {
+    images.clear();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageTextures[index] != nullptr) images.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
     }
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
     }
-    return images;
 }
 
 bool ShaderResources::HasCachedStorageImages() const {

@@ -1208,6 +1208,8 @@ struct StampRuns {
     StampKind kind;
     std::size_t stamped = 0;
     const WindowCopy* window = nullptr;
+    // The walk takes its generation at its first stamp, not before it starts (walkWrites).
+    bool bumpAtFirstStamp = false;
 };
 
 void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
@@ -1215,6 +1217,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& tracker = runs.tracker;
     const auto kind = runs.kind;
     if (end <= begin) return;
+    if (runs.bumpAtFirstStamp && runs.stamped == 0) ++tracker.generation;
     ++runs.stamped;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
@@ -1254,9 +1257,17 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
 }
 #endif
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION, COMMITTER-PLAN S7): a walk bumps the generation
+// at its first stamp instead of before it starts, so a walk that finds nothing written leaves
+// TrackerGeneration where it was and the draw snapshot memos keyed by it (Recorder's
+// UnwrittenDrawSlice and UnwrittenDrawSnapshot) stop clearing on clean walks. Every stamp still
+// exceeds every generation returned before it: the bump and the stamps happen under the tracker
+// mutex, and a clean walk, which returns the current value, stamped nothing newer. MarkWritten and
+// the driver's own stores bump as before.
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
-    ++tracker.generation;
-    StampRuns runs{tracker, kind, 0, window};
+    static const bool lazy = std::getenv("APS5_EXPERIMENT_LAZY_GENERATION") != nullptr;
+    if (!lazy) ++tracker.generation;
+    StampRuns runs{tracker, kind, 0, window, lazy};
 #ifdef _WIN32
     return collectWindowsWrites(runs, first, stop, armedOnly);
 #else
@@ -1850,8 +1861,9 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
-    // Under the mutex: a collect bumps the generation before its walk, and a walk still running
-    // when the value is read absorbs stores made after it with a stamp not newer than the value.
+    // Under the mutex: a collect bumps the generation before its walk (at its first stamp under
+    // APS5_EXPERIMENT_LAZY_GENERATION), and a walk still running when the value is read absorbs
+    // stores made after it with a stamp not newer than the value.
     const auto lock = lockTracker(tracker);
     return tracker.generation;
 }

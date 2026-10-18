@@ -1054,9 +1054,172 @@ struct DrawInputs {
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
-std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, const ShaderRecompiler::VertexAttribute& attribute) {
-    auto zero = std::make_shared<Buffer>(context, DecodeVertexFormat(attribute).bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t bytes) {
+    auto zero = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
+    return zero;
+}
+
+// The pure part of a draw's vertex input (VertexFetchPlan): per attribute a zero buffer or the
+// fetch it reads, checked against the color target, then the fetches copied alone and the copy plan
+// of the others. With `zeroed` the zero buffers are made in the same walk, for the draw to bind.
+void planVertexFetches(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const ShaderRecompiler::VertexAttribute> attributes, const Pm4::DrawParameters::IndirectDraw* args, std::uint32_t maxIndex, VertexFetchPlan& planned, std::vector<std::shared_ptr<Buffer>>* zeroed) {
+    auto& fetches = planned.fetches;
+    auto& fetchValid = planned.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
+    planned.fetchOf.assign(attributes.size(), 0);
+    planned.zero.assign(attributes.size(), 0);
+    planned.zeroBytes.assign(attributes.size(), 0);
+    if (zeroed != nullptr) zeroed->assign(attributes.size(), nullptr);
+    for (std::size_t i = 0; i < attributes.size(); ++i) {
+        const auto& attribute = attributes[i];
+        if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
+            planned.zero[i] = 1;
+            planned.zeroBytes[i] = DecodeVertexFormat(attribute).bytes;
+            if (zeroed != nullptr) (*zeroed)[i] = zeroVertexBuffer(context, planned.zeroBytes[i]);
+            continue;
+        }
+        // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
+        const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, maxIndex, draw.instanceCount, draw.firstInstance);
+        const auto& fields = attribute.resource.fields;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        const auto firstByte = args == nullptr ? VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance) : 0;
+        Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address + firstByte, "vertex buffer aliases the render target");
+        const auto stride = (fields[1] >> 16u) & 0x3fffu;
+        planned.fetchOf[i] = fetches.size();
+        fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
+        const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
+        fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
+    }
+    planned.soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
+    auto& isSolo = planned.isSolo;
+    isSolo.assign(fetches.size(), 0);
+    for (const auto f : planned.soloFetches) isSolo[f] = 1;
+    auto& plannedFetches = planned.plannedFetches;
+    plannedFetches.clear();
+    auto& plannedOf = planned.plannedOf;
+    plannedOf.assign(fetches.size(), 0);
+    for (std::size_t f = 0; f < fetches.size(); ++f) {
+        if (isSolo[f]) continue;
+        plannedOf[f] = plannedFetches.size();
+        plannedFetches.push_back(fetches[f]);
+    }
+    planned.copies = PlanVertexCopies(plannedFetches);
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS, COMMITTER-PLAN S6): a recipe's replays reuse what
+// they derived from their inputs (DrawReplayInputs): the highest index of an in-place index range,
+// the vertex fetch plan and the zero vertex buffers. Every check against memory and recorded work
+// (InPlaceDrawInput's pending, label, queued-store and copied-writer checks, the host import, the
+// range checks and the copies) still runs per draw. =2 also computes every reused answer the
+// ordinary way and aborts on a difference. 0: off.
+int ReplayInputsMode() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_REPLAY_INPUTS");
+        return text == nullptr ? 0 : text[0] == '2' ? 2 : 1;
+    }();
+    return mode;
+}
+
+// Index ranges of fewer indices are scanned on every replay as before: below it the memo's collect
+// and stamp check cost about what the scan does. APS5_EXPERIMENT_REPLAY_INDEX_MIN=<indices> moves it.
+std::size_t ReplayIndexMinimum() {
+    static const std::size_t minimum = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_REPLAY_INDEX_MIN");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{512};
+    }();
+    return minimum;
+}
+
+// The replay inputs of `recipe`, made by its first replay; null without the switch or a recipe.
+DrawReplayInputs* replayInputs(const DrawRecipe* recipe) {
+    if (recipe == nullptr || ReplayInputsMode() == 0) return nullptr;
+    GuestMemory::AssertGpuLockHeld("DrawRecipe replay inputs");
+    if (recipe->replay == nullptr) recipe->replay = std::make_unique<DrawReplayInputs>();
+    return recipe->replay.get();
+}
+
+[[noreturn]] void replayDisagrees(const char* what) {
+    std::fprintf(stderr, "[replay] APS5_EXPERIMENT_REPLAY_INPUTS=2: %s from the replay memo disagrees with the ordinary computation\n", what);
+    std::fflush(stderr);
+    std::abort();
+}
+
+// The highest index of an in-place index range on a replay. The recipe's memo answers while the
+// range is unchanged since the collect made before its scan, under the same guest allocations
+// (Recorder::KnownHighestIndex's rule, here for every count from ReplayIndexMinimum on); a miss
+// takes InPlaceIndexRange's answer and remembers it under this collect.
+std::optional<std::uint32_t> replayHighestIndex(Recorder& recorder, DrawReplayInputs& replay, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
+    if (bytes < ReplayIndexMinimum() * indexSize) return InPlaceIndexRange(recorder, address, bytes, indexSize, skipRestart).highest;
+    const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto generation = GuestMemory::CollectWrites(address, bytes);
+    std::optional<std::uint32_t> highest;
+    if (replay.highestIndex.Find(address, bytes, indexSize, skipRestart, generation, registryGeneration, highest)) {
+        if (ReplayInputsMode() == 2 && HighestDrawIndex(std::span(reinterpret_cast<const std::byte*>(address), bytes), indexSize, skipRestart) != highest) {
+            // A CPU store made after the collect of this epoch is the next epoch's to see
+            // (GuestMemory::BumpCollectEpoch), while the scan sees it at once: only a memo that
+            // still answers after a fresh walk of the range disagrees.
+            GuestMemory::CollectWritesUncached(address, bytes);
+            std::optional<std::uint32_t> again;
+            if (replay.highestIndex.Find(address, bytes, indexSize, skipRestart, generation, registryGeneration, again)) replayDisagrees("the highest index");
+        }
+        return highest;
+    }
+    highest = InPlaceIndexRange(recorder, address, bytes, indexSize, skipRestart).highest;
+    replay.highestIndex.Keep(address, bytes, indexSize, skipRestart, generation, registryGeneration, highest);
+    return highest;
+}
+
+// The fetch plan a replay of the same attributes, vertex and instance range and color target made.
+const VertexFetchPlan* replayFetchPlan(const DrawReplayInputs& replay, std::span<const ShaderRecompiler::VertexAttribute> attributes, const State& state, const Pm4::DrawParameters& draw, std::uint32_t maxIndex) {
+    for (const auto& entry : replay.fetchPlans) {
+        if (!entry.valid || entry.maxIndex != maxIndex || entry.firstVertex != draw.firstVertex || entry.instanceCount != draw.instanceCount || entry.firstInstance != draw.firstInstance) continue;
+        if (entry.hasColorTarget != state.hasColorTarget || entry.colorAddress != state.color.address || entry.colorBytes != state.color.bytes || !std::ranges::equal(entry.attributes, attributes)) continue;
+        return &entry.plan;
+    }
+    return nullptr;
+}
+
+void keepFetchPlan(DrawReplayInputs& replay, std::span<const ShaderRecompiler::VertexAttribute> attributes, const State& state, const Pm4::DrawParameters& draw, std::uint32_t maxIndex, const VertexFetchPlan& planned) {
+    auto& entry = replay.fetchPlans[replay.nextFetchPlan++ % replay.fetchPlans.size()];
+    // Valid only once the copy is whole: a copy that throws leaves an empty slot, not half a plan
+    // under a new key.
+    entry.valid = false;
+    entry.attributes.assign(attributes.begin(), attributes.end());
+    entry.maxIndex = maxIndex;
+    entry.firstVertex = draw.firstVertex;
+    entry.instanceCount = draw.instanceCount;
+    entry.firstInstance = draw.firstInstance;
+    entry.hasColorTarget = state.hasColorTarget;
+    entry.colorAddress = state.color.address;
+    entry.colorBytes = state.color.bytes;
+    entry.plan = planned;
+    entry.valid = true;
+}
+
+bool sameFetches(std::span<const VertexFetch> first, std::span<const VertexFetch> second) {
+    return std::ranges::equal(first, second, [](const VertexFetch& a, const VertexFetch& b) { return a.begin == b.begin && a.end == b.end && a.stride == b.stride && a.fetchIndex == b.fetchIndex && a.alignment == b.alignment; });
+}
+
+bool sameFetchPlan(const VertexFetchPlan& first, const VertexFetchPlan& second) {
+    return first.zero == second.zero && first.zeroBytes == second.zeroBytes && first.fetchOf == second.fetchOf && sameFetches(first.fetches, second.fetches) && first.fetchValid == second.fetchValid && first.soloFetches == second.soloFetches && first.isSolo == second.isSolo && sameFetches(first.plannedFetches, second.plannedFetches) && first.plannedOf == second.plannedOf && first.copies.copies == second.copies.copies && first.copies.copyOf == second.copies.copyOf && first.copies.offsets == second.copies.offsets && first.copies.alignments == second.copies.alignments;
+}
+
+// A zero vertex buffer of `bytes` for a replay: the recipe's while a batch still keeps it, else a
+// new one the recipe remembers. Nothing writes a zero buffer after its fill, so the draws of every
+// batch can bind the same one.
+std::shared_ptr<Buffer> replayZeroBuffer(const Context& context, DrawReplayInputs& replay, std::size_t bytes) {
+    const auto held = std::find_if(replay.zeroBuffers.begin(), replay.zeroBuffers.end(), [&](const DrawReplayInputs::ZeroBuffer& entry) { return entry.bytes == bytes; });
+    if (held != replay.zeroBuffers.end()) {
+        if (auto zero = held->buffer.lock()) {
+            if (ReplayInputsMode() == 2 && (zero->Bytes().size() != bytes || std::any_of(zero->Bytes().begin(), zero->Bytes().end(), [](std::byte value) { return value != std::byte{0}; }))) replayDisagrees("a zero vertex buffer");
+            return zero;
+        }
+    }
+    auto zero = zeroVertexBuffer(context, bytes);
+    if (held != replay.zeroBuffers.end()) held->buffer = zero;
+    else replay.zeroBuffers.push_back({bytes, zero});
     return zero;
 }
 
@@ -1151,7 +1314,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
-            highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            auto* replay = replayInputs(recipe);
+            highest = replay != nullptr ? replayHighestIndex(*context.recorder, *replay, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart) : InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
@@ -1221,58 +1385,40 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     // The per-draw fetch bookkeeping lives in the thread's scratch (ThreadOwned), not on the heap.
     struct FetchScratch {
-        std::vector<VertexFetch> fetches;
-        std::vector<std::size_t> fetchValid;
-        std::vector<std::size_t> fetchOf;
+        VertexFetchPlan planned;
         std::vector<std::shared_ptr<Buffer>> zeroed;
-        std::vector<std::uint8_t> isSolo;
-        std::vector<VertexFetch> plannedFetches;
-        std::vector<std::size_t> plannedOf;
         std::vector<VkBuffer> rangeHandles;
         std::vector<VkDeviceSize> rangeOffsets;
         std::vector<VkBuffer> soloHandles;
     };
     auto& scratch = ThreadScratch<FetchScratch, FetchScratch>();
-    auto& fetches = scratch.fetches;
-    auto& fetchValid = scratch.fetchValid;
-    fetches.clear();
-    fetchValid.clear();
-    auto& fetchOf = scratch.fetchOf;
-    fetchOf.assign(attributes.size(), 0);
     auto& zeroed = scratch.zeroed;
-    zeroed.assign(attributes.size(), nullptr);
-    for (std::size_t i = 0; i < attributes.size(); ++i) {
-        const auto& attribute = attributes[i];
-        if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
-            zeroed[i] = zeroVertexBuffer(context, attribute);
-            continue;
+    // A replay (APS5_EXPERIMENT_REPLAY_INPUTS) takes the plan its recipe made for the same inputs and
+    // the recipe's zero buffers; otherwise the plan is made here, with the zero buffers.
+    auto* replay = args == nullptr ? replayInputs(recipe) : nullptr;
+    const VertexFetchPlan* remembered = replay != nullptr ? replayFetchPlan(*replay, attributes, state, draw, inputs.maxIndex) : nullptr;
+    if (remembered != nullptr && ReplayInputsMode() == 2) {
+        planVertexFetches(context, state, draw, attributes, args, inputs.maxIndex, scratch.planned, nullptr);
+        if (!sameFetchPlan(*remembered, scratch.planned)) replayDisagrees("the vertex fetch plan");
+    }
+    if (remembered == nullptr) {
+        planVertexFetches(context, state, draw, attributes, args, inputs.maxIndex, scratch.planned, replay == nullptr ? &zeroed : nullptr);
+        if (replay != nullptr) keepFetchPlan(*replay, attributes, state, draw, inputs.maxIndex, scratch.planned);
+    }
+    const auto& planned = remembered != nullptr ? *remembered : scratch.planned;
+    if (replay != nullptr) {
+        zeroed.assign(attributes.size(), nullptr);
+        for (std::size_t i = 0; i < attributes.size(); ++i) {
+            if (planned.zero[i] != 0) zeroed[i] = replayZeroBuffer(context, *replay, planned.zeroBytes[i]);
         }
-        // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
-        const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
-        const auto& fields = attribute.resource.fields;
-        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
-        const auto firstByte = args == nullptr ? VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance) : 0;
-        Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address + firstByte, "vertex buffer aliases the render target");
-        const auto stride = (fields[1] >> 16u) & 0x3fffu;
-        fetchOf[i] = fetches.size();
-        fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
-        const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
-        fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
-    const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    auto& isSolo = scratch.isSolo;
-    isSolo.assign(fetches.size(), 0);
-    for (const auto f : soloFetches) isSolo[f] = 1;
-    auto& plannedFetches = scratch.plannedFetches;
-    plannedFetches.clear();
-    auto& plannedOf = scratch.plannedOf;
-    plannedOf.assign(fetches.size(), 0);
-    for (std::size_t f = 0; f < fetches.size(); ++f) {
-        if (isSolo[f]) continue;
-        plannedOf[f] = plannedFetches.size();
-        plannedFetches.push_back(fetches[f]);
-    }
-    const auto plan = PlanVertexCopies(plannedFetches);
+    const auto& fetches = planned.fetches;
+    const auto& fetchValid = planned.fetchValid;
+    const auto& fetchOf = planned.fetchOf;
+    const auto& soloFetches = planned.soloFetches;
+    const auto& isSolo = planned.isSolo;
+    const auto& plannedOf = planned.plannedOf;
+    const auto& plan = planned.copies;
     auto& rangeHandles = scratch.rangeHandles;
     auto& rangeOffsets = scratch.rangeOffsets;
     rangeHandles.clear();
@@ -1613,20 +1759,47 @@ struct Kept {
     std::unique_ptr<DeviceBuffer> scratch;
 };
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_BINDINGS, COMMITTER-PLAN S7): a recorded draw keeps the
+// objects consecutive draws share (template, pipeline, framebuffer, targets) once per batch
+// (Recorder::KeepOnce) and only its own copies per draw, and its pass image lists live in the
+// thread's scratch; see ShaderResources.cpp for the template's side.
+bool ReplayBindings() {
+    static const bool enabled = std::getenv("APS5_EXPERIMENT_REPLAY_BINDINGS") != nullptr;
+    return enabled;
+}
+
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::uint32_t> slices, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
-    auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
-    kept->pipeline = std::move(pipeline);
-    kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
-    kept->scratch = std::move(scratch);
-    kept->targets = std::move(targets);
-    const auto& residents = kept->targets;
-    recorder.Keep(kept);
+    std::shared_ptr<Kept> kept;
+    if (ReplayBindings()) {
+        // The draw's own copies first and the template last, as a Kept releases them (a batch
+        // releases its kept objects front to back). An object a draw earlier in the batch kept is
+        // not kept again: the batch holds it until it completes either way.
+        if (inputs.indices != nullptr || !inputs.vertexBuffers.empty() || scratch != nullptr) {
+            auto copies = std::make_shared<Kept>();
+            copies->indices = std::move(inputs.indices);
+            copies->vertexBuffers = std::move(inputs.vertexBuffers);
+            copies->scratch = std::move(scratch);
+            recorder.Keep(std::move(copies));
+        }
+        for (const auto& target : targets) recorder.KeepOnce(target);
+        recorder.KeepOnce(framebuffer);
+        recorder.KeepOnce(pipeline);
+        recorder.KeepOnce(resources);
+    } else {
+        kept = std::make_shared<Kept>();
+        kept->resources = resources;
+        kept->pipeline = std::move(pipeline);
+        kept->framebuffer = std::move(framebuffer);
+        kept->indices = std::move(inputs.indices);
+        kept->vertexBuffers = std::move(inputs.vertexBuffers);
+        kept->scratch = std::move(scratch);
+        kept->targets = std::move(targets);
+        recorder.Keep(kept);
+    }
+    const auto& residents = kept != nullptr ? kept->targets : targets;
     if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
@@ -1874,8 +2047,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
+    // APS5_EXPERIMENT_REPLAY_BINDINGS (COMMITTER-PLAN S7): the image lists go into the thread's
+    // scratch like passReads (the pass hazards copy what they keep), not into new vectors per draw.
+    std::vector<std::pair<VkImage, bool>> ownImages;
+    std::vector<std::pair<VkImage, bool>> ownAttachments;
+    struct PassImagesTag {};
+    struct PassAttachmentsTag {};
+    auto& passImages = ReplayBindings() ? ThreadScratch<std::vector<std::pair<VkImage, bool>>, PassImagesTag>() : ownImages;
+    auto& passAttachments = ReplayBindings() ? ThreadScratch<std::vector<std::pair<VkImage, bool>>, PassAttachmentsTag>() : ownAttachments;
+    resources.StorageImages(passImages);
+    passAttachments.clear();
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);

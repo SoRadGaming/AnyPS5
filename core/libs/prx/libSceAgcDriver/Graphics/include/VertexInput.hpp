@@ -292,6 +292,24 @@ struct VertexCopyPlan {
     std::vector<std::uint32_t> alignments;
 };
 
+// The part of a draw's vertex input that only depends on its attributes, its vertex and instance
+// range and the color target the fetches are checked against (Draw.cpp's planVertexFetches): per
+// attribute whether it binds a zero buffer (a null or out-of-range descriptor) and of how many
+// bytes, else the fetch it reads; the fetch ranges with their valid bytes; the fetches copied alone
+// with zero padding; and the copy plan of the others.
+struct VertexFetchPlan {
+    std::vector<std::uint8_t> zero;
+    std::vector<std::size_t> zeroBytes;
+    std::vector<std::size_t> fetchOf;
+    std::vector<VertexFetch> fetches;
+    std::vector<std::size_t> fetchValid;
+    std::vector<std::size_t> soloFetches;
+    std::vector<std::uint8_t> isSolo;
+    std::vector<VertexFetch> plannedFetches;
+    std::vector<std::size_t> plannedOf;
+    VertexCopyPlan copies;
+};
+
 inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     VertexCopyPlan plan;
     plan.copyOf.assign(fetches.size(), 0);

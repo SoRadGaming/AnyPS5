@@ -254,6 +254,12 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    // Keep for the open batch once: an object the batch already kept this way is skipped (the
+    // template, pipeline, framebuffer and targets consecutive draws share, see Draw.cpp's
+    // keepRecordedDraw under APS5_EXPERIMENT_REPLAY_BINDINGS). Null is ignored.
+    template <typename T> void KeepOnce(const std::shared_ptr<T>& object) {
+        if (object != nullptr && noteKeptOnce(object.get())) Keep(object);
+    }
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
@@ -707,6 +713,8 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
+        // The objects KeepOnce kept (each is in `kept`, so no address repeats while the batch lives).
+        std::unordered_set<const void*> keptOnce;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
@@ -912,6 +920,8 @@ private:
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
     void dropStaleHoldKept();
+    // KeepOnce's test: opens a batch when none is open; whether `object` is new to its keptOnce.
+    bool noteKeptOnce(const void* object);
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
     // Records the pending store and the run's trailing barrier; the next store starts a new run.

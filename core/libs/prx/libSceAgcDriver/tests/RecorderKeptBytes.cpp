@@ -238,6 +238,26 @@ void SharedOwnerCountsOncePerBatch() {
     recorder.Sync();
 }
 
+// Recorder::KeepOnce (the kept dedupe of APS5_EXPERIMENT_REPLAY_BINDINGS): the draws of one batch
+// keep a shared object once, a null object is ignored, and the next batch keeps it again rather
+// than relying on the submitted one, so the object lives while either batch is in flight.
+void KeepOnceKeepsOncePerBatch() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    auto object = std::make_shared<int>(0);
+    const std::weak_ptr<int> watched = object;
+    for (int keep = 0; keep < 3; ++keep) recorder.KeepOnce(object);
+    recorder.KeepOnce(std::shared_ptr<int>{});
+    Expect(recorder.Recording() && watched.use_count() == 2, "three KeepOnce calls for one object in one batch hold " + std::to_string(watched.use_count() - 1) + " references to it, not one");
+    recorder.Submit();
+    recorder.KeepOnce(object);
+    Expect(watched.use_count() == 3, "the next batch did not keep an object the submitted batch kept once");
+    object.reset();
+    Expect(!watched.expired(), "an object kept once by two batches in flight was released");
+    recorder.Sync();
+}
+
 void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST) {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -309,6 +329,7 @@ int main() {
         SyncedWithinTwiceTheBudget();
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
+        KeepOnceKeepsOncePerBatch();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);

@@ -573,9 +573,12 @@ configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_write_tracking_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_write_tracking COMMAND agc_write_tracking_tests)
-    set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION): the same with the bump at a walk's first stamp.
+    add_test(NAME agc_write_tracking_lazy_generation COMMAND agc_write_tracking_tests)
+    set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_write_tracking_lazy_generation PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_LAZY_GENERATION=1")
     if(WIN32)
-        set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1320,6 +1323,29 @@ if(BUILD_TESTING)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_BINDINGS): the draw snapshot suites with the pool sizes
+    # from the build, the kept dedupe, the pass image lists in scratch and the hoisted
+    # CompletePendingCpuWrites gate.
+    add_test(NAME agc_draw_snapshots_replay_bindings COMMAND agc_driver_recorder_tests --draw-snapshots-only)
+    add_test(NAME agc_draw_snapshot_epoch_replay_bindings COMMAND agc_driver_recorder_tests --draw-snapshot-epoch-only)
+    add_test(NAME agc_draw_inputs_in_place_replay_bindings COMMAND agc_driver_recorder_tests --draw-inputs-in-place-only)
+    set_tests_properties(agc_draw_snapshots_replay_bindings agc_draw_snapshot_epoch_replay_bindings agc_draw_inputs_in_place_replay_bindings PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_EXPERIMENT_REPLAY_BINDINGS=1")
+    if(WIN32)
+        set_tests_properties(agc_draw_snapshots_replay_bindings agc_draw_snapshot_epoch_replay_bindings agc_draw_inputs_in_place_replay_bindings PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION): the suites whose memos are keyed by the
+    # tracker generation, with the bump at a walk's first stamp.
+    add_test(NAME agc_draw_snapshots_lazy_generation COMMAND agc_driver_recorder_tests --draw-snapshots-only)
+    add_test(NAME agc_draw_snapshot_epoch_lazy_generation COMMAND agc_driver_recorder_tests --draw-snapshot-epoch-only)
+    add_test(NAME agc_draw_snapshots_watched_imports_lazy_generation COMMAND agc_driver_recorder_tests --draw-snapshots-only)
+    add_test(NAME agc_unchanged_cpu_stamps_lazy_generation COMMAND agc_driver_recorder_tests --unchanged-cpu-stamps-only)
+    set_tests_properties(agc_draw_snapshots_lazy_generation agc_draw_snapshot_epoch_lazy_generation agc_unchanged_cpu_stamps_lazy_generation PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_EXPERIMENT_LAZY_GENERATION=1")
+    set_tests_properties(agc_draw_snapshots_watched_imports_lazy_generation PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_EXPERIMENT_LAZY_GENERATION=1;APS5_WRITE_WATCH_IMPORTS=watch")
+    if(WIN32)
+        set_tests_properties(agc_draw_snapshots_lazy_generation agc_draw_snapshot_epoch_lazy_generation agc_draw_snapshots_watched_imports_lazy_generation agc_unchanged_cpu_stamps_lazy_generation PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_pending_key_stores COMMAND agc_driver_recorder_tests --pending-key-stores-only)
     set_tests_properties(agc_pending_key_stores PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_shadowed_key_stores COMMAND agc_driver_recorder_tests --shadowed-key-stores-only)
@@ -1358,8 +1384,11 @@ configure_windows_unwind(agc_recorder_kept_bytes_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_recorder_kept_bytes COMMAND agc_recorder_kept_bytes_tests)
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_BINDINGS): with the kept dedupe.
+    add_test(NAME agc_recorder_kept_bytes_replay_bindings COMMAND agc_recorder_kept_bytes_tests)
+    set_tests_properties(agc_recorder_kept_bytes_replay_bindings PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_REPLAY_BINDINGS=1")
     if(WIN32)
-        set_tests_properties(agc_recorder_kept_bytes PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_kept_bytes agc_recorder_kept_bytes_replay_bindings PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -2079,6 +2108,26 @@ if(BUILD_TESTING)
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
             endif()
         endforeach()
+    endforeach()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS): the recipe round trips with the replay input
+    # memos, every reused answer checked against the ordinary computation (=2 aborts on a difference).
+    foreach(agcReplayTest IN ITEMS agc_driver_depth_bias_per_face agc_driver_draw_cache_reuse agc_driver_draw_cache_relocation)
+        add_test(NAME ${agcReplayTest}_replay_inputs COMMAND ${agcReplayTest}_tests)
+        set_tests_properties(${agcReplayTest}_replay_inputs PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_REPLAY_INPUTS=2;APS5_VERIFY_DRAW_RECIPE=1;APS5_VERIFY_REGISTER_KEYS=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcReplayTest}_replay_inputs PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_BINDINGS): recorded draws, recipe hits and template
+    # hits with the per-template precompute, the kept dedupe and the hoisted gate.
+    foreach(agcBindingsTest IN ITEMS agc_driver_graphics agc_driver_depth_bias_per_face agc_driver_draw_cache_reuse)
+        add_test(NAME ${agcBindingsTest}_replay_bindings COMMAND ${agcBindingsTest}_tests)
+        set_tests_properties(${agcBindingsTest}_replay_bindings PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_REPLAY_BINDINGS=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcBindingsTest}_replay_bindings PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
     endforeach()
 
     add_test(NAME agc_driver_stencil_replay_no_gpl COMMAND agc_driver_stencil_replay_tests)

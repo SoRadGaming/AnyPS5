@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HighestIndexMemo.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -13,9 +14,11 @@
 #endif
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1092,6 +1095,108 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS): a draw recipe's highest-index memo answers only
+// while its range is unchanged since the collect made before its scan, under the same guest
+// allocations: a driver store over the range, a CPU store seen by a new epoch's collect and a
+// registry change each make it miss, a store beside the range's block does not.
+void CheckHighestIndexMemo() {
+    constexpr std::size_t bytes = 2 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() {
+#ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+            munmap(memory, bytes);
+#endif
+        }
+    } cleanup{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    constexpr std::size_t count = 600;
+    constexpr std::size_t rangeBytes = count * sizeof(std::uint16_t);
+    const auto address = base + 256;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto value = static_cast<std::uint16_t>(index % 100);
+        std::memcpy(memory + 256 + index * sizeof(value), &value, sizeof(value));
+    }
+    AgcDriver::Graphics::HighestIndexMemo memo;
+    // As a replay asks (Draw.cpp's replayHighestIndex): the registry generation, then the collect.
+    std::optional<std::uint32_t> found;
+    const auto find = [&](bool skipRestart = false) {
+        const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto generation = CollectWrites(address, rangeBytes);
+        return memo.Find(address, rangeBytes, 2, skipRestart, generation, registry, found);
+    };
+    const auto keep = [&](std::uint32_t highest) {
+        const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto generation = CollectWrites(address, rangeBytes);
+        Require(generation != 0, "the index range is not collected");
+        memo.Keep(address, rangeBytes, 2, false, generation, registry, highest);
+    };
+    BumpCollectEpoch();
+    Require(!find(), "an empty memo answered");
+    keep(99);
+    Require(find() && found == 99u, "an unchanged index range missed the memo");
+    Require(!find(true), "a range scanned without the restart rule answered for it");
+
+    MarkWritten(address + 64, 4);
+    Require(!find(), "a driver store over the index range kept the memo");
+    keep(99);
+    Require(find() && found == 99u, "a range kept after a driver store missed the memo");
+
+    const std::uint16_t raised = 700;
+    std::memcpy(memory + 256 + 7 * sizeof(raised), &raised, sizeof(raised));
+    BumpCollectEpoch();
+    Require(!find(), "a CPU store seen by a new epoch's collect kept the memo");
+    keep(700);
+    Require(find() && found == 700u, "a range kept after a CPU store missed the memo");
+
+    MarkWritten(base + Block + 64, 4);
+    Require(find() && found == 700u, "a driver store beside the index range's block dropped the memo");
+
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(address), rangeBytes);
+    Require(!find(), "a guest allocation change kept the memo");
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION): with the switch a walk that finds nothing
+// written leaves the tracker generation where it was, without it every walk moves it; either way a
+// walk that stamps returns the next generation, and only the blocks it stamped read as changed
+// since the generation before it.
+void CheckLazyGeneration() {
+    const bool lazy = std::getenv("APS5_EXPERIMENT_LAZY_GENERATION") != nullptr;
+    constexpr std::size_t bytes = 2 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() {
+#ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+            munmap(memory, bytes);
+#endif
+        }
+    } cleanup{memory};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto synced = CollectWritesUncached(base, bytes);
+    Require(synced != 0 && UnchangedSince(base, bytes, synced), "the test block is not collected");
+
+    const auto clean = CollectWritesUncached(base, bytes);
+    Require(lazy ? clean == synced : clean == synced + 1, lazy ? "a walk that found nothing written moved the tracker generation" : "a walk that found nothing written did not move the tracker generation");
+    Require(TrackerGeneration() == clean && UnchangedSince(base, bytes, clean), "a clean walk's generation is not current");
+
+    static_cast<volatile std::uint8_t*>(memory)[8] = 0x22;
+    const auto stamped = CollectWritesUncached(base, bytes);
+    Require(stamped == clean + 1, "a walk that stamped did not return the next generation");
+    Require(!UnchangedSince(base, Block, clean) && UnchangedSince(base, bytes, stamped), "a stamping walk's block does not read as changed since the generation before it");
+    Require(UnchangedSince(base + Block, Block, clean), "a stamping walk stamped a block it did not find written");
+}
+
 int main() {
     try {
         if (!WriteWatched()) {
@@ -1133,6 +1238,8 @@ int main() {
         CheckStoreAcrossImports();
         CheckUnwatchedImport();
         CheckCommittedRanges();
+        CheckHighestIndexMemo();
+        CheckLazyGeneration();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;
