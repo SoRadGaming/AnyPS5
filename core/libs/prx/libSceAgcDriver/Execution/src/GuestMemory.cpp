@@ -1861,8 +1861,9 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 
 std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
-    // Under the mutex: a collect bumps the generation before its walk, and a walk still running
-    // when the value is read absorbs stores made after it with a stamp not newer than the value.
+    // Under the mutex: a collect bumps the generation before its walk (at its first stamp under
+    // APS5_EXPERIMENT_LAZY_GENERATION), and a walk still running when the value is read absorbs
+    // stores made after it with a stamp not newer than the value.
     const auto lock = lockTracker(tracker);
     return tracker.generation;
 }
