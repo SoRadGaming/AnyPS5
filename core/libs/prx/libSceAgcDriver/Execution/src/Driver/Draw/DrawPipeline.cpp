@@ -38,7 +38,63 @@ int roomWake() {
     return mode;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_COMMIT_RUNS=1): when the front item is a draw or a label, the
+// committer takes the GPU mutex once and commits the draws and labels behind it under the same
+// hold, up to 8 commits (=N for N >= 2: up to N) or about CommitRunWindow. It ends the run early
+// when another thread waits for the mutex (GpuMutexType::Waiters), when the next item is anything
+// else, and when the queue is empty, so it never waits for work while it holds the mutex. Each
+// commit still runs its own closure and takes the mutex itself, which now nests, and each item is
+// popped as soon as it finished, as before. 0 when off.
+std::size_t commitRunItems() {
+    static const std::size_t items = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_COMMIT_RUNS");
+        if (text == nullptr) return std::size_t{0};
+        const auto value = std::strtoull(text, nullptr, 10);
+        return value >= 2 ? static_cast<std::size_t>(std::min<unsigned long long>(value, 64)) : std::size_t{8};
+    }();
+    return items;
 }
+
+constexpr std::chrono::microseconds CommitRunWindow{150};
+
+struct CurrentRunTag {};
+
+// How a commit ended: `failed` for an exception (a failed commit in the report), `shutdown` for
+// the process shutting down, which is not reported to the driver.
+struct CommitOutcome {
+    std::exception_ptr fatal;
+    bool failed = false;
+    bool shutdown = false;
+};
+
+template<typename TWork>
+CommitOutcome guarded(TWork&& work) {
+    CommitOutcome outcome;
+    try {
+        work();
+    } catch (const std::exception&) {
+        outcome.failed = true;
+        outcome.fatal = std::current_exception();
+    } catch (const ProcessShutdown&) {
+        outcome.shutdown = true;
+        outcome.fatal = std::current_exception();
+    } catch (...) {
+        outcome.fatal = std::current_exception();
+    }
+    return outcome;
+}
+
+}
+
+// The committer's state for one run, reachable from the commits inside it through a thread slot.
+struct DrawPipeline::CommitRun {
+    std::size_t left = 0;
+    std::chrono::steady_clock::time_point until{};
+    // The check the commits left to the run's end (Driver::submitDueAfterRun), run once.
+    void (*deferred)() = nullptr;
+    bool labelReaped = false;
+    std::exception_ptr unreported;
+};
 
 DrawPipeline& DrawPipeline::Queue0() {
     static DrawPipeline* pipeline = new DrawPipeline();
@@ -90,7 +146,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_REPORT") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -122,7 +178,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -155,8 +211,13 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
+    if (runs != 0) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "; %llu commit runs of %.1f commits on average", static_cast<unsigned long long>(runs), static_cast<double>(runCommits) / static_cast<double>(runs));
+        drainText += item;
+    }
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = runs = runCommits = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -165,7 +226,7 @@ void DrawPipeline::run() {
     StartCommitterSampler();
     if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("committer");
     for (;;) {
-        Commit* commit = nullptr;
+        Item* front = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -173,53 +234,112 @@ void DrawPipeline::run() {
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (items.empty()) break;
-            commit = stopped ? nullptr : &items.front().commit;
+            front = stopped ? nullptr : &items.front();
         }
-        const auto start = std::chrono::steady_clock::now();
-        std::exception_ptr fatal;
-        bool failed = false;
-        bool shutdown = false;
-        try {
-            if (commit != nullptr) {
-                PerformanceTimer itemTiming("Committer.Item");
-                (*commit)();
-            }
-        } catch (const std::exception&) {
-            failed = true;
-            fatal = std::current_exception();
-        } catch (const ProcessShutdown&) {
-            shutdown = true;
-            fatal = std::current_exception();
-        } catch (...) {
-            fatal = std::current_exception();
-        }
-        const auto spent = elapsedNs(start);
-        if (fatal != nullptr && !stopped) {
-            stopped = true;
-            if (!shutdown) Driver::Get().ReportFailure(fatal);
-        }
-        Item done;
-        {
-            std::lock_guard lock(mutex);
-            done = std::move(items.front());
-            items.pop_front();
-            ++commits;
-            commitNs += spent;
-            if (failed) ++commitErrors;
-            if (fatal != nullptr && failure == nullptr) failure = fatal;
-            outstanding.fetch_sub(1, std::memory_order_release);
-            if (roomWake() == 0) {
-                if (idleWaiters != 0) idle.notify_all();
-            } else {
-                // Only drains wait on `idle` here. Every queued item is popped in turn (a stopped
-                // committer pops without committing), so while a producer waits for room the queue
-                // passes half depth and that pop wakes it.
-                if (idleWaiters != 0 && items.empty()) idle.notify_all();
-                if (roomWaiters != 0 && items.size() <= Depth() / 2) room.notify_all();
-            }
-        }
-        retire(std::move(done));
+        if (front != nullptr && front->kind != ItemKind::Other && commitRunItems() != 0) commitRun(front);
+        else commitFront(front, nullptr);
     }
+}
+
+// Commits the front item (nothing once the pipeline stopped), then pops and retires it. Inside a
+// run it returns the item the run continues with, chosen under the pipeline mutex with the pop.
+DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
+    const auto start = std::chrono::steady_clock::now();
+    auto outcome = guarded([&] {
+        if (front != nullptr) {
+            PerformanceTimer itemTiming("Committer.Item");
+            front->commit();
+        }
+    });
+    const auto finished = std::chrono::steady_clock::now();
+    auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - start).count());
+    if (run == nullptr && outcome.fatal != nullptr && !stopped) {
+        stopped = true;
+        if (!outcome.shutdown) Driver::Get().ReportFailure(outcome.fatal);
+    }
+    Item done;
+    Item* next = nullptr;
+    {
+        std::unique_lock lock(mutex);
+        if (run != nullptr) {
+            ++runCommits;
+            // The next item is only read here; the producer appends behind it and only the
+            // committer pops, so it stays valid once the front is popped.
+            if (outcome.fatal == nullptr && --run->left != 0 && finished < run->until && items.size() >= 2 && items[1].kind != ItemKind::Other && GuestMemory::GpuMutex().Waiters() == 0) {
+                next = &items[1];
+            } else {
+                ++runs;
+                // The checks the run's commits left to its end belong to its last commit: they run
+                // before its item is popped, so a drain returns only after them, and their failure
+                // is that commit's failure.
+                if (outcome.fatal == nullptr && run->deferred != nullptr) {
+                    lock.unlock();
+                    outcome = guarded(run->deferred);
+                    spent = elapsedNs(start);
+                    lock.lock();
+                }
+            }
+            // Reported once the run gave up the GPU mutex (commitRun).
+            if (outcome.fatal != nullptr && !stopped) {
+                stopped = true;
+                if (!outcome.shutdown) run->unreported = outcome.fatal;
+            }
+        }
+        done = std::move(items.front());
+        items.pop_front();
+        ++commits;
+        commitNs += spent;
+        if (outcome.failed) ++commitErrors;
+        if (outcome.fatal != nullptr && failure == nullptr) failure = outcome.fatal;
+        outstanding.fetch_sub(1, std::memory_order_release);
+        if (roomWake() == 0) {
+            if (idleWaiters != 0) idle.notify_all();
+        } else {
+            // Only drains wait on `idle` here. Every queued item is popped in turn (a stopped
+            // committer pops without committing), so while a producer waits for room the queue
+            // passes half depth and that pop wakes it.
+            if (idleWaiters != 0 && items.empty()) idle.notify_all();
+            if (roomWaiters != 0 && items.size() <= Depth() / 2) room.notify_all();
+        }
+    }
+    retire(std::move(done));
+    return next;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_COMMIT_RUNS=1): one GPU-mutex hold for a run of draws and
+// labels starting at `front` (see commitRunItems). A failure ends the run; it is reported to the
+// driver after the hold, since the report takes the driver's own locks to fail outputs and flips.
+void DrawPipeline::commitRun(Item* front) {
+    using CurrentRun = HostThreadSlot<CommitRun*, CurrentRunTag>;
+    CommitRun run;
+    run.left = commitRunItems();
+    run.until = std::chrono::steady_clock::now() + CommitRunWindow;
+    {
+        GuestMemory::TagGpuLockSite(front->kind == ItemKind::Label ? GuestMemory::GpuLockSite::Label : GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        struct Current {
+            explicit Current(CommitRun& run) { CurrentRun::Set(&run); }
+            ~Current() { CurrentRun::Set(nullptr); }
+        } current{run};
+        while (front != nullptr) front = commitFront(front, &run);
+    }
+    if (run.unreported != nullptr) Driver::Get().ReportFailure(run.unreported);
+}
+
+bool DrawPipeline::DeferToRunEnd(void (*check)()) {
+    if (commitRunItems() == 0) return false;
+    using CurrentRun = HostThreadSlot<CommitRun*, CurrentRunTag>;
+    auto* run = CurrentRun::Get();
+    if (run == nullptr) return false;
+    run->deferred = check;
+    return true;
+}
+
+bool DrawPipeline::LabelReapDue() {
+    if (commitRunItems() == 0) return true;
+    using CurrentRun = HostThreadSlot<CommitRun*, CurrentRunTag>;
+    auto* run = CurrentRun::Get();
+    return run == nullptr || !std::exchange(run->labelReaped, true);
 }
 
 void DrawPipeline::retire(Item&& item) {

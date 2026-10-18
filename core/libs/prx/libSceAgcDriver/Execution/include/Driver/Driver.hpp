@@ -257,6 +257,9 @@ private:
     void commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes);
     void commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt);
     void submitDueAfterCommit(VulkanDevice* localDevice);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_COMMIT_RUNS=1): submitDueAfterCommit once at the end of a
+    // run of commits under one GPU-mutex hold (DrawPipeline::DeferToRunEnd), on the current device.
+    static void submitDueAfterRun();
     std::optional<WrittenBuffer> newestWriterLocked(std::uint64_t begin, std::uint64_t end) const;
     std::optional<WrittenBuffer> newestWriter(std::uint64_t begin, std::uint64_t end);
     std::string describeWriters(std::uint64_t begin, std::uint64_t end);

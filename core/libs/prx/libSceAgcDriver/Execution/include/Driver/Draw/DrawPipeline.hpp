@@ -24,6 +24,9 @@ public:
     using Commit = std::function<void()>;
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
+    // What a queued commit records, named by the draw and label enqueues: consecutive draws and
+    // labels may share one GPU-mutex hold (APS5_EXPERIMENT_COMMIT_RUNS), anything else commits alone.
+    enum class ItemKind : std::uint8_t { Other, Draw, Label };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -33,7 +36,7 @@ public:
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -42,6 +45,12 @@ public:
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_COMMIT_RUNS=1): the committer commits consecutive draws and
+    // labels under one GPU-mutex hold (a run). A commit inside a run leaves its after-commit check to
+    // the run's end with DeferToRunEnd, which returns false outside a run, where the caller runs the
+    // check itself; LabelReapDue lets only the run's first label reap finished batches.
+    static bool DeferToRunEnd(void (*check)());
+    static bool LabelReapDue();
 
 private:
     struct Item {
@@ -49,9 +58,13 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        ItemKind kind = ItemKind::Other;
     };
+    struct CommitRun;
     DrawPipeline() = default;
     void run();
+    Item* commitFront(Item* front, CommitRun* run);
+    void commitRun(Item* front);
     void retire(Item&& item);
     void reap();
     void rethrowFailure();
@@ -87,6 +100,8 @@ private:
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
+    std::uint64_t runs = 0;
+    std::uint64_t runCommits = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

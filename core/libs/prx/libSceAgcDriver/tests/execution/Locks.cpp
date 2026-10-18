@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -151,6 +152,32 @@ void GpuMutexRecursion() {
     Check(counter == 80000, "every nested increment under the GPU mutex counted");
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_COMMIT_RUNS=1): a thread blocked on the held GPU mutex is
+// counted until it got the mutex; the holder's own nested locks are not waits. Without the switch
+// nothing is counted.
+void GpuMutexWaiters() {
+    auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+    const bool counted = std::getenv("APS5_EXPERIMENT_COMMIT_RUNS") != nullptr;
+    Check(mutex.Waiters() == 0, "no thread waits for the free GPU mutex");
+    mutex.lock();
+    mutex.lock();
+    Check(mutex.Waiters() == 0, "the holder's nested lock is not counted as a wait");
+    std::atomic<bool> acquired{false};
+    std::thread waiter([&] {
+        std::lock_guard lock(mutex);
+        acquired = true;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (counted && mutex.Waiters() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (!counted) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Check(mutex.Waiters() == (counted ? 1u : 0u), counted ? "a thread blocked on the held GPU mutex is not counted" : "a wait for the GPU mutex was counted without APS5_EXPERIMENT_COMMIT_RUNS");
+    Check(!acquired, "another thread took the held GPU mutex");
+    mutex.unlock();
+    mutex.unlock();
+    waiter.join();
+    Check(acquired && mutex.Waiters() == 0, "the waiting thread did not take the released GPU mutex or is still counted");
+}
+
 template<typename TTag>
 void SlotIsolation(const char* what) {
     using Slot = HostThreadSlot<std::uint64_t, TTag>;
@@ -211,6 +238,7 @@ int main() {
     MutexWakesSleeper();
     DeviceGate();
     GpuMutexRecursion();
+    GpuMutexWaiters();
     ThreadSlots();
     if (failures != 0) {
         std::fprintf(stderr, "%d lock check(s) failed\n", failures);

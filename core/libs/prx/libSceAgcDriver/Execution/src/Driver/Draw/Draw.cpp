@@ -646,7 +646,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             notePipelinePrograms(programs);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw);
         if (exactBatchCap()) drawCountedAtCommit() = true;
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
@@ -698,7 +698,8 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         ~SubmitDue() noexcept(false) {
             if (std::uncaught_exceptions() != 0) return;
             if (countWork) Graphics::Recorder::CountRecordedWork();
-            driver.submitDueAfterCommit(device.get());
+            // Inside a run of commits (APS5_EXPERIMENT_COMMIT_RUNS) the check runs once, at its end.
+            if (!DrawPipeline::DeferToRunEnd(&Driver::submitDueAfterRun)) driver.submitDueAfterCommit(device.get());
         }
     } submitDue{*this, localDevice, exactBatchCap()};
     recordLabelsForPacket(localDevice.get(), queue);

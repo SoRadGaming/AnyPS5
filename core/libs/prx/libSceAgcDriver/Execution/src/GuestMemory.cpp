@@ -2116,10 +2116,41 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 
 namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_COMMIT_RUNS=1): a thread blocked on the mutex is counted for as
+// long as it waits, spinning or asleep, so the draw committer, which then holds the mutex across a
+// run of commits, ends the run at the next commit (GpuMutexType::Waiters). Off, nothing is counted.
+bool WaitersCounted() {
+    static const bool counted = std::getenv("APS5_EXPERIMENT_COMMIT_RUNS") != nullptr;
+    return counted;
+}
+
+class CountedWait {
+public:
+    explicit CountedWait(std::atomic<std::uint32_t>& waiting) : counter(WaitersCounted() ? &waiting : nullptr) {
+        if (counter != nullptr) counter->fetch_add(1, std::memory_order_relaxed);
+    }
+    ~CountedWait() {
+        if (counter != nullptr) counter->fetch_sub(1, std::memory_order_relaxed);
+    }
+    CountedWait(const CountedWait&) = delete;
+    CountedWait& operator=(const CountedWait&) = delete;
+
+private:
+    std::atomic<std::uint32_t>* counter;
+};
 }
 
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
+    if (HeldByThisThread()) return;
+    if (!WaitersCounted()) {
+        LockSpinning(mutex, HandoffSpinWindow());
+        return;
+    }
+    // Only a contended acquisition counts as a wait.
+    if (mutex.try_lock()) return;
+    const CountedWait counted(waiting);
+    LockSpinning(mutex, HandoffSpinWindow());
 }
 
 bool GpuMutexType::tryEnter() {
@@ -2203,7 +2234,10 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex, HandoffSpinWindow());
+                {
+                    const CountedWait counted(waiting);
+                    LockSpinning(mutex, HandoffSpinWindow());
+                }
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -2221,7 +2255,10 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        LockSpinning(mutex, HandoffSpinWindow());
+        {
+            const CountedWait counted(waiting);
+            LockSpinning(mutex, HandoffSpinWindow());
+        }
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);

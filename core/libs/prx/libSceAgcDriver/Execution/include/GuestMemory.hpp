@@ -147,6 +147,10 @@ public:
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_COMMIT_RUNS=1): how many threads are blocked in lock() (0
+    // without the switch, which counts nothing). The draw committer holds the mutex across a run of
+    // commits and ends the run at the next commit when another thread waits.
+    std::uint32_t Waiters() const { return waiting.load(std::memory_order_relaxed); }
 
 private:
     void enter();
@@ -157,6 +161,7 @@ private:
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};
     std::uint32_t depth = 0;
+    std::atomic<std::uint32_t> waiting{0};
 };
 GpuMutexType& GpuMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:

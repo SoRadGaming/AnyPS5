@@ -397,7 +397,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
         GuestMemory::SetCurrentPacket(opcode, queue);
         commitLabel(queue, address, bytes, endOfPipeInterrupt);
-    }, std::move(writes), address, std::move(stored));
+    }, std::move(writes), address, std::move(stored), DrawPipeline::ItemKind::Label);
     return true;
 }
 
@@ -410,7 +410,9 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
-        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        // Inside a run of commits (APS5_EXPERIMENT_COMMIT_RUNS) only the run's first label reaps
+        // finished batches before it records; the end-of-pipe steps below still reap per label.
+        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue, DrawPipeline::LabelReapDue()) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
@@ -430,7 +432,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         }
         if (!deferred) AgcDriverDeliverEopInterrupt(queue);
     }
-    submitDueAfterCommit(localDevice.get());
+    if (!DrawPipeline::DeferToRunEnd(&Driver::submitDueAfterRun)) submitDueAfterCommit(localDevice.get());
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
@@ -439,6 +441,11 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
     if (due || capped) localDevice->SubmitRecorded(true);
+}
+
+void Driver::submitDueAfterRun() {
+    auto& driver = Get();
+    driver.submitDueAfterCommit(driver.device.Load().get());
 }
 
 }

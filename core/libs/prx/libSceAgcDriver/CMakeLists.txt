@@ -2069,7 +2069,8 @@ if(BUILD_TESTING)
     set(committerExperimentCases
             "room_wake|APS5_EXPERIMENT_ROOM_WAKE=1"
             "room_spin|APS5_EXPERIMENT_ROOM_WAKE=2"
-            "exact_batch_cap|APS5_EXPERIMENT_EXACT_BATCH_CAP=1,APS5_BATCH_CAP=2")
+            "exact_batch_cap|APS5_EXPERIMENT_EXACT_BATCH_CAP=1,APS5_BATCH_CAP=2"
+            "commit_runs|APS5_EXPERIMENT_COMMIT_RUNS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
@@ -2082,7 +2083,9 @@ if(BUILD_TESTING)
             "same_queue_label_wait|same_queue_label_wait|none"
             "queue_zero_late_interrupt|queue_zero_late_interrupt|none"
             "shutdown_threads_draw_committer|shutdown_threads|--draw-committer"
-            "draw_cache_reuse|draw_cache_reuse|none")
+            "draw_cache_reuse|draw_cache_reuse|none"
+            "locks|locks|none"
+            "pm4|pm4|none")
     add_test(NAME agc_driver_draw_pipeline_commits_failure COMMAND agc_driver_draw_pipeline_commits_tests --failure)
     add_test(NAME agc_driver_draw_pipeline_commits_closing COMMAND agc_driver_draw_pipeline_commits_tests --closing)
     set(committerExperimentTests agc_driver_draw_pipeline_commits_failure agc_driver_draw_pipeline_commits_closing)
