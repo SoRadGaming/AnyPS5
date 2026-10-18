@@ -1,6 +1,11 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
@@ -10,16 +15,27 @@
 #endif
 #include <windows.h>
 #endif
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -270,6 +286,211 @@ void DepthDrawRecipe(AgcDriver::VulkanDevice& device) {
     Require(rejectedDepthOutcome == AgcDriver::RecipeOutcome::Rebuild, "a recipe with depth must be rejected when depth target is removed");
 }
 
+// buffer_load_dword v0, off, s[0:3], 0; s_waitcnt vmcnt(0); exp mrt0 v0, v0, v0, v0 done vm: every
+// pixel gets the first dword of the buffer the V# in the pixel shader's user data names.
+alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{
+    0xe0300000, 0x80000000, 0xbf8c3f70, 0xf800180f, 0x00000000, 0xbf810000, 0xbf810000, 0xbf810000,
+};
+
+std::array<std::uint32_t, 4> ConstantDescriptor(std::uint64_t address, std::uint32_t bytes) {
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_MOVED_RECIPES): the recipe of a draw whose pixel shader reads
+// its color through a read-only V#. The first draw builds the template and a recipe; a draw whose
+// V# moved to other bytes is a template hit with a moved buffer (the content key leaves its
+// address out), which builds a recipe only under the switch. Under it a hit of either recipe
+// renders the bytes its own V# names, misses while they are behind a pending GPU write, a queued
+// label store or pending storage-image results (and records once they settled), and retires a
+// depth surface made over its color target since the recipe was built. Without the switch only
+// the refusal of the second recipe is checked.
+void MovedBufferDrawRecipe(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::RecipeOutcome;
+    const bool movedRecipes = std::getenv("APS5_EXPERIMENT_MOVED_RECIPES") != nullptr;
+    constexpr std::uint32_t TargetWidth = 128;
+    constexpr std::uint32_t TargetHeight = 128;
+    constexpr std::uint32_t ConstantBytes = 16;
+    constexpr std::size_t SlotBytes = 256;
+    const AgcDriver::Graphics::ColorTargetLayout colorLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4);
+    Require(colorLayout.Bytes() == GuestBlock::BlockBytes, "the moved-buffer target does not fill its block");
+
+    const GuestBlock guestVertices;
+    const GuestBlock guestTarget;
+    const GuestBlock guestOther;
+    const GuestBlock guestConstants;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    if (AgcDriver::Graphics::HostImportFor(context, guestConstants.Address(), GuestBlock::BlockBytes) == nullptr) {
+        std::puts("moved-buffer draw recipe test skipped: the constants cannot be read in place");
+        return;
+    }
+    std::memset(guestTarget.Data(), static_cast<int>(Kept), GuestBlock::BlockBytes);
+    std::memset(guestOther.Data(), static_cast<int>(Kept), GuestBlock::BlockBytes);
+    // One constant per slot: A and B for the two draws, C for a hit at a third place, P behind a
+    // pending GPU write, L under a label store.
+    enum Slot : std::size_t { SlotA, SlotB, SlotC, SlotP, SlotL, SlotCount };
+    constexpr std::array<float, SlotCount> Values{0.2f, 0.6f, 1.0f, 0.4f, 0.0f};
+    constexpr float LabelValue = 0.8f;
+    const auto slotAddress = [&](std::size_t slot) { return guestConstants.Address() + slot * SlotBytes; };
+    for (std::size_t slot = 0; slot < SlotCount; ++slot) std::memcpy(guestConstants.Data() + slot * SlotBytes, &Values[slot], sizeof(float));
+
+    auto* triangle = reinterpret_cast<std::array<float, 4>*>(guestVertices.Data());
+    triangle[0] = {-1.0f, -1.0f, 0.5f, 1.0f};
+    triangle[1] = {3.0f, -1.0f, 0.5f, 1.0f};
+    triangle[2] = {-1.0f, 3.0f, 0.5f, 1.0f};
+    const auto target = device.Target();
+
+    std::vector<std::uint32_t> vertexUserData(4, 0u);
+    const auto vertexBuffer = BufferDescriptor(triangle, 16u, 3u);
+    std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
+    ShaderRecompiler::RecompileRequest vertex{
+        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(VertexCode.data()), VertexCode, 0, {}},
+        {WaveSize, 0, vertexUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
+        target,
+        {0, 0, 0, 64}
+    };
+    vertex.useCache = false;
+    const auto vertexResult = ShaderRecompiler::Recompile(vertex);
+    const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
+
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
+    pixel.posX = true;
+    pixel.posY = true;
+    pixel.targetOutputMode[0] = 9;
+    pixel.targetExportMapping.fill(0xe4u);
+    std::vector<std::uint32_t> pixelUserData(8, 0u);
+    const auto constant = ConstantDescriptor(slotAddress(SlotA), ConstantBytes);
+    std::copy(constant.begin(), constant.end(), pixelUserData.begin());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(ConstantPixelCode.data()), std::as_bytes(std::span(ConstantPixelCode))}}};
+    ShaderRecompiler::RecompileRequest fragment{
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(ConstantPixelCode.data()), ConstantPixelCode, 0, {}},
+        {WaveSize, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
+        target,
+        PixelPushLayout(vertexPush, target)
+    };
+    fragment.useCache = false;
+    const auto pixelResult = ShaderRecompiler::Recompile(fragment);
+    const auto guestBuffers = std::ranges::find_if(pixelResult.bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.count == 1u && binding.guestDescriptor.size() == 4u; });
+    Require(guestBuffers != pixelResult.bindings.end() && !guestBuffers->bufferWritten.empty() && !guestBuffers->bufferWritten.front(), "the constant pixel shader does not bind its V# as one read-only guest buffer");
+    const auto bindingIndex = static_cast<std::size_t>(guestBuffers - pixelResult.bindings.begin());
+    // The same compiled variant with the V# moved to each slot (or to the other target's memory),
+    // as the driver hands a draw whose descriptor words moved: only the address bits change.
+    std::vector<ShaderRecompiler::RecompileResult> pixels;
+    const auto moveTo = [&](std::uint64_t address) {
+        auto moved = pixelResult;
+        auto& words = moved.bindings[bindingIndex].guestDescriptor;
+        words[0] = static_cast<std::uint32_t>(address);
+        words[1] = (words[1] & 0xffff0000u) | static_cast<std::uint32_t>((address >> 32u) & 0xffffu);
+        return moved;
+    };
+    pixels.reserve(SlotCount + 1);
+    for (std::size_t slot = 0; slot < SlotCount; ++slot) pixels.push_back(moveTo(slotAddress(slot)));
+    pixels.push_back(moveTo(guestOther.Address()));
+    const auto shadersAt = [&](std::size_t index) {
+        return std::array<AgcDriver::Graphics::CompiledShader, 2>{{
+            {ShaderStage::Vertex, &vertexResult, 0},
+            {ShaderStage::Fragment, &pixels[index], PixelPushOffset(vertexPush, target)}
+        }};
+    };
+    constexpr std::size_t AtOther = SlotCount;
+
+    AgcDriver::Graphics::State state{};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, WaveSize, WaveSize, std::nullopt, std::nullopt};
+    state.color = {guestTarget.Address(), {TargetWidth, TargetHeight}, VK_FORMAT_R8G8B8A8_UNORM, colorLayout.Bytes(), 0xe4u, AgcDriver::Graphics::ColorTileMode::RenderTarget};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {TargetWidth, TargetHeight};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(TargetHeight), static_cast<float>(TargetWidth), -static_cast<float>(TargetHeight), 0, 1};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, {TargetWidth, TargetHeight}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    state.blendConstants = {};
+    auto otherState = state;
+    otherState.color.address = guestOther.Address();
+    otherState.colors = {otherState.color};
+    const AgcDriver::Pm4::DrawParameters draw{0, 3u, 0, 1, 0, false};
+
+    // The target is one color everywhere, so its bytes read the same in any tiling.
+    const auto expect = [&](float value, const std::string& what) {
+        AgcDriver::Graphics::StorageTexture::FlushPending(guestTarget.Address(), colorLayout.Bytes(), nullptr, "test");
+        device.WaitIdle();
+        const auto expected = static_cast<int>(value * 255.0f + 0.5f);
+        for (std::size_t offset = 0; offset < colorLayout.Bytes(); offset += 509) {
+            const auto actual = static_cast<int>(guestTarget.Data()[offset]);
+            Require(actual + 1 >= expected && actual <= expected + 1, what + ": the target holds " + std::to_string(actual) + " at byte " + std::to_string(offset) + ", expected " + std::to_string(expected));
+        }
+    };
+    const auto hit = [&](const std::shared_ptr<const AgcDriver::DrawRecipe>& recipe, std::size_t index) {
+        return device.DrawFromRecipe(state, draw, shadersAt(index), {}, recipe);
+    };
+
+    std::shared_ptr<const AgcDriver::DrawRecipe> recipeA;
+    device.Draw(state, draw, shadersAt(SlotA), {}, &recipeA);
+    expect(Values[SlotA], "the draw that built the template");
+    if (recipeA == nullptr) {
+        std::puts("moved-buffer draw recipe test skipped: the template is not reusable on this device");
+        return;
+    }
+    std::shared_ptr<const AgcDriver::DrawRecipe> recipeB;
+    device.Draw(state, draw, shadersAt(SlotB), {}, &recipeB);
+    expect(Values[SlotB], "the template hit whose buffer moved");
+    // A recipe over the first draw's template is the moved hit's; a build of its own (the hit
+    // refused) would carry another template.
+    const auto sharesTemplate = [&] {
+        const auto shared = recipeA->templateRef.lock();
+        return shared != nullptr && recipeB != nullptr && recipeB->templateRef.lock() == shared;
+    };
+    if (!movedRecipes) {
+        Require(!sharesTemplate(), "a template hit whose read-only buffer moved built a draw recipe without APS5_EXPERIMENT_MOVED_RECIPES");
+        return;
+    }
+    Require(sharesTemplate(), "a template hit whose read-only buffer moved built no draw recipe over the template");
+
+    Require(hit(recipeA, SlotC) == RecipeOutcome::Recorded, "the first draw's recipe refused a moved buffer");
+    expect(Values[SlotC], "a recipe hit whose buffer moved from where the recipe's draw read it");
+    Require(hit(recipeB, SlotA) == RecipeOutcome::Recorded, "the moved draw's recipe refused the template's own buffer");
+    expect(Values[SlotA], "a recipe hit whose buffer is back where the template read it");
+
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(recorder != nullptr, "no recorder is active");
+        recorder->NotePendingWrite(slotAddress(SlotP), ConstantBytes);
+    }
+    Require(hit(recipeA, SlotP) == RecipeOutcome::Rebuild, "a recipe hit read a moved buffer behind a pending GPU write");
+    device.WaitIdle();
+    Require(hit(recipeA, SlotP) == RecipeOutcome::Recorded, "a recipe hit refused a moved buffer whose GPU write completed");
+    expect(Values[SlotP], "a recipe hit after the moved buffer's GPU write completed");
+
+    Require(hit(recipeA, SlotB) == RecipeOutcome::Recorded, "a recipe hit refused a settled moved buffer");
+    const auto label = std::bit_cast<std::array<std::byte, 4>>(LabelValue);
+    Require(device.WriteLabelOnGpu(slotAddress(SlotL), label, 1, 0, false) == 0, "the label store over the moved buffer was not recorded on the GPU");
+    Require(hit(recipeA, SlotL) == RecipeOutcome::Rebuild, "a recipe hit read a moved buffer under a queued label store");
+    device.WaitIdle();
+    Require(hit(recipeA, SlotL) == RecipeOutcome::Recorded, "a recipe hit refused a moved buffer whose label store landed");
+    expect(LabelValue, "a recipe hit reading the label's value");
+
+    device.Draw(otherState, draw, shadersAt(SlotA));
+    Require(hit(recipeA, AtOther) == RecipeOutcome::Rebuild, "a recipe hit read a moved buffer under pending storage-image results");
+    AgcDriver::Graphics::StorageTexture::FlushPending(guestOther.Address(), GuestBlock::BlockBytes, nullptr, "test");
+    device.WaitIdle();
+    Require(hit(recipeA, AtOther) == RecipeOutcome::Recorded, "a recipe hit refused a moved buffer whose storage-image results were stored");
+    // The other target's stored bytes (A's color in every byte) read as a float far below 1/255.
+    expect(0.0f, "a recipe hit reading the stored results");
+
+    const AgcDriver::Graphics::DepthTarget overColor{guestTarget.Address(), 0, {TargetWidth, TargetHeight}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    AgcDriver::Graphics::DepthSurfaceView(context, overColor);
+    Require(AgcDriver::Graphics::DepthSurfaceOverlaps(device.Device(), guestTarget.Address(), colorLayout.Bytes()), "no depth surface was made over the color target");
+    Require(hit(recipeA, SlotB) == RecipeOutcome::Recorded, "a recipe hit refused after a depth surface was made over its target");
+    Require(!AgcDriver::Graphics::DepthSurfaceOverlaps(device.Device(), guestTarget.Address(), colorLayout.Bytes()), "a recipe hit kept the depth surface made over its color target");
+    expect(Values[SlotB], "the recipe hit that retired the depth surface");
+}
+
 }
 
 int main() {
@@ -284,6 +505,10 @@ int main() {
         Check(true, true, "both faces pulled closer");
         Draw(*device, -Bias, 0.0f);
         Check(true, false, "only front faces biased");
+        // Before DepthDrawRecipe, which leaves its target's results pending over the blocks it
+        // frees: a block allocated after it can be given the same memory, and the moved-buffer
+        // test reads its blocks' bytes. It stores its own results before its blocks go.
+        MovedBufferDrawRecipe(*device);
         DepthDrawRecipe(*device);
         std::puts("per-face depth bias tests passed");
         return 0;
