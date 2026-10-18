@@ -97,6 +97,9 @@ CommitOutcome guarded(TWork&& work) {
 struct DrawPipeline::CommitRun {
     std::size_t left = 0;
     std::chrono::steady_clock::time_point until{};
+    // Taken before the run waited for the GPU mutex: the first commit's time includes that wait,
+    // as a commit's time included its own lock wait.
+    std::chrono::steady_clock::time_point started{};
     // The check the commits left to the run's end (Driver::submitDueAfterRun), run once.
     void (*deferred)() = nullptr;
     bool labelReaped = false;
@@ -256,7 +259,7 @@ void DrawPipeline::run() {
 // Commits the front item (nothing once the pipeline stopped), then pops and retires it. Inside a
 // run it returns the item the run continues with, chosen under the pipeline mutex with the pop.
 DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
-    const auto start = std::chrono::steady_clock::now();
+    const auto start = run != nullptr && run->started != std::chrono::steady_clock::time_point{} ? std::exchange(run->started, {}) : std::chrono::steady_clock::now();
     auto outcome = guarded([&] {
         if (front == nullptr) return;
         PerformanceTimer itemTiming("Committer.Item");
@@ -285,8 +288,8 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
         std::unique_lock lock(mutex);
         if (run != nullptr) {
             ++runCommits;
-            // The next item is only read here; the producer appends behind it and only the
-            // committer pops, so it stays valid once the front is popped.
+            // The next item stays in place when the front is popped: the producer only appends and
+            // only the committer pops.
             if (outcome.fatal == nullptr && --run->left != 0 && finished < run->until && items.size() >= 2 && items[1].kind != ItemKind::Other && GuestMemory::GpuMutex().Waiters() == 0) {
                 next = &items[1];
             } else {
@@ -335,10 +338,11 @@ void DrawPipeline::commitRun(Item* front) {
     using CurrentRun = HostThreadSlot<CommitRun*, CurrentRunTag>;
     CommitRun run;
     run.left = commitRunItems();
-    run.until = std::chrono::steady_clock::now() + CommitRunWindow;
+    run.started = std::chrono::steady_clock::now();
     {
         GuestMemory::TagGpuLockSite(front->kind == ItemKind::Label ? GuestMemory::GpuLockSite::Label : GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        run.until = std::chrono::steady_clock::now() + CommitRunWindow;
         struct Current {
             explicit Current(CommitRun& run) { CurrentRun::Set(&run); }
             ~Current() { CurrentRun::Set(nullptr); }
