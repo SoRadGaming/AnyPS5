@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +24,7 @@ struct Counters {
     std::array<std::atomic<std::uint64_t>, DrawTicket::PartCount> used{};
     std::array<std::atomic<std::uint64_t>, DrawTicket::PartCount> clear{};
     std::array<std::atomic<std::uint64_t>, DrawTicket::PartCount> disagreed{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TicketEvent::Count)> events{};
 };
 
 Counters& counters() {
@@ -80,10 +83,12 @@ void settleReference(TicketReference&& reference, const Context& context) {
     }
 }
 
-// Every strong reference the ticket holds, moved out of it (none in Q1: its parts are values).
+// Every strong reference the ticket holds, moved out of it: the template hint and the pipeline.
 void takeReferences(DrawTicket& ticket, std::vector<TicketReference>& out) {
-    static_cast<void>(ticket);
-    static_cast<void>(out);
+    if (ticket.resources != nullptr) out.push_back({ticket.device, std::move(ticket.resources), nullptr});
+    if (ticket.pipeline != nullptr) out.push_back({ticket.device, nullptr, std::move(ticket.pipeline)});
+    // The memo names the template only by address; it must not outlive the reference.
+    ticket.memo.owner = nullptr;
 }
 
 }
@@ -100,6 +105,69 @@ int Q0Ticket() {
 bool Q0TicketsBuilt() {
     static const bool built = Q0Ticket() != 0 || GuestMemory::Q0PrepStats() >= 2;
     return built;
+}
+
+int Q0Template() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_Q0_TEMPLATE");
+        if (text == nullptr || Q0Ticket() == 0) return 0;
+        return std::strtol(text, nullptr, 10) == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+bool Q0ByteShadow() {
+    static const bool shadow = [] {
+        if (GuestMemory::Q0PrepStats() < 3) return false;
+        if (std::getenv("APS5_EXPERIMENT_LAZY_GENERATION") != nullptr) return true;
+        std::fprintf(stderr, "[q0prep] APS5_DEBUG_Q0_PREP_STATS=3 needs APS5_EXPERIMENT_LAZY_GENERATION=1: no byte shadow (as =2)\n");
+        return false;
+    }();
+    return shadow;
+}
+
+namespace {
+
+// The serials a Q4 re-check requires unchanged (COMMITTER-MAP 3.2, commit steps 3 and 4).
+bool byteSerialsHold(std::uint64_t pendingSerial, std::uint64_t allocations, std::uint64_t forgetSerial) {
+    return (forgetSerial & 1u) == 0 && StorageTexture::PendingSerial() == pendingSerial && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == allocations && GuestMemory::ForgetSerial() == forgetSerial;
+}
+
+}
+
+void NoteTicketIndex(const DrawTicket& ticket, std::uint64_t address, std::uint64_t bytes) {
+    if (!ticket.indexShadow.has_value()) return;
+    NoteTicketEvent(TicketEvent::IndexOffered);
+    const auto& shadow = *ticket.indexShadow;
+    if (shadow.address != address || shadow.bytes != bytes) {
+        NoteTicketEvent(TicketEvent::IndexOther);
+        return;
+    }
+    // The committer's own collect first (a memo hit after InPlaceIndexRange's), then the stamp.
+    GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
+    if (!GuestMemory::UnchangedSince(address, static_cast<std::size_t>(bytes), shadow.generation)) NoteTicketEvent(TicketEvent::IndexStamp);
+    else if (!byteSerialsHold(ticket.pendingSerial, ticket.allocationsGeneration, ticket.forgetSerial)) NoteTicketEvent(TicketEvent::IndexGuard);
+    else NoteTicketEvent(TicketEvent::IndexPass);
+}
+
+void NoteTicketSlice(const ShaderResources::TicketBindings& ticket, std::uint64_t begin, std::size_t bytes, bool copied) {
+    NoteTicketEvent(TicketEvent::SliceOffered);
+    const auto found = std::find_if(ticket.slices.begin(), ticket.slices.end(), [&](const ShaderResources::TicketSlice& slice) { return slice.begin == begin && slice.bytes == bytes; });
+    if (found == ticket.slices.end()) {
+        NoteTicketEvent(TicketEvent::SliceUnpredicted);
+        return;
+    }
+    GuestMemory::CollectWrites(begin, bytes);
+    if (!GuestMemory::UnchangedSince(begin, bytes, found->generation)) NoteTicketEvent(TicketEvent::SliceStamp);
+    else if (!byteSerialsHold(ticket.pendingSerial, ticket.allocations, ticket.forgetSerial)) NoteTicketEvent(TicketEvent::SliceGuard);
+    else NoteTicketEvent(TicketEvent::SlicePass);
+    if (copied) NoteTicketEvent(TicketEvent::SliceCopied);
+}
+
+bool Q0TemplateParts() {
+    // Used tickets with the switch, and the shadow tickets of APS5_DEBUG_Q0_PREP_STATS=2.
+    static const bool parts = Q0Template() != 0 || (Q0Ticket() == 0 && GuestMemory::Q0PrepStats() >= 2);
+    return parts;
 }
 
 const Q0PrepDepth& Q0PrepDepths() {
@@ -149,7 +217,10 @@ TicketUse TicketPartUseBuilt(const DrawTicket& ticket, DrawTicket::Part part) {
     }
     if (counting()) counters().used[index].fetch_add(1, std::memory_order_relaxed);
     if (ticket.shadow) return TicketUse::Shadow;
-    return Q0Ticket() == 2 ? TicketUse::Verify : TicketUse::Use;
+    // The template parts verify under APS5_EXPERIMENT_Q0_TEMPLATE=2, the others under =2 of
+    // APS5_EXPERIMENT_Q0_TICKET.
+    const bool templatePart = part == DrawTicket::Template || part == DrawTicket::Moved || part == DrawTicket::Push || part == DrawTicket::Pipeline;
+    return (templatePart ? Q0Template() == 2 : Q0Ticket() == 2) ? TicketUse::Verify : TicketUse::Use;
 }
 
 void TicketDisagrees(DrawTicket::Part part, TicketUse use, const char* what) {
@@ -187,6 +258,10 @@ void ReleaseTicketReferences(DrawTicket& ticket, const Context& context) {
     for (auto& reference : left) settleReference(std::move(reference), context);
 }
 
+void NoteTicketEvent(TicketEvent event) {
+    if (counting()) counters().events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
 void NoteTicketSkip(TicketSkip skip) {
     if (!counting()) return;
     (skip == TicketSkip::Shallow ? counters().shallow : counters().locked).fetch_add(1, std::memory_order_relaxed);
@@ -220,6 +295,7 @@ TicketCounts TakeTicketCounts() {
         counts.clear[index] = all.clear[index].exchange(0, std::memory_order_relaxed);
         counts.disagreed[index] = all.disagreed[index].exchange(0, std::memory_order_relaxed);
     }
+    for (std::size_t index = 0; index < counts.events.size(); ++index) counts.events[index] = all.events[index].exchange(0, std::memory_order_relaxed);
     return counts;
 }
 

@@ -38,6 +38,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 // parameter and alias checks Draw would run (each part only when all its checks passed) and the
 // color targets' layouts and resident surfaces.
 void FillDrawTicketChecks(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): queue 0's Q2 parts: the content key, the
+// template hint (FindHint, or Probe for a shadow ticket) and, with a hint, its moved-candidate
+// memo, the push block and the store's pipeline (CachedPipelineIfPresent, lookup only).
+void FillDrawTicketTemplate(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const PreparedDraw* prepared);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 

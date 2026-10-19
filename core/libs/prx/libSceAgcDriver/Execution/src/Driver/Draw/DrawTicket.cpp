@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -47,6 +49,32 @@ struct PartTimer {
     }
 };
 
+// LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): queue 0 collects the draw's index range (at least 1024
+// indices) and the hint's predicted small slices, then reads the registries' serials after them
+// (COMMITTER-MAP 3.2: collect first); no byte is read or copied. The committer only counts
+// (NoteTicketIndex, NoteTicketSlice).
+void fillByteShadow(Graphics::DrawTicket& ticket, const TicketInputs& inputs, const DrawPipeline::PrepareBudget& budget) {
+    constexpr std::uint32_t IndexMinimum = 1024;
+    const PartTimer timer{Graphics::DrawTicket::ByteShadow};
+    const auto& draw = inputs.parameters;
+    if (draw.indexed && draw.indexCount >= IndexMinimum) {
+        const auto bytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+        if (const auto generation = GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(bytes)); generation != 0) ticket.indexShadow = Graphics::DrawTicket::IndexShadow{draw.indexAddress, bytes, generation};
+    }
+    if (ticket.resources != nullptr) {
+        std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+        ticket.resources->PredictDrawSlices(ticket.memo, ranges);
+        for (const auto& [begin, bytes] : ranges) {
+            if (budget.Stop()) break;
+            if (const auto generation = GuestMemory::CollectWrites(begin, bytes); generation != 0) ticket.sliceShadows.push_back({begin, bytes, generation});
+        }
+    }
+    ticket.pendingSerial = Graphics::StorageTexture::PendingSerial();
+    ticket.allocationsGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    ticket.forgetSerial = GuestMemory::ForgetSerial();
+    ticket.parts |= Graphics::DrawTicket::ByteShadow;
+}
+
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, COMMITTER-SPLIT-PLAN Q1): queue 0 builds the draw's
 // ticket inside Enqueue, in a GuestMemory::PrepareScope and without GpuMutex. The context is the
 // device's without a recorder or copied writers, so any recorder use on this path faults at once;
@@ -76,6 +104,11 @@ void prepareTicket(void* self, const DrawPipeline::PrepareBudget& budget) {
             else ticket->writerRanges.clear();
         }
         Graphics::FillDrawTicketChecks(*ticket, context, *inputs.state, inputs.parameters, inputs.stages);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE, COMMITTER-SPLIT-PLAN Q2): the template hint
+        // and its parts, unless the committer is about to run dry.
+        if (Graphics::Q0TemplateParts() && !budget.Stop()) Graphics::FillDrawTicketTemplate(*ticket, context, *inputs.state, inputs.parameters, inputs.stages, inputs.prepared);
+        // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, in full pipeline waits only.
+        if (Graphics::Q0ByteShadow() && budget.full && !budget.Stop()) fillByteShadow(*ticket, inputs, budget);
         Graphics::NoteTicketBuilt(*ticket);
         *inputs.slot = std::move(ticket);
     } catch (const std::exception&) {
@@ -179,6 +212,15 @@ void Driver::reportQ0Prep() {
         parts += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[q0prep] tickets (10 s, %s): built %llu, skipped shallow %llu, skipped holding the GPU mutex %llu; refused at the commit: device %llu, pool %llu; parts:%s\n", Graphics::Q0Ticket() == 0 ? "shadow" : Graphics::Q0Ticket() == 2 ? "verify" : "used", count(tickets.built), count(tickets.shallow), count(tickets.locked), count(tickets.refusedDevice), count(tickets.refusedPool), parts.c_str());
+    if (!Graphics::Q0TemplateParts()) return;
+    // What the committer did with the template parts (TicketEvent).
+    std::string events;
+    for (std::size_t index = 0; index < tickets.events.size(); ++index) {
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s %llu", Graphics::TicketEventNames[index], count(tickets.events[index]));
+        events += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[q0prep] ticket templates (10 s):%s\n", events.c_str());
 }
 
 }

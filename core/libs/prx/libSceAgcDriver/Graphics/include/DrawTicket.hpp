@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -17,7 +19,8 @@
 namespace AgcDriver::Graphics {
 
 class BufferPool;
-class ShaderResources;
+class Pipeline;
+struct PreparedDraw;
 
 // LOCAL EXPERIMENT (COMMITTER-SPLIT-PLAN, room-wait draw tickets): what queue 0 prepared for one
 // pipelined draw while it waited for room in DrawPipeline::Enqueue, before the push. The ticket
@@ -38,9 +41,18 @@ struct DrawTicket {
         AliasesChecked = 1u << 3,  // CheckBufferAliases (a template hit's alias checks) passed
         Targets = 1u << 4,         // `targets`: each color target's layout and resident surface
         WriterRanges = 1u << 5,    // `writerRanges`: noteDrawWriters' ranges, noted at the commit
+        // Q2: the template hint and what derives from it (APS5_EXPERIMENT_Q0_TEMPLATE). Every part
+        // after Template is for `resources` and is used only when the committer's accepted
+        // template is that same object.
+        Template = 1u << 6,        // `cacheableShaders`, the content key and the hint `resources` (null: a miss, never trusted)
+        Moved = 1u << 7,           // `memo`: the hint's moved-candidate walk for these stages
+        Push = 1u << 8,            // `pushBytes` / `pushStages` with the hint's push patches
+        Pipeline = 1u << 9,        // `pipeline`: the store's pipeline for the hint, `pipelinePrepared` and `proxiedMask`
+        // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, counted at the commit, never used.
+        ByteShadow = 1u << 10,
     };
-    static constexpr std::size_t PartCount = 6;
-    static constexpr std::array<const char*, PartCount> PartNames{"abi", "stencil", "validated", "aliases", "targets", "writers"};
+    static constexpr std::size_t PartCount = 11;
+    static constexpr std::array<const char*, PartCount> PartNames{"abi", "stencil", "validated", "aliases", "targets", "writers", "template", "moved", "push", "pipeline", "bytes"};
     // Identity: the device and buffer pool the ticket was built for (TicketFor refuses another).
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<BufferPool> pool;
@@ -62,6 +74,37 @@ struct DrawTicket {
         GuestTextureResource surface{};
     };
     std::vector<Target> targets;
+    // Q2. The content key is the PreparedDraw's (`preparedKey`, which the draw's closure keeps) or
+    // `ownKey`, built with the ticket's context exactly as resolveDrawResources builds it.
+    bool cacheableShaders = false;
+    const std::vector<std::uint32_t>* preparedKey = nullptr;
+    std::vector<std::uint32_t> ownKey;
+    const std::vector<std::uint32_t>& Key() const { return preparedKey != nullptr ? *preparedKey : ownKey; }
+    std::shared_ptr<ShaderResources> resources;
+    ShaderResources::MovedWordsMemo memo;
+    std::array<std::byte, PipelinePushConstantBytes> pushBytes{};
+    VkShaderStageFlags pushStages = 0;
+    std::shared_ptr<Graphics::Pipeline> pipeline;
+    // The PreparedDraw whose vertex layout and fragment outputs the pipeline was looked up with,
+    // and the targets predicted to render through an attachment proxy (bit per color target).
+    const PreparedDraw* pipelinePrepared = nullptr;
+    std::uint32_t proxiedMask = 0;
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3, the byte shadow of COMMITTER-SPLIT-PLAN 1.8 without
+    // any copy): in a full pipeline wait queue 0 collects the index range (at least 1024 indices)
+    // and the hint's predicted small slices, then reads the pending, allocation and forget serials.
+    // The committer counts at the index scan and at each slice how often a Q4 re-check (its own
+    // collect, UnchangedSince that generation, the serials unchanged) would have passed.
+    struct IndexShadow {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t generation = 0;
+    };
+    std::optional<IndexShadow> indexShadow;
+    std::vector<ShaderResources::TicketSlice> sliceShadows;
+    std::uint64_t pendingSerial = 0;
+    std::uint64_t allocationsGeneration = 0;
+    std::uint64_t forgetSerial = 0;
+    ShaderResources::TicketBindings ByteBindings() const { return {sliceShadows, pendingSerial, allocationsGeneration, forgetSerial}; }
     DrawTicket() = default;
     DrawTicket(const DrawTicket&) = delete;
     DrawTicket& operator=(const DrawTicket&) = delete;
@@ -77,6 +120,24 @@ int Q0Ticket();
 // Whether queue 0 builds tickets at all: APS5_EXPERIMENT_Q0_TICKET, or the shadow tickets of
 // APS5_DEBUG_Q0_PREP_STATS=2 (built and compared, never used).
 bool Q0TicketsBuilt();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): 0 off; 1 queue 0 adds the template hint, the moved-candidate memo,
+// the push block and the pipeline to its tickets (requires APS5_EXPERIMENT_Q0_TICKET, ignored
+// without it), and the committer uses them after checking the template's identity; 2 the same
+// with the committer also probing the cache, running today's CachedPipeline, push assembly and
+// memo-less MovedReadOnlyBuffers, and aborting on a difference (template membership is counted,
+// never aborted on). Shadow tickets (APS5_DEBUG_Q0_PREP_STATS=2) carry these parts too, built
+// with lookup-only probes. Read once.
+int Q0Template();
+bool Q0TemplateParts();
+// LOCAL DEBUG: APS5_DEBUG_Q0_PREP_STATS=3 builds the byte shadow; it needs
+// APS5_EXPERIMENT_LAZY_GENERATION=1 (queue 0's extra walks would otherwise move the tracker
+// generation and retire the committer's slice memos) and acts as =2 without it (said once).
+bool Q0ByteShadow();
+// The committer's counts of the byte shadow (TicketEvent Index* / Slice*): at the in-place index
+// scan of a draw whose ticket collected its index range, and at each small slice
+// PrepareDrawBindings takes (`copied`: today's path copied it, what Q4 would save).
+void NoteTicketIndex(const DrawTicket& ticket, std::uint64_t address, std::uint64_t bytes);
+void NoteTicketSlice(const ShaderResources::TicketBindings& ticket, std::uint64_t begin, std::size_t bytes, bool copied);
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_PREP_DEPTH=<pre>:<bail>, a comma also separates): queue 0 prepares a ticket
 // only when it finds at least `pre` items queued (default 3), and stops between parts once
 // `bail` or fewer are left (default 2). 0:0 prepares every draw (tests).
@@ -134,6 +195,13 @@ void ReleaseTicketReference(TicketReference reference);
 void DrainTicketRelease(const Context& context);
 void ReleaseTicketReferences(DrawTicket& ticket, const Context& context);
 
+// What the committer did with a ticket's template parts (APS5_DEBUG_Q0_PREP_STATS): the hint used,
+// found uncached, or a miss the committer's Find found or not; Revalidate refusing the template;
+// the memo kept or rebuilt; the pipeline accepted or refused by reason; the push block used.
+enum class TicketEvent : std::uint8_t { HintUsed, HintUncached, MissFound, MissAbsent, HintRevalidateFailed, OtherTemplate, MemoKept, MemoRebuilt, PipelineAccepted, PipelineNotLean, PipelineStencil, PipelineOtherTemplate, PipelineOtherPrepared, PipelineProxies, PipelineAbandoned, PushUsed, PushOtherTemplate, IndexOffered, IndexOther, IndexPass, IndexStamp, IndexGuard, SliceOffered, SliceUnpredicted, SlicePass, SliceStamp, SliceGuard, SliceCopied, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(TicketEvent::Count)> TicketEventNames{"hint-used", "hint-uncached", "miss-found", "miss-absent", "revalidate-failed", "other-template", "memo-kept", "memo-rebuilt", "pipeline-accepted", "pipeline-not-lean", "pipeline-stencil", "pipeline-other-template", "pipeline-other-prepared", "pipeline-proxies", "pipeline-abandoned", "push-used", "push-other-template", "index-offered", "index-other-range", "index-pass", "index-stamp", "index-serials", "slice-offered", "slice-unpredicted", "slice-pass", "slice-stamp", "slice-serials", "slice-copied-today"};
+void NoteTicketEvent(TicketEvent event);
+
 // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the ticket counters of the [q0prep] line, reset by
 // TakeTicketCounts. Queue 0 counts what it built (and its time per part), the committer what it
 // used, refused and compared.
@@ -148,6 +216,7 @@ struct TicketCounts {
     std::array<std::uint64_t, DrawTicket::PartCount> used{};
     std::array<std::uint64_t, DrawTicket::PartCount> clear{};
     std::array<std::uint64_t, DrawTicket::PartCount> disagreed{};
+    std::array<std::uint64_t, static_cast<std::size_t>(TicketEvent::Count)> events{};
 };
 enum class TicketSkip : std::uint8_t { Shallow, Locked };
 void NoteTicketSkip(TicketSkip skip);

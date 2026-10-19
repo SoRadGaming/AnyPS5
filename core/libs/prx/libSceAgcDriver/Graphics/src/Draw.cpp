@@ -1570,6 +1570,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             auto* replay = replayInputs(recipe);
             const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Index);
             highest = replay != nullptr ? replayHighestIndex(*context.recorder, *replay, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart) : InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): would the ticket's index collect pass here?
+            if (ticket != nullptr && ticket->indexShadow.has_value()) NoteTicketIndex(*ticket, draw.indexAddress, indexBytes);
         } else if (!copy.reused) {
             // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): a copy in device-local memory
             // (write-combined ReBAR VRAM, uncached for the CPU) is not scanned: the guest range
@@ -1780,6 +1782,22 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     return resident;
 }
 
+// Whether a draw's stages may share a resource-cache template (resolveDrawResources' `cacheable`
+// without the recordable and switch terms; a draw ticket's Template part carries it).
+bool cacheableStages(std::span<const CompiledShader> shaders) {
+    return std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+}
+
+const ShaderResources* ticketResources(const DrawTicket* ticket) {
+    return ticket != nullptr ? ticket->resources.get() : nullptr;
+}
+
+bool sameMovedBuffers(const std::optional<std::vector<ShaderResources::MovedBuffer>>& first, const std::optional<std::vector<ShaderResources::MovedBuffer>>& second) {
+    if (first.has_value() != second.has_value()) return false;
+    if (!first.has_value()) return true;
+    return std::ranges::equal(*first, *second, [](const ShaderResources::MovedBuffer& a, const ShaderResources::MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && std::ranges::equal(a.words, b.words); });
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 struct ResolvedResources {
@@ -1793,7 +1811,7 @@ struct ResolvedResources {
     const ResourceCache::Key& ContentKey() const { return preparedKey != nullptr ? *preparedKey : builtKey; }
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const PreparedDraw* prepared, const DrawTicket* ticket) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const PreparedDraw* prepared, DrawTicket* ticket) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1807,18 +1825,57 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     const bool trimKey = TrimmedDrawKey();
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): the ticket's Template part, built by queue 0
+    // from the same closure objects: whether the stages are cacheable, the content key, and the
+    // hint (FindHint did the hit's LRU and statistics). The hint is taken while the cache still
+    // maps the key to it (!Uncached); a miss or a dropped hint is never trusted: Find as today.
+    const auto templateUse = TicketPartUse(ticket, DrawTicket::Template);
+    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && (templateUse == TicketUse::Use ? ticket->cacheableShaders : cacheableStages(shaders));
+    if (templateUse != TicketUse::None && templateUse != TicketUse::Use && recordable && !noDrawResourceCache && !noTextureCache && ticket->cacheableShaders != cacheableStages(shaders)) TicketDisagrees(DrawTicket::Template, templateUse, "whether the stages are cacheable");
     if (resolved.cacheable) {
-        if (prepared != nullptr && !prepared->contentKey.empty()) resolved.preparedKey = &prepared->contentKey;
-        else resolved.builtKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.ContentKey())) {
+        if (templateUse == TicketUse::Use) {
+            resolved.preparedKey = &ticket->Key();
+        } else {
+            if (prepared != nullptr && !prepared->contentKey.empty()) resolved.preparedKey = &prepared->contentKey;
+            else resolved.builtKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+            if (templateUse != TicketUse::None && resolved.ContentKey() != ticket->Key()) TicketDisagrees(DrawTicket::Template, templateUse, "the content key");
+        }
+        std::shared_ptr<ShaderResources> cached;
+        bool hinted = false;
+        if (templateUse == TicketUse::Use || templateUse == TicketUse::Verify) {
+            if (ticket->resources != nullptr && !ticket->resources->Uncached()) {
+                cached = ticket->resources;
+                hinted = true;
+                NoteTicketEvent(TicketEvent::HintUsed);
+                // Membership is counted, never aborted on: Probe races nothing here, but a
+                // difference is a cache fact, not a ticket fault.
+                if (templateUse == TicketUse::Verify && SharedResourceCache().Probe(resolved.ContentKey()) != cached) NoteTicketEvent(TicketEvent::OtherTemplate);
+            } else {
+                cached = SharedResourceCache().Find(resolved.ContentKey());
+                NoteTicketEvent(ticket->resources != nullptr ? TicketEvent::HintUncached : cached != nullptr ? TicketEvent::MissFound : TicketEvent::MissAbsent);
+            }
+        } else {
+            cached = SharedResourceCache().Find(resolved.ContentKey());
+            if (templateUse == TicketUse::Shadow) NoteTicketEvent(cached == ticket->resources ? (cached != nullptr ? TicketEvent::HintUsed : TicketEvent::MissAbsent) : ticket->resources == nullptr ? TicketEvent::MissFound : TicketEvent::OtherTemplate);
+        }
+        if (cached != nullptr) {
             const bool valid = [&] {
                 const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Revalidate);
                 return cached->Revalidate(shaders);
             }();
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): queue 0's moved-candidate walk for
+            // these stages on this very template (the memo checks owner and data words itself);
+            // today's checks against memory and recorded work run in order as before.
+            const auto movedUse = cached.get() == ticketResources(ticket) && cached != nullptr ? TicketPartUse(ticket, DrawTicket::Moved) : TicketUse::None;
+            if (valid && recorder != nullptr) {
+                auto* memo = movedUse == TicketUse::Use || movedUse == TicketUse::Verify ? &ticket->memo : nullptr;
+                moved = cached->MovedReadOnlyBuffers(shaders, *recorder, memo);
+                if (memo != nullptr) NoteTicketEvent(memo->builtFor != nullptr ? TicketEvent::MemoKept : TicketEvent::MemoRebuilt);
+                if (movedUse == TicketUse::Verify && !sameMovedBuffers(moved, cached->MovedReadOnlyBuffers(shaders, *recorder))) TicketDisagrees(DrawTicket::Moved, movedUse, "the moved read-only buffers");
+                if (movedUse == TicketUse::Shadow && !sameMovedBuffers(moved, cached->MovedReadOnlyBuffers(shaders, *recorder, &ticket->memo))) TicketDisagrees(DrawTicket::Moved, movedUse, "the moved read-only buffers");
+            }
             if (moved.has_value()) {
                 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): skipped when the ticket ran them.
                 if (trimKey) TicketChecks(TicketPartUse(ticket, DrawTicket::AliasesChecked), DrawTicket::AliasesChecked, [&] { CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes); });
@@ -1829,7 +1886,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
             } else {
-                SharedResourceCache().Remove(resolved.ContentKey());
+                // A template the draw took from its ticket is removed only while the key still maps
+                // to it, so a newer entry stays; without a used ticket as before.
+                if (templateUse == TicketUse::Use || templateUse == TicketUse::Verify) SharedResourceCache().Remove(resolved.ContentKey(), cached.get());
+                else SharedResourceCache().Remove(resolved.ContentKey());
+                if (hinted) NoteTicketEvent(TicketEvent::HintRevalidateFailed);
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
@@ -2137,6 +2198,8 @@ struct RecordedDraw {
     std::vector<VkImage> multisampleImages;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the ticket's byte shadow for PrepareDrawBindings.
+    const ShaderResources::TicketBindings* ticketBindings = nullptr;
     bool listed = false;
     bool completion = false;
     bool waited = false;
@@ -2335,7 +2398,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const auto drawBindings = [&] {
         const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Bindings);
-        return resources.PrepareDrawBindings(*recorder, record.moved);
+        return resources.PrepareDrawBindings(*recorder, record.moved, false, record.ticketBindings);
     }();
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
@@ -2807,6 +2870,76 @@ void FillDrawTicketChecks(DrawTicket& ticket, const Context& context, const Stat
     }
 }
 
+void FillDrawTicketTemplate(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const PreparedDraw* prepared) {
+    // resolveDrawResources never looks a template up under these.
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (noDrawResourceCache || noTextureCache) return;
+    prepared = PreparedDrawFor(prepared, context);
+    try {
+        const TicketPartTimer timer{DrawTicket::Template};
+        ticket.cacheableShaders = cacheableStages(shaders);
+        if (ticket.cacheableShaders) {
+            // The key resolveDrawResources uses: the PreparedDraw's, or built the same way.
+            if (prepared != nullptr && !prepared->contentKey.empty()) ticket.preparedKey = &prepared->contentKey;
+            else ticket.ownKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !TrimmedDrawKey());
+            // A shadow ticket only probes: no LRU or statistics change.
+            ticket.resources = ticket.shadow ? SharedResourceCache().Probe(ticket.Key()) : SharedResourceCache().FindHint(ticket.Key());
+        }
+        ticket.parts |= DrawTicket::Template;
+    } catch (const std::exception&) {
+        ticket.resources.reset();
+        return;
+    }
+    if (ticket.resources == nullptr) return;
+    // Queue 0 reads only the hint's build-fixed data from here on: its allocations, bindings,
+    // data and push patches, set layouts and data-words hash.
+    try {
+        const TicketPartTimer timer{DrawTicket::Moved};
+        ticket.resources->PlanMovedWords(shaders, ticket.memo);
+        if (ticket.memo.owner == ticket.resources.get()) ticket.parts |= DrawTicket::Moved;
+    } catch (const std::exception&) {
+    }
+    try {
+        // pushDrawConstants' block before its per-draw patches (depth remap, tessellation, mesh).
+        const TicketPartTimer timer{DrawTicket::Push};
+        ticket.pushBytes = AssemblePushConstants(shaders);
+        ticket.resources->PatchPushConstants(ticket.pushBytes);
+        ticket.pushStages = PushConstantStages(shaders);
+        ticket.parts |= DrawTicket::Push;
+    } catch (const std::exception&) {
+    }
+    // The pipeline Draw would ask the store for: only with a PreparedDraw (its vertex layout and
+    // fragment outputs) and without stencil replay, in the general layout of a lean draw, with the
+    // attachment proxies every single-sample target with a proxy format gets once resident.
+    const bool stencilReplay = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); });
+    if (prepared == nullptr || stencilReplay || state.colors.size() > 32) return;
+    try {
+        const TicketPartTimer timer{DrawTicket::Pipeline};
+        auto masked = maskedState(state, prepared->fragmentOutputs);
+        std::uint32_t proxiedMask = 0;
+        for (std::size_t index = 0; index < state.colors.size(); ++index) {
+            const auto& color = state.colors[index];
+            if (color.samples > 1 || AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED) continue;
+            proxiedMask |= 1u << index;
+            if (!masked.has_value()) masked = state;
+            masked->colors[index].format = AttachmentProxyFormat(context, state.colors[index].format);
+            masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
+        }
+        const State& pipelineState = masked.has_value() ? *masked : state;
+        static const VertexInputLayout noVertexInput{};
+        const auto& vertexInput = prepared->vertexInput != nullptr ? *prepared->vertexInput : noVertexInput;
+        ticket.pipeline = CachedPipelineIfPresent(context, pipelineState, vertexInput, ticket.resources->SetLayouts(), shaders, VK_IMAGE_LAYOUT_GENERAL, !ticket.shadow);
+        if (ticket.pipeline != nullptr) {
+            ticket.pipelinePrepared = prepared;
+            ticket.proxiedMask = proxiedMask;
+            ticket.parts |= DrawTicket::Pipeline;
+        }
+    } catch (const std::exception&) {
+        ticket.pipeline.reset();
+    }
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDraw* prepared, DrawTicket* ticket) {
     const bool slotOffered = recipeOut != nullptr;
     prepared = PreparedDrawFor(prepared, context);
@@ -3169,7 +3302,26 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
-    auto pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): the pipeline queue 0 found in the store for
+    // the hint, the PreparedDraw's vertex layout and fragment outputs, the predicted proxies and the
+    // general layout. Taken only when all of that is what this draw uses: a lean draw without
+    // stencil replay, on that template (its set layouts), with that PreparedDraw (prepareDrawInputs
+    // took the layout and outputs from it) and the same proxied targets, and a pipeline its device
+    // did not abandon (the ticket's device and pool were checked on entry).
+    std::shared_ptr<Pipeline> ticketPipeline;
+    const auto pipelineUse = TicketPartUse(ticket, DrawTicket::Pipeline);
+    if (pipelineUse != TicketUse::None) {
+        std::uint32_t proxiedMask = 0;
+        for (std::size_t index = 0; index < targets.size() && index < 32; ++index) {
+            if (targets[index].proxied) proxiedMask |= 1u << index;
+        }
+        const auto verdict = !lean ? TicketEvent::PipelineNotLean : !stencilReplay.empty() ? TicketEvent::PipelineStencil : resources != ticket->resources ? TicketEvent::PipelineOtherTemplate : prepared != ticket->pipelinePrepared ? TicketEvent::PipelineOtherPrepared : proxiedMask != ticket->proxiedMask || targets.size() > 32 ? TicketEvent::PipelineProxies : ticket->pipeline->Layout() == VK_NULL_HANDLE ? TicketEvent::PipelineAbandoned : TicketEvent::PipelineAccepted;
+        NoteTicketEvent(verdict);
+        if (verdict == TicketEvent::PipelineAccepted) ticketPipeline = ticket->pipeline;
+    }
+    auto pipeline = stencilReplay.empty() ? (pipelineUse == TicketUse::Use && ticketPipeline != nullptr ? ticketPipeline : CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) : stencilReplay.front().second;
+    if (ticketPipeline != nullptr && pipelineUse != TicketUse::Use && pipeline != ticketPipeline) TicketDisagrees(DrawTicket::Pipeline, pipelineUse, "the pipeline");
+    if (pipelineUse == TicketUse::Verify && ticketPipeline != nullptr) pipeline = ticketPipeline;
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
@@ -3207,6 +3359,29 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.completion = completion;
         record.waited = outcome.waited;
         record.stencilReplay = stencilReplay;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): the push block queue 0 assembled and
+        // patched with the hint's push patches, when the draw binds that template.
+        if (const auto pushUse = TicketPartUse(ticket, DrawTicket::Push); pushUse != TicketUse::None) {
+            if (resources != ticket->resources) {
+                NoteTicketEvent(TicketEvent::PushOtherTemplate);
+            } else {
+                NoteTicketEvent(TicketEvent::PushUsed);
+                if (pushUse != TicketUse::Use) {
+                    auto block = AssemblePushConstants(shaders);
+                    resources->PatchPushConstants(block);
+                    if (block != ticket->pushBytes || PushConstantStages(shaders) != ticket->pushStages) TicketDisagrees(DrawTicket::Push, pushUse, "the push block");
+                }
+                if (pushUse != TicketUse::Shadow) {
+                    record.pushBytes = &ticket->pushBytes;
+                    record.pushStages = ticket->pushStages;
+                }
+            }
+        }
+        ShaderResources::TicketBindings byteBindings;
+        if (ticket != nullptr && ticket->Has(DrawTicket::ByteShadow)) {
+            byteBindings = ticket->ByteBindings();
+            record.ticketBindings = &byteBindings;
+        }
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,

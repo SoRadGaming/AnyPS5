@@ -2446,7 +2446,8 @@ if(BUILD_TESTING)
             "label_coalesce|APS5_EXPERIMENT_LABEL_COALESCE=1"
             "committer_all|APS5_EXPERIMENT_ROOM_WAKE=2,APS5_EXPERIMENT_EXACT_BATCH_CAP=1,APS5_BATCH_CAP=2,APS5_EXPERIMENT_COMMIT_RUNS=1,APS5_EXPERIMENT_LABEL_COALESCE=1"
             "q0_shadow|APS5_DEBUG_Q0_PREP_STATS=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0"
-            "q0_ticket|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0")
+            "q0_ticket|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0"
+            "q0_template|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

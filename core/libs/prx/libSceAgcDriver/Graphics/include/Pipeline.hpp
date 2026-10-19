@@ -110,6 +110,13 @@ private:
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 // `created` reports whether this call built the pipeline (false: served from the store or private).
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): CachedPipeline's lookup alone, for a draw ticket
+// queue 0 prepares off the GPU mutex: the store's pipeline for this configuration when it holds
+// one built on this context's device and buffer pool, else null. It never builds, abandons,
+// journals or adopts a pool into an entry. With `use` a hit counts as CachedPipeline's hit and
+// moves the entry to the recent end, exactly as CachedPipeline's lookup does; without it (shadow
+// tickets) nothing changes.
+std::shared_ptr<Pipeline> CachedPipelineIfPresent(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool use);
 // Cumulative pipeline store outcomes since start-up (the [pipecache] line reports 10 s windows).
 struct PipelineStoreCounters {
     std::uint64_t hits = 0;

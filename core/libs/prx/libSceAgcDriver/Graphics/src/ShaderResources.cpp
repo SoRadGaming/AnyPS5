@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -3485,6 +3486,22 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     return found->second->second;
 }
 
+std::shared_ptr<ShaderResources> ResourceCache::FindHint(const Key& key) {
+    std::lock_guard lock(mutex);
+    const auto found = index.find(key);
+    if (found == index.end()) return nullptr;
+    resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    entries.splice(entries.begin(), entries, found->second);
+    noteUse(key);
+    return found->second->second;
+}
+
+std::shared_ptr<ShaderResources> ResourceCache::Probe(const Key& key) const {
+    std::lock_guard lock(mutex);
+    const auto found = index.find(key);
+    return found == index.end() ? nullptr : found->second->second;
+}
+
 void ResourceCache::noteEvicted(const Key& key) {
     if (fixedCapacity) return;
     const auto hash = KeyHash{}(key);
@@ -3657,6 +3674,9 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(key); found != index.end()) {
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): every object leaving the index is marked
+        // (ShaderResources::Uncached), here and at each exit below.
+        found->second->second->markUncached();
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
@@ -3672,6 +3692,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     noteUse(key);
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
+        entries.back().second->markUncached();
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
@@ -3686,6 +3707,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
             continue;
         }
         tables -= elements;
+        it->second->markUncached();
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = std::prev(entries.erase(it));
@@ -3708,6 +3730,7 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        it->second->markUncached();
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -3721,6 +3744,7 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             ++it;
             continue;
         }
+        it->second->markUncached();
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -3747,6 +3771,7 @@ std::uint64_t ResourceCache::Touches() {
 
 void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
+    for (auto& entry : entries) entry.second->markUncached();
     index.clear();
     entries.clear();
     evictedKeys.clear();
@@ -3795,6 +3820,7 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    found->second->second->markUncached();
     entries.erase(found->second);
     index.erase(found);
 }
@@ -5180,9 +5206,12 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     }
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS): the word checks from the memo while the
     // words and this object's data buffers repeat; the checks against memory and recorded work run
-    // on every call, in the walk's order.
+    // on every call, in the walk's order. LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): a memo
+    // PlanMovedWords built for these very stages needs no word compare.
     bool same = memo->owner == this && memo->dataWordsHash == dataWordsHash;
-    if (same) {
+    if (same && memo->builtFor != nullptr && memo->builtFor == shaders.data() && memo->builtCount == shaders.size()) {
+        // The words are the stages' own; nothing to compare.
+    } else if (same) {
         std::size_t cursor = 0;
         visitMovedWords(shaders, [&](std::uint32_t word) {
             same = same && cursor < memo->words.size() && memo->words[cursor] == word;
@@ -5194,6 +5223,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
         // Owned by no object until rebuilt in full: a throw on the way must not leave the new words
         // over part of their candidates for the next call to take.
         memo->owner = nullptr;
+        memo->builtFor = nullptr;
+        memo->builtCount = 0;
         memo->dataWordsHash = dataWordsHash;
         memo->words.clear();
         visitMovedWords(shaders, [&](std::uint32_t word) { memo->words.push_back(word); });
@@ -5212,6 +5243,30 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
         std::abort();
     }
     return result;
+}
+
+void ShaderResources::PlanMovedWords(std::span<const CompiledShader> shaders, MovedWordsMemo& memo) const {
+    // MovedReadOnlyBuffers' rebuild, in its order; a throw leaves the memo owned by no object.
+    memo.owner = nullptr;
+    memo.builtFor = nullptr;
+    memo.builtCount = 0;
+    memo.dataWordsHash = dataWordsHash;
+    memo.words.clear();
+    memo.candidates.clear();
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) {
+        // MovedReadOnlyBuffers answers "nothing to move" before any check: an empty memo says so.
+        memo.refused = false;
+    } else {
+        if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return;
+        visitMovedWords(shaders, [&](std::uint32_t word) { memo.words.push_back(word); });
+        memo.refused = !movedCandidates(shaders, [&](const MovedWordsMemo::Candidate& candidate) {
+            memo.candidates.push_back(candidate);
+            return true;
+        });
+    }
+    memo.owner = this;
+    memo.builtFor = shaders.data();
+    memo.builtCount = shaders.size();
 }
 
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {
@@ -5309,7 +5364,31 @@ std::optional<std::uint32_t> ShaderResources::drawVariableCount(std::size_t set)
     return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
+void ShaderResources::PredictDrawSlices(const MovedWordsMemo& memo, std::vector<std::pair<std::uint64_t, std::size_t>>& ranges) const {
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return;
+    const bool candidates = memo.owner == this && !memo.refused;
+    std::size_t totalSnapshotBytes = 0;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const MovedWordsMemo::Candidate* moved = nullptr;
+        if (candidates) {
+            const auto found = std::find_if(memo.candidates.begin(), memo.candidates.end(), [&](const MovedWordsMemo::Candidate& candidate) { return candidate.allocation == index; });
+            if (found != memo.candidates.end()) moved = &*found;
+        }
+        if (moved != nullptr && moved->data) continue;
+        if (moved == nullptr && (!item.guest || item.written)) continue;
+        const auto address = moved != nullptr ? moved->address : item.address;
+        const auto size = moved != nullptr ? moved->size : item.size;
+        const auto begin = address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        if (moved == nullptr && (bytes > maxDrawSnapshotBytes || totalSnapshotBytes + bytes > maxDrawSnapshotBytes)) continue;
+        if (bytes == 0 || bytes > SnapshotArena::InputLimit) continue;
+        ranges.emplace_back(begin, bytes);
+        totalSnapshotBytes += bytes;
+    }
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const TicketBindings* ticket) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     struct ReadsTag {};
     auto& reads = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsTag>();
@@ -5378,6 +5457,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (bytes != 0 && bytes <= SnapshotArena::InputLimit) {
             SnapshotArena::Slice slice;
+            bool sliceCopied = false;
             const bool epochMemo = stamp[1] != 0;
             if (const auto* held = epochMemo ? recorder.UnwrittenDrawSlice(begin, bytes, stamp) : nullptr) {
                 slice = *held;
@@ -5397,12 +5477,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 } else {
                     slice = recorder.AllocateSnapshot(bytes);
                     std::memcpy(slice.bytes.data(), reinterpret_cast<const void*>(begin), bytes);
+                    sliceCopied = true;
                     recorder.KeepDrawSlice(begin, slice, generation, registryGeneration);
                     if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::SliceCopied, bytes);
                 }
                 if (epochMemo && GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSlice(begin, stamp, slice);
                 else if (epochMemo) stamped = false;
             }
+            // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): would queue 0's collect of this slice
+            // have passed a re-check here? Counted only; the slice above is today's.
+            if (ticket != nullptr) NoteTicketSlice(*ticket, begin, bytes, sliceCopied);
             selected.push_back(index);
             keep({begin, std::move(slice.chunk), slice.offset, bytes, true});
             totalSnapshotBytes += bytes;

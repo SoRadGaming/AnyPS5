@@ -3936,9 +3936,9 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     std::optional<Graphics::Context> built;
     const auto& context = graphicsContext(built);
-    // References tickets left (a stopped pipeline, a commit that threw) are settled here, under
-    // the mutex, and the ones this draw's ticket still holds after it.
-    if (Graphics::Q0TicketsBuilt()) Graphics::DrainTicketRelease(context);
+    // References tickets left (a stopped pipeline, a commit that threw) are settled by the next
+    // ticketed draw's commit, under the mutex, and the ones this draw's ticket still holds after it.
+    if (ticket != nullptr) Graphics::DrainTicketRelease(context);
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, prepared, ticket);
     if (ticket != nullptr) Graphics::ReleaseTicketReferences(*ticket, context);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
