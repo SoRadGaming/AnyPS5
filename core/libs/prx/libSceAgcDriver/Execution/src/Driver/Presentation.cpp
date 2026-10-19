@@ -157,6 +157,43 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     }
 }
 
+// APS5_LOADING_SPLASH (LoadingSplash.hpp): a present of the splash, or of black once it ended, from the
+// present loop's idle time. Unlike Present it never waits, so the loop keeps pumping window events: it
+// gives up while the GPU lock is held (a queue worker compiling or recording), while the next
+// presentation slot is in flight or while no swapchain image is free, and it leaves its presentation
+// trailing for the next present to retire.
+bool Driver::TryPresentSplash(const PresentationWindow& window) {
+    static thread_local bool pinned = false;
+    if (!pinned) {
+        pinned = true;
+        PinWorkerThread("presenter");
+        GuestMemory::MarkPresenterThread();
+    }
+    CheckFailure();
+    require(window.getDrawableSize != nullptr, "missing window drawable size query");
+    try {
+        std::unique_lock lock(GuestMemory::GpuMutex(), std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+        if (device == nullptr || device->Window() != window.context) return false;
+        std::shared_ptr<VulkanDevice> presenting = device;
+        std::uint32_t drawableWidth = 0;
+        std::uint32_t drawableHeight = 0;
+        window.getDrawableSize(window.context, &drawableWidth, &drawableHeight);
+        presenting->Resize(drawableWidth, drawableHeight);
+        presenting->SelectDynamicRange(nullptr);
+        if (!presenting->Presentable() || !presenting->PresentSlotFree() || !presenting->AcquireImage()) return false;
+        if (!presenting->PresentClear(window.width, window.height, true)) return false;
+        presenting->QueuePresent();
+        return true;
+    } catch (const ProcessShutdown&) {
+        throw;
+    } catch (...) {
+        ReportFailure(std::current_exception());
+        throw;
+    }
+}
+
 void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
     static std::vector<double> waits;
     static VulkanDevice::PresentStatistics previous{};

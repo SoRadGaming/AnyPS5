@@ -3581,6 +3581,13 @@ double VulkanDevice::RetirePresents(std::size_t keepInFlight) {
     return waitedMs;
 }
 
+bool VulkanDevice::PresentSlotFree() {
+    if (state->presentSlots.empty()) return false;
+    RetirePresents(state->presentSlots.size());
+    std::lock_guard lock(state->presentMutex);
+    return !state->presentSlots[state->presentCursor].inFlight;
+}
+
 double VulkanDevice::FinishPresent() {
     return RetirePresents(0);
 }

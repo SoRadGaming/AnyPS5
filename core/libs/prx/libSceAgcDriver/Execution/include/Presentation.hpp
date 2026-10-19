@@ -35,6 +35,8 @@ extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix();
 // it (on input), and its picture (RGBA8 rows, copied).
 extern "C" bool AgcDriverLoadingSplashShowing_nid_postfix();
 extern "C" void AgcDriverFinishLoadingSplash_nid_postfix(const char* reason);
+// Presents the splash (black once it ended) without waiting; false when it could not right now.
+extern "C" bool AgcDriverTryPresentSplash_nid_postfix(const AgcDriver::PresentationWindow& window);
 extern "C" void AgcDriverSetLoadingSplashPicture_nid_postfix(std::uint32_t width, std::uint32_t height, const std::uint8_t* rgba, std::size_t bytes);
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error);
 
