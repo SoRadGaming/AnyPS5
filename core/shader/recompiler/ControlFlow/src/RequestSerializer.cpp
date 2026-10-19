@@ -866,7 +866,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.context.linkedCallFallbacks = result.linkedCallFallbacks;
     }
     if (version >= 32u) result.request.target.spannedWaves = reader.ReadBool();
-    if (version >= 35u) result.request.target.float32FlushToZero = reader.ReadBool();
+    if (version == 33u || version >= 35u) result.request.target.float32FlushToZero = reader.ReadBool();
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     return result;
 }
