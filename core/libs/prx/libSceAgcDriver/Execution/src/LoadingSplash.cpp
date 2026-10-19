@@ -23,9 +23,9 @@ Clock::time_point startedAt() {
 std::chrono::seconds maxDuration() {
     static const std::chrono::seconds limit = [] {
         const char* value = std::getenv("APS5_LOADING_SPLASH_MAX_SECONDS");
-        if (value == nullptr) return std::chrono::seconds(300);
+        if (value == nullptr) return std::chrono::seconds(900);
         const long parsed = std::strtol(value, nullptr, 10);
-        return std::chrono::seconds(parsed > 0 ? parsed : 300);
+        return std::chrono::seconds(parsed > 0 ? parsed : 900);
     }();
     return limit;
 }

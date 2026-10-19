@@ -31,7 +31,7 @@ struct Picture {
 };
 
 bool Enabled();
-// Enabled, not finished, and within APS5_LOADING_SPLASH_MAX_SECONDS (default 300) of the first call.
+// Enabled, not finished, and within APS5_LOADING_SPLASH_MAX_SECONDS (default 900, a cold-cache boot) of the first call.
 bool Showing();
 void Finish(const char* reason);
 
