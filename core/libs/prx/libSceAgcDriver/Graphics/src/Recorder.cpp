@@ -2828,7 +2828,7 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     spans.clear();
     const bool sole = entry.buffer.use_count() == 1;
     static const bool snapshotStatsCpu = std::getenv("APS5_DEBUG_SNAPSHOT_STATS") != nullptr;
-    thread_local std::vector<std::uint8_t> cpuStamped;
+    std::vector<std::uint8_t> cpuStamped;
     if (snapshotStatsCpu) cpuStamped.assign(count, 1);
     GuestMemory::ChangedBlocks(address, bytes, generations, changed, snapshotStatsCpu ? std::span<std::uint8_t>(cpuStamped) : std::span<std::uint8_t>{});
     for (std::size_t k = 0; k < count; ++k) {

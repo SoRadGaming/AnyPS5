@@ -1380,13 +1380,18 @@ struct MissStats {
     std::unordered_map<std::uint64_t, std::array<std::uint64_t, 3>> ranges;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
-thread_local MissStats missStats;
+// Per thread through ThreadScratch: a thread_local with a destructor (the map) runs after emulated TLS
+// freed it on Windows (prx_thread_local_destructors).
+struct MissStatsTag {};
+MissStats& threadMissStats() {
+    return ThreadScratch<MissStats, MissStatsTag>();
+}
 bool missStatsEnabled() {
     static const bool enabled = std::getenv("APS5_DEBUG_MISS_STATS") != nullptr;
     return enabled;
 }
 void reportMissStats() {
-    auto& st = missStats;
+    auto& st = threadMissStats();
     const auto now = std::chrono::steady_clock::now();
     if (now - st.last < std::chrono::seconds(10)) return;
     if (st.uncached + st.memoHits + st.missSerial + st.missEpoch + st.missNone != 0) std::fprintf(stderr, "[miss-stats] thread %lu: uncached walks %llu (%.1f ms), memo hits %llu, memoized walks: serial changed %llu, epoch changed %llu, no entry %llu (%.1f ms), unwatch serial changes seen %llu\n", GetCurrentThreadId(), static_cast<unsigned long long>(st.uncached), st.uncachedNs / 1e6, static_cast<unsigned long long>(st.memoHits), static_cast<unsigned long long>(st.missSerial), static_cast<unsigned long long>(st.missEpoch), static_cast<unsigned long long>(st.missNone), st.missNs / 1e6, static_cast<unsigned long long>(st.serialChanges));
@@ -1462,14 +1467,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         // initialized and watched; nothing below the lock needs asking.
         if (epochCoverageEnabled() && epochCovers(epoch, unwatched, first, stop)) {
             noteCollectMemoHit();
-            if (missStatsEnabled()) ++missStats.memoHits;
+            if (missStatsEnabled()) ++threadMissStats().memoHits;
             return tracker.generation.load(std::memory_order_relaxed);
         }
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                 noteCollectMemoHit();
-                if (missStatsEnabled()) ++missStats.memoHits;
+                if (missStatsEnabled()) ++threadMissStats().memoHits;
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
@@ -1479,14 +1484,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
                 noteCollectMemoHit();
-                if (missStatsEnabled()) ++missStats.memoHits;
+                if (missStatsEnabled()) ++threadMissStats().memoHits;
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
     }
     int missKind = -1;
     if (missStatsEnabled()) {
-        auto& st = missStats;
+        auto& st = threadMissStats();
         if (unwatched != st.lastSerial) {
             ++st.serialChanges;
             st.lastSerial = unwatched;
@@ -1517,7 +1522,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         bool done = false;
         ~MissNote() {
             if (kind < 0) return;
-            auto& st = missStats;
+            auto& st = threadMissStats();
             const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
             if (!done) ++st.failed;
             if (kind == 0) { ++st.uncached; st.uncachedNs += ns; }
