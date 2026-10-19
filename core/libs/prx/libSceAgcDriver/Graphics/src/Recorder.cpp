@@ -5,6 +5,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -2659,7 +2660,10 @@ SnapshotArena::Slice SnapshotArena::Allocate(const Context& context, std::size_t
     std::size_t consumed = 0;
     if (chunk == nullptr || offset + bytes > chunk->Bytes().size()) {
         if (chunk != nullptr) consumed = static_cast<std::size_t>(chunk->Bytes().size() - cursor);
-        chunk = std::make_shared<Buffer>(context, ChunkBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1): in ReBAR VRAM; the CPU only
+        // writes the slices (PrepareDrawBindings).
+        chunk = std::make_shared<Buffer>(context, ChunkBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, DrawSnapshotChunkProperties());
+        if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, DrawInputSite::SnapshotArena, *chunk, ChunkBytes);
         cursor = 0;
         offset = 0;
     }
@@ -2751,7 +2755,10 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
-        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1): in ReBAR VRAM; the CPU only
+        // writes the slices (PrepareDrawBindings).
+        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, DrawSnapshotChunkProperties());
+        if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, DrawInputSite::DrawUpload, *drawUpload, std::max(DrawUploadChunk, bytes));
         offset = 0;
     }
     drawUploadUsed = offset + bytes;

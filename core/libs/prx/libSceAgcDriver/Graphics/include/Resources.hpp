@@ -19,6 +19,10 @@ public:
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
     void Invalidate();
+    // LOCAL DEBUG (APS5_DEBUG_DRAW_INPUT_BYTES): the requested properties and the memory type the
+    // allocation has (a pooled one keeps the type it was made with).
+    VkMemoryPropertyFlags Properties() const { return properties; }
+    std::uint32_t MemoryType() const { return memoryType; }
 
 private:
     void initializeAddress(VkBufferUsageFlags usage);
@@ -38,6 +42,7 @@ private:
     bool slab = false;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
+    std::uint32_t memoryType = 0;
     std::shared_ptr<BufferPool> cache;
 };
 

@@ -268,7 +268,9 @@ struct Context {
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
     }
 
-    std::uint32_t BufferMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes) const {
+    // `spilled` (LOCAL DEBUG, APS5_DEBUG_DRAW_INPUT_BYTES) is set when the budget moved the request
+    // to a type on another heap.
+    std::uint32_t BufferMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes, bool* spilled = nullptr) const {
         constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         auto type = MemoryType(mask, flags);
         if (flags == coherent) {
@@ -290,7 +292,10 @@ struct Context {
         if (reported.heapBudget[heap] == 0 || fits(heap)) return type;
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             const auto& candidate = memory.memoryTypes[i];
-            if ((mask & (1u << i)) != 0 && (candidate.propertyFlags & flags) == flags && candidate.heapIndex != heap && fits(candidate.heapIndex)) return i;
+            if ((mask & (1u << i)) != 0 && (candidate.propertyFlags & flags) == flags && candidate.heapIndex != heap && fits(candidate.heapIndex)) {
+                if (spilled != nullptr) *spilled = true;
+                return i;
+            }
         }
         return type;
     }

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -51,6 +52,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         capacity = allocation->bytes;
         offset = allocation->offset;
         slab = allocation->slab;
+        memoryType = allocation->memoryType;
         if (allocation->bufferBytes != size) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
@@ -82,7 +84,12 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         // The CPU reads most of these buffers back (write-back, diffs), which is very slow from
         // write-combined memory, so the default host properties prefer cached host memory.
         const bool useSlab = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize);
-        allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, properties, useSlab ? BufferPool::SlabBlockBytes(capacity) : allocation.allocationSize);
+        const auto typeBytes = useSlab ? BufferPool::SlabBlockBytes(capacity) : allocation.allocationSize;
+        bool spilled = false;
+        allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, properties, typeBytes, &spilled);
+        memoryType = allocation.memoryTypeIndex;
+        // LOCAL DEBUG (APS5_DEBUG_DRAW_INPUT_BYTES): counts the buffers the budget moved to another heap.
+        if (spilled) NoteBufferHeapSpill(context, properties, allocation.memoryTypeIndex, useSlab ? static_cast<VkDeviceSize>(capacity) : allocation.allocationSize);
         if (useSlab) {
             const auto slot = cache->TakeSlot(context, allocation.memoryTypeIndex, capacity, addressable);
             memory = slot.memory;
@@ -112,7 +119,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size, memoryType});
         return;
     }
     if (slab) {

@@ -25,6 +25,9 @@ struct BufferAllocation {
     VkDeviceSize offset = 0;
     bool slab = false;
     std::size_t bufferBytes = 0;
+    // LOCAL DEBUG (APS5_DEBUG_DRAW_INPUT_BYTES): a Buffer's memory type, kept for its next taker
+    // (Buffer::MemoryType); DeviceBuffer leaves 0.
+    std::uint32_t memoryType = 0;
 };
 
 struct SlabSlot {
