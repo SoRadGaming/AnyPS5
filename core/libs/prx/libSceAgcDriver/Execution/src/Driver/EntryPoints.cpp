@@ -125,6 +125,10 @@ extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationW
     AgcDriver::PresentClear(window, opaque, gpuReady, context);
 }
 
+extern "C" bool AgcDriverTryPresentSplash_nid_postfix(const AgcDriver::PresentationWindow& window) {
+    return AgcDriver::DriverDetail::Driver::Get().TryPresentSplash(window);
+}
+
 extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, void (*gpuReady)(void*), void* context) {
     AgcDriver::PresentBuffer(window, buffer, gpuReady, context);
 }

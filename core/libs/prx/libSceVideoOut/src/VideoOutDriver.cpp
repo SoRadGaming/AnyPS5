@@ -803,13 +803,11 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 static int splashContext = 0;
                 const AgcDriver::PresentationWindow splash{window.Handle(), splashExtensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr};
                 if (AgcDriverLoadingSplashShowing_nid_postfix()) {
-                    if (now - lastSplash >= SPLASH_IDLE_INTERVAL) {
+                    if (now - lastSplash >= SPLASH_IDLE_INTERVAL && AgcDriverTryPresentSplash_nid_postfix(splash)) {
                         lastSplash = now;
-                        AgcDriverPresentClear_nid_postfix(splash, true, [](void*) {}, &splashContext);
                         splashShown = true;
                     }
                 } else if (splashShown) {
-                    splashShown = false;
                     const auto flip = std::exchange(covered, std::nullopt);
                     bool live = false;
                     if (flip && now - flip->at <= SPLASH_COVERED_RECENT) {
@@ -823,8 +821,9 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                         window.Ensure(flip->width, flip->height);
                         const AgcDriver::PresentationWindow target{window.Handle(), splashExtensions, &createWindowSurface, &windowDrawableSize, flip->width, flip->height, nullptr};
                         AgcDriverPresentBuffer_nid_postfix(target, flip->display, [](void*) {}, &splashContext);
+                        splashShown = false;
                     } else {
-                        AgcDriverPresentClear_nid_postfix(splash, true, [](void*) {}, &splashContext);
+                        splashShown = !AgcDriverTryPresentSplash_nid_postfix(splash);
                     }
                 }
             }
