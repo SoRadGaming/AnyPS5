@@ -50,9 +50,11 @@ struct DrawTicket {
         Pipeline = 1u << 9,        // `pipeline`: the store's pipeline for the hint, `pipelinePrepared` and `proxiedMask`
         // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, counted at the commit, never used.
         ByteShadow = 1u << 10,
+        // Q2b: `wordBuffers`, the hint's moved data-word buffers (APS5_EXPERIMENT_Q0_WORD_BUFFERS).
+        WordBuffers = 1u << 11,
     };
-    static constexpr std::size_t PartCount = 11;
-    static constexpr std::array<const char*, PartCount> PartNames{"abi", "stencil", "validated", "aliases", "targets", "writers", "template", "moved", "push", "pipeline", "bytes"};
+    static constexpr std::size_t PartCount = 12;
+    static constexpr std::array<const char*, PartCount> PartNames{"abi", "stencil", "validated", "aliases", "targets", "writers", "template", "moved", "push", "pipeline", "bytes", "words"};
     // Identity: the device and buffer pool the ticket was built for (TicketFor refuses another).
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<BufferPool> pool;
@@ -104,7 +106,9 @@ struct DrawTicket {
     std::uint64_t pendingSerial = 0;
     std::uint64_t allocationsGeneration = 0;
     std::uint64_t forgetSerial = 0;
-    ShaderResources::TicketBindings ByteBindings() const { return {sliceShadows, pendingSerial, allocationsGeneration, forgetSerial}; }
+    ShaderResources::TicketBindings ByteBindings() const { return {true, sliceShadows, pendingSerial, allocationsGeneration, forgetSerial, {}, false, false}; }
+    // Q2b: one per data candidate of `memo`, made with the hint's data patches.
+    std::vector<ShaderResources::TicketWordBuffer> wordBuffers;
     DrawTicket() = default;
     DrawTicket(const DrawTicket&) = delete;
     DrawTicket& operator=(const DrawTicket&) = delete;
@@ -129,6 +133,19 @@ bool Q0TicketsBuilt();
 // with lookup-only probes. Read once.
 int Q0Template();
 bool Q0TemplateParts();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): 0 off; 1 queue 0 makes the hint's moved data-word buffers for
+// its tickets (requires APS5_EXPERIMENT_Q0_TEMPLATE, ignored without it; a queue-0 cache of 64
+// keeps them for reuse, keyed by template, allocation and words) and the committer binds them
+// when its template is the hint and the element's allocation, words and size match; 2 the same
+// with each bound buffer's bytes compared with today's (a difference aborts). Shadow tickets
+// (APS5_DEBUG_Q0_PREP_STATS=2) carry the bytes only. Read once.
+int Q0WordBuffers();
+bool Q0WordParts();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): queue 0's WordBuffers part (after the
+// template parts, with the hint's memo).
+void FillDrawTicketWords(DrawTicket& ticket, const Context& context, std::span<const CompiledShader> shaders);
+// The bytes the queue-0 word buffer cache holds ([q0prep]).
+std::uint64_t TicketWordCacheBytes();
 // LOCAL DEBUG: APS5_DEBUG_Q0_PREP_STATS=3 builds the byte shadow; it needs
 // APS5_EXPERIMENT_LAZY_GENERATION=1 (queue 0's extra walks would otherwise move the tracker
 // generation and retire the committer's slice memos) and acts as =2 without it (said once).
@@ -198,8 +215,8 @@ void ReleaseTicketReferences(DrawTicket& ticket, const Context& context);
 // What the committer did with a ticket's template parts (APS5_DEBUG_Q0_PREP_STATS): the hint used,
 // found uncached, or a miss the committer's Find found or not; Revalidate refusing the template;
 // the memo kept or rebuilt; the pipeline accepted or refused by reason; the push block used.
-enum class TicketEvent : std::uint8_t { HintUsed, HintUncached, MissFound, MissAbsent, HintRevalidateFailed, OtherTemplate, MemoKept, MemoRebuilt, PipelineAccepted, PipelineNotLean, PipelineStencil, PipelineOtherTemplate, PipelineOtherPrepared, PipelineProxies, PipelineAbandoned, PushUsed, PushOtherTemplate, IndexOffered, IndexOther, IndexPass, IndexStamp, IndexGuard, SliceOffered, SliceUnpredicted, SlicePass, SliceStamp, SliceGuard, SliceCopied, Count };
-inline constexpr std::array<const char*, static_cast<std::size_t>(TicketEvent::Count)> TicketEventNames{"hint-used", "hint-uncached", "miss-found", "miss-absent", "revalidate-failed", "other-template", "memo-kept", "memo-rebuilt", "pipeline-accepted", "pipeline-not-lean", "pipeline-stencil", "pipeline-other-template", "pipeline-other-prepared", "pipeline-proxies", "pipeline-abandoned", "push-used", "push-other-template", "index-offered", "index-other-range", "index-pass", "index-stamp", "index-serials", "slice-offered", "slice-unpredicted", "slice-pass", "slice-stamp", "slice-serials", "slice-copied-today"};
+enum class TicketEvent : std::uint8_t { HintUsed, HintUncached, MissFound, MissAbsent, HintRevalidateFailed, OtherTemplate, MemoKept, MemoRebuilt, PipelineAccepted, PipelineNotLean, PipelineStencil, PipelineOtherTemplate, PipelineOtherPrepared, PipelineProxies, PipelineAbandoned, PushUsed, PushOtherTemplate, WordsBuilt, WordsCacheHit, WordsUsed, WordsUnmatched, WordsOtherTemplate, IndexOffered, IndexOther, IndexPass, IndexStamp, IndexGuard, SliceOffered, SliceUnpredicted, SlicePass, SliceStamp, SliceGuard, SliceCopied, Count };
+inline constexpr std::array<const char*, static_cast<std::size_t>(TicketEvent::Count)> TicketEventNames{"hint-used", "hint-uncached", "miss-found", "miss-absent", "revalidate-failed", "other-template", "memo-kept", "memo-rebuilt", "pipeline-accepted", "pipeline-not-lean", "pipeline-stencil", "pipeline-other-template", "pipeline-other-prepared", "pipeline-proxies", "pipeline-abandoned", "push-used", "push-other-template", "words-built", "words-cache-hit", "words-used", "words-unmatched", "words-other-template", "index-offered", "index-other-range", "index-pass", "index-stamp", "index-serials", "slice-offered", "slice-unpredicted", "slice-pass", "slice-stamp", "slice-serials", "slice-copied-today"};
 void NoteTicketEvent(TicketEvent event);
 
 // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the ticket counters of the [q0prep] line, reset by

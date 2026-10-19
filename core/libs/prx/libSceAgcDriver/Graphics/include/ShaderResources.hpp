@@ -218,11 +218,33 @@ public:
         std::size_t bytes = 0;
         std::uint64_t generation = 0;
     };
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS, COMMITTER-SPLIT-PLAN Q2b): a moved
+    // data-word buffer queue 0 made for a draw ticket on the ticket's template: the words of the
+    // stage binding it was made from (`words`, the closure-owned binding's own data, so equal
+    // pointers mean equal words) with that template's data patches. A shadow ticket carries the
+    // bytes only (no buffer).
+    struct TicketWordBuffer {
+        std::size_t allocation = 0;
+        const std::uint32_t* words = nullptr;
+        std::size_t size = 0;
+        std::shared_ptr<Buffer> buffer;
+        std::vector<std::byte> bytes;
+    };
     struct TicketBindings {
+        // Whether `slices` and the serials are a byte shadow (an empty list then means nothing
+        // was predicted).
+        bool byteShadow = false;
         std::span<const TicketSlice> slices;
         std::uint64_t pendingSerial = 0;
         std::uint64_t allocations = 0;
         std::uint64_t forgetSerial = 0;
+        // Offered only when the draw binds the ticket's template. PrepareDrawBindings binds an entry
+        // whose allocation, word pointer and size equal the moved buffer's instead of making or
+        // reusing one; `verifyWords` also compares its bytes with today's (a difference aborts),
+        // `shadowWords` runs today's path and only compares.
+        std::span<const TicketWordBuffer> words;
+        bool verifyWords = false;
+        bool shadowWords = false;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const TicketBindings* ticket = nullptr) const;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS, COMMITTER-PLAN S6): what the checks of
@@ -263,6 +285,9 @@ public:
     // without the checks against memory and recorded work, and ties it to `shaders`. Queue 0 calls
     // it off the GPU mutex on a cached draw template: it reads nothing a draw changes after the build.
     void PlanMovedWords(std::span<const CompiledShader> shaders, MovedWordsMemo& memo) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): the bytes PrepareDrawBindings writes into
+    // a moved data-word buffer of `allocation`: the words, then this object's data patches.
+    void MovedWordBytes(std::size_t allocation, std::span<const std::uint32_t> words, std::size_t size, std::span<std::byte> out) const;
     // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the small-slice ranges a draw binding this object
     // could read through PrepareDrawBindings' slice path, from build-fixed data and the memo's
     // moved candidates only (no check against memory or recorded work, so a superset), for

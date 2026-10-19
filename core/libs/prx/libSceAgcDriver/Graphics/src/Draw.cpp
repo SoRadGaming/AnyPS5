@@ -3377,10 +3377,22 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 }
             }
         }
-        ShaderResources::TicketBindings byteBindings;
+        ShaderResources::TicketBindings ticketBindings;
         if (ticket != nullptr && ticket->Has(DrawTicket::ByteShadow)) {
-            byteBindings = ticket->ByteBindings();
-            record.ticketBindings = &byteBindings;
+            ticketBindings = ticket->ByteBindings();
+            record.ticketBindings = &ticketBindings;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): queue 0's moved data-word buffers,
+        // offered only when the draw binds the template whose data patches they carry.
+        if (const auto wordsUse = TicketPartUse(ticket, DrawTicket::WordBuffers); wordsUse != TicketUse::None) {
+            if (resources != ticket->resources) {
+                NoteTicketEvent(TicketEvent::WordsOtherTemplate);
+            } else {
+                ticketBindings.words = ticket->wordBuffers;
+                ticketBindings.verifyWords = wordsUse == TicketUse::Verify;
+                ticketBindings.shadowWords = wordsUse == TicketUse::Shadow;
+                record.ticketBindings = &ticketBindings;
+            }
         }
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):

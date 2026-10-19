@@ -107,6 +107,8 @@ void prepareTicket(void* self, const DrawPipeline::PrepareBudget& budget) {
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE, COMMITTER-SPLIT-PLAN Q2): the template hint
         // and its parts, unless the committer is about to run dry.
         if (Graphics::Q0TemplateParts() && !budget.Stop()) Graphics::FillDrawTicketTemplate(*ticket, context, *inputs.state, inputs.parameters, inputs.stages, inputs.prepared);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS, COMMITTER-SPLIT-PLAN Q2b).
+        if (Graphics::Q0WordParts() && !budget.Stop()) Graphics::FillDrawTicketWords(*ticket, context, inputs.stages);
         // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, in full pipeline waits only.
         if (Graphics::Q0ByteShadow() && budget.full && !budget.Stop()) fillByteShadow(*ticket, inputs, budget);
         Graphics::NoteTicketBuilt(*ticket);
@@ -220,7 +222,7 @@ void Driver::reportQ0Prep() {
         std::snprintf(item, sizeof(item), " %s %llu", Graphics::TicketEventNames[index], count(tickets.events[index]));
         events += item;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[q0prep] ticket templates (10 s):%s\n", events.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[q0prep] ticket templates (10 s):%s; queue-0 word buffer cache %.2f MiB\n", events.c_str(), static_cast<double>(Graphics::TicketWordCacheBytes()) / 1048576.0);
 }
 
 }

@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -87,6 +89,9 @@ void settleReference(TicketReference&& reference, const Context& context) {
 void takeReferences(DrawTicket& ticket, std::vector<TicketReference>& out) {
     if (ticket.resources != nullptr) out.push_back({ticket.device, std::move(ticket.resources), nullptr});
     if (ticket.pipeline != nullptr) out.push_back({ticket.device, nullptr, std::move(ticket.pipeline)});
+    for (auto& words : ticket.wordBuffers) {
+        if (words.buffer != nullptr) out.push_back({ticket.device, nullptr, std::move(words.buffer)});
+    }
     // The memo names the template only by address; it must not outlive the reference.
     ticket.memo.owner = nullptr;
 }
@@ -114,6 +119,119 @@ int Q0Template() {
         return std::strtol(text, nullptr, 10) == 2 ? 2 : 1;
     }();
     return mode;
+}
+
+int Q0WordBuffers() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_Q0_WORD_BUFFERS");
+        if (text == nullptr || Q0Template() == 0) return 0;
+        return std::strtol(text, nullptr, 10) == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+bool Q0WordParts() {
+    static const bool parts = Q0WordBuffers() != 0 || (Q0Ticket() == 0 && GuestMemory::Q0PrepStats() >= 2);
+    return parts;
+}
+
+namespace {
+
+// Queue 0's moved data-word buffers (Q2b), for reuse by later tickets of the same template with
+// the same words, as the template's own movedWordBuffers serve today's path. A hit needs the very
+// template (owner equality with the live hint, so a recycled address never matches, and no
+// temporary strong reference that could end up the last one on queue 0). Only queue 0 makes
+// tickets; the mutex only guards against another producer. An evicted buffer goes to the ticket
+// release list: a batch may still read it.
+struct WordCacheEntry {
+    VkDevice device = VK_NULL_HANDLE;
+    std::weak_ptr<ShaderResources> owner;
+    std::size_t allocation = 0;
+    std::vector<std::uint32_t> words;
+    std::size_t size = 0;
+    std::shared_ptr<Buffer> buffer;
+};
+
+struct WordCache {
+    std::mutex mutex;
+    std::vector<WordCacheEntry> entries;
+    std::size_t next = 0;
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+WordCache& wordCache() {
+    static auto* cache = new WordCache();
+    return *cache;
+}
+
+constexpr std::size_t WordCacheSlots = 64;
+
+std::shared_ptr<Buffer> ticketWordBuffer(const Context& context, const std::shared_ptr<ShaderResources>& owner, std::size_t allocation, std::span<const std::uint32_t> words, std::size_t size) {
+    auto& cache = wordCache();
+    std::lock_guard lock(cache.mutex);
+    for (const auto& entry : cache.entries) {
+        if (entry.allocation != allocation || entry.size != size || entry.device != context.device || !std::ranges::equal(entry.words, words) || entry.owner.owner_before(owner) || owner.owner_before(entry.owner)) continue;
+        NoteTicketEvent(TicketEvent::WordsCacheHit);
+        if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::MovedReused, size);
+        return entry.buffer;
+    }
+    // The properties of today's buffers (PrepareDrawBindings), so the VRAM A/Bs stay comparable.
+    auto buffer = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, DrawSnapshotChunkProperties());
+    if (DebugDrawInputBytes()) {
+        NoteDrawInputBuffer(context, DrawInputSite::MovedWords, *buffer, size);
+        CountDrawInputBytes(DrawInputBytes::MovedCopied, size);
+    }
+    owner->MovedWordBytes(allocation, words, size, buffer->Bytes());
+    NoteTicketEvent(TicketEvent::WordsBuilt);
+    WordCacheEntry entry{context.device, owner, allocation, {words.begin(), words.end()}, size, buffer};
+    cache.bytes.fetch_add(size, std::memory_order_relaxed);
+    if (cache.entries.size() < WordCacheSlots) {
+        cache.entries.push_back(std::move(entry));
+    } else {
+        auto& slot = cache.entries[cache.next++ % WordCacheSlots];
+        cache.bytes.fetch_sub(slot.size, std::memory_order_relaxed);
+        ReleaseTicketReference({slot.device, nullptr, std::move(slot.buffer)});
+        slot = std::move(entry);
+    }
+    return buffer;
+}
+
+}
+
+void FillDrawTicketWords(DrawTicket& ticket, const Context& context, std::span<const CompiledShader> shaders) {
+    // Only on the hint's memo for these stages: every data candidate gets the bytes today's path
+    // would write (the words with the hint's data patches).
+    if (!ticket.Has(DrawTicket::Moved) || ticket.resources == nullptr || ticket.memo.owner != ticket.resources.get() || ticket.memo.refused || ticket.memo.builtFor != shaders.data()) return;
+    const bool timed = counting();
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    try {
+        for (const auto& candidate : ticket.memo.candidates) {
+            if (!candidate.data) continue;
+            const auto& words = shaders[candidate.shader].program->bindings[candidate.binding].guestDescriptor;
+            ShaderResources::TicketWordBuffer entry;
+            entry.allocation = candidate.allocation;
+            entry.words = words.data();
+            entry.size = candidate.size;
+            if (ticket.shadow) {
+                entry.bytes.resize(candidate.size);
+                ticket.resources->MovedWordBytes(candidate.allocation, words, candidate.size, entry.bytes);
+            } else {
+                entry.buffer = ticketWordBuffer(context, ticket.resources, candidate.allocation, words, candidate.size);
+            }
+            ticket.wordBuffers.push_back(std::move(entry));
+        }
+        ticket.parts |= DrawTicket::WordBuffers;
+    } catch (const std::exception&) {
+        for (auto& entry : ticket.wordBuffers) {
+            if (entry.buffer != nullptr) ReleaseTicketReference({ticket.device, nullptr, std::move(entry.buffer)});
+        }
+        ticket.wordBuffers.clear();
+    }
+    if (timed) NoteTicketPartNs(DrawTicket::WordBuffers, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+}
+
+std::uint64_t TicketWordCacheBytes() {
+    return wordCache().bytes.load(std::memory_order_relaxed);
 }
 
 bool Q0ByteShadow() {
@@ -220,7 +338,8 @@ TicketUse TicketPartUseBuilt(const DrawTicket& ticket, DrawTicket::Part part) {
     // The template parts verify under APS5_EXPERIMENT_Q0_TEMPLATE=2, the others under =2 of
     // APS5_EXPERIMENT_Q0_TICKET.
     const bool templatePart = part == DrawTicket::Template || part == DrawTicket::Moved || part == DrawTicket::Push || part == DrawTicket::Pipeline;
-    return (templatePart ? Q0Template() == 2 : Q0Ticket() == 2) ? TicketUse::Verify : TicketUse::Use;
+    const int mode = part == DrawTicket::WordBuffers ? Q0WordBuffers() : templatePart ? Q0Template() : Q0Ticket();
+    return mode == 2 ? TicketUse::Verify : TicketUse::Use;
 }
 
 void TicketDisagrees(DrawTicket::Part part, TicketUse use, const char* what) {

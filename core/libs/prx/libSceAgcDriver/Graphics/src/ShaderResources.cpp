@@ -5364,6 +5364,14 @@ std::optional<std::uint32_t> ShaderResources::drawVariableCount(std::size_t set)
     return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt;
 }
 
+void ShaderResources::MovedWordBytes(std::size_t allocation, std::span<const std::uint32_t> words, std::size_t size, std::span<std::byte> out) const {
+    Require(out.size() >= size && words.size() * sizeof(std::uint32_t) >= size, "moved data words exceed their buffer");
+    std::memcpy(out.data(), words.data(), size);
+    for (const auto& patch : dataPatches) {
+        if (patch.allocation == allocation && patch.byte < size) out[patch.byte] = static_cast<std::byte>(patch.adjustment);
+    }
+}
+
 void ShaderResources::PredictDrawSlices(const MovedWordsMemo& memo, std::vector<std::pair<std::uint64_t, std::size_t>>& ranges) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return;
     const bool candidates = memo.owner == this && !memo.refused;
@@ -5411,8 +5419,29 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             constexpr std::size_t MovedWordBufferSlots = 8;
-            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): the buffer queue 0 made for this
+            // element (same allocation, words and size, on this template: the caller offers words
+            // only then), bound without touching movedWordBuffers.
+            const TicketWordBuffer* ticketed = nullptr;
+            if (ticket != nullptr && !ticket->words.empty()) {
+                const auto found = std::find_if(ticket->words.begin(), ticket->words.end(), [&](const TicketWordBuffer& entry) { return entry.allocation == index && entry.words == override->words.data() && entry.size == override->size; });
+                if (found != ticket->words.end()) ticketed = &*found;
+                else NoteTicketEvent(TicketEvent::WordsUnmatched);
+            }
             std::shared_ptr<Buffer> buffer;
+            if (ticketed != nullptr && !ticket->shadowWords && ticketed->buffer != nullptr) {
+                buffer = ticketed->buffer;
+                NoteTicketEvent(TicketEvent::WordsUsed);
+                if (ticket->verifyWords) {
+                    std::vector<std::byte> expected(override->size);
+                    MovedWordBytes(index, override->words, override->size, expected);
+                    if (buffer->Bytes().size() < override->size || std::memcmp(buffer->Bytes().data(), expected.data(), override->size) != 0) TicketDisagrees(DrawTicket::WordBuffers, TicketUse::Verify, "a moved data-word buffer");
+                }
+                selected.push_back(index);
+                keep({0, std::move(buffer), 0, override->size});
+                continue;
+            }
+            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); });
             if (held != movedWordBuffers.end()) {
                 buffer = held->buffer;
                 if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::MovedReused, override->size);
@@ -5432,6 +5461,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                 else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
             }
+            // A shadow ticket's bytes against today's buffer (counted only).
+            if (ticketed != nullptr && ticket->shadowWords && (ticketed->bytes.size() != override->size || std::memcmp(buffer->Bytes().data(), ticketed->bytes.data(), override->size) != 0)) TicketDisagrees(DrawTicket::WordBuffers, TicketUse::Shadow, "a moved data-word buffer");
             selected.push_back(index);
             keep({0, std::move(buffer), 0, override->size});
             continue;
@@ -5486,7 +5517,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): would queue 0's collect of this slice
             // have passed a re-check here? Counted only; the slice above is today's.
-            if (ticket != nullptr) NoteTicketSlice(*ticket, begin, bytes, sliceCopied);
+            if (ticket != nullptr && ticket->byteShadow) NoteTicketSlice(*ticket, begin, bytes, sliceCopied);
             selected.push_back(index);
             keep({begin, std::move(slice.chunk), slice.offset, bytes, true});
             totalSnapshotBytes += bytes;
