@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 #include <thread>
+#include <utility>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -43,6 +44,23 @@ constexpr std::uint64_t PRESENT_POLL_MICROS = 10000;
 // APS5_LOADING_SPLASH: while no flip came for this long, the present loop shows the splash itself.
 constexpr auto SPLASH_IDLE_AFTER = std::chrono::milliseconds(100);
 constexpr auto SPLASH_IDLE_INTERVAL = std::chrono::milliseconds(33);
+// A covered flip this recent when the splash ended is the frame whose probe ended it, and is shown
+// again; after a later end (input, time limit) the window is cleared instead.
+constexpr auto SPLASH_COVERED_RECENT = std::chrono::milliseconds(1000);
+
+// APS5_LOADING_SPLASH: Enter, Space, Escape (without modifiers, not repeated) or a controller button
+// pressed while the window has focus ends the splash.
+bool splashDismissal(const SDL_Event& event, SDL_Window* window) {
+    if (window == nullptr || SDL_GetKeyboardFocus() != window) return false;
+    if (event.type == SDL_CONTROLLERBUTTONDOWN) return true;
+    if (event.type != SDL_KEYDOWN || event.key.repeat != 0 || (event.key.keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) != 0) return false;
+    const auto scancode = event.key.keysym.scancode;
+    return scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_SPACE || scancode == SDL_SCANCODE_ESCAPE;
+}
+
+bool sameDisplayBuffer(const AgcDriver::DisplayBuffer& a, const AgcDriver::DisplayBuffer& b) {
+    return a.address == b.address && a.pixelFormat == b.pixelFormat && a.width == b.width && a.height == b.height && a.tilingMode == b.tilingMode && a.pitchInPixel == b.pitchInPixel && a.dccAddress == b.dccAddress && a.dccClearColor == b.dccClearColor && a.alignment == b.alignment;
+}
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("VideoOut: ") + reason);
@@ -697,8 +715,10 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         ImeTextInput imeTextInput;
         // APS5_LOADING_SPLASH: the picture loads beside the loop; until the splash ends, a gap in the
         // game's flips is filled with presents of the splash alone (black flips, see LoadingSplash.hpp).
-        // The splash covers the frame whose probe ends it; when no flip follows, `covered` (the last
-        // buffer flipped under the splash) is presented again once it ended.
+        // The splash covers the frame whose probe ends it. `splashShown`: the window's last present
+        // was the splash (an idle present or a flip covered by it). Once the splash ended and no flip
+        // follows, `covered` (the last buffer flipped under the splash) is presented again if it is
+        // recent and still registered as it was, and the window is cleared otherwise.
         std::jthread splashLoader;
         if (AgcDriverLoadingSplashShowing_nid_postfix()) splashLoader = std::jthread([] { loadSplashPicture(); });
         const auto splashExtensions = windowExtensions(window.Handle());
@@ -706,12 +726,14 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         auto lastSplash = std::chrono::steady_clock::time_point{};
         struct CoveredFlip {
             std::shared_ptr<VideoOutConfig> cfg;
-            std::uint64_t generation = 0;
+            int index = 0;
             AgcDriver::DisplayBuffer display{};
             std::uint32_t width = 0;
             std::uint32_t height = 0;
+            std::chrono::steady_clock::time_point at;
         };
         std::optional<CoveredFlip> covered;
+        bool splashShown = false;
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
@@ -730,7 +752,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                     LibcRequestExit_nid_postfix(0);
                     throw ProcessShutdown{};
                 }
-                if ((event.type == SDL_KEYDOWN || event.type == SDL_CONTROLLERBUTTONDOWN || event.type == SDL_JOYBUTTONDOWN || event.type == SDL_MOUSEBUTTONDOWN) && AgcDriverLoadingSplashShowing_nid_postfix()) AgcDriverFinishLoadingSplash_nid_postfix("input");
+                if (splashDismissal(event, window.Handle()) && AgcDriverLoadingSplashShowing_nid_postfix()) AgcDriverFinishLoadingSplash_nid_postfix("input");
                 padInput.HandleEvent(event, window);
                 if (window.Handle() != nullptr) {
                     mouseInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
@@ -748,8 +770,11 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
                 const bool underSplash = AgcDriverLoadingSplashShowing_nid_postfix();
                 processFlip(*current);
-                covered.reset();
-                if (underSplash && current->index >= 0 && !current->unregistered && current->cfg->busType != VIDEO_OUT_BUS_TYPE_OVERLAY) covered = CoveredFlip{current->cfg, current->generation, DescribeVideoOutBuffer(current->buffer, current->group), current->width, current->height};
+                if (current->cfg->busType != VIDEO_OUT_BUS_TYPE_OVERLAY) {
+                    splashShown = underSplash;
+                    covered.reset();
+                    if (underSplash && current->index >= 0 && !current->unregistered) covered = CoveredFlip{current->cfg, current->index, DescribeVideoOutBuffer(current->buffer, current->group), current->width, current->height, std::chrono::steady_clock::now()};
+                }
                 int windowWidth = 0;
                 int windowHeight = 0;
                 if (window.Handle() != nullptr) SDL_GetWindowSize(window.Handle(), &windowWidth, &windowHeight);
@@ -776,24 +801,30 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
             } else if (window.Handle() != nullptr && std::chrono::steady_clock::now() - lastFlip >= SPLASH_IDLE_AFTER) {
                 const auto now = std::chrono::steady_clock::now();
                 static int splashContext = 0;
+                const AgcDriver::PresentationWindow splash{window.Handle(), splashExtensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr};
                 if (AgcDriverLoadingSplashShowing_nid_postfix()) {
                     if (now - lastSplash >= SPLASH_IDLE_INTERVAL) {
                         lastSplash = now;
-                        const AgcDriver::PresentationWindow splash{window.Handle(), splashExtensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr};
                         AgcDriverPresentClear_nid_postfix(splash, true, [](void*) {}, &splashContext);
+                        splashShown = true;
                     }
-                } else if (covered) {
-                    const auto flip = std::move(*covered);
-                    covered.reset();
+                } else if (splashShown) {
+                    splashShown = false;
+                    const auto flip = std::exchange(covered, std::nullopt);
                     bool live = false;
-                    {
-                        std::lock_guard lock(flip.cfg->mutex);
-                        live = !flip.cfg->Closed() && !flip.cfg->failure && flip.cfg->generation == flip.generation;
+                    if (flip && now - flip->at <= SPLASH_COVERED_RECENT) {
+                        std::lock_guard lock(flip->cfg->mutex);
+                        if (!flip->cfg->Closed() && !flip->cfg->failure) {
+                            const auto& buffer = flip->cfg->buffers[static_cast<std::size_t>(flip->index)];
+                            live = buffer.Occupied() && static_cast<std::size_t>(buffer.groupIndex) < flip->cfg->groups.size() && flip->cfg->groups[static_cast<std::size_t>(buffer.groupIndex)].occupied && sameDisplayBuffer(DescribeVideoOutBuffer(buffer, flip->cfg->groups[static_cast<std::size_t>(buffer.groupIndex)]), flip->display);
+                        }
                     }
                     if (live) {
-                        window.Ensure(flip.width, flip.height);
-                        const AgcDriver::PresentationWindow target{window.Handle(), splashExtensions, &createWindowSurface, &windowDrawableSize, flip.width, flip.height, nullptr};
-                        AgcDriverPresentBuffer_nid_postfix(target, flip.display, [](void*) {}, &splashContext);
+                        window.Ensure(flip->width, flip->height);
+                        const AgcDriver::PresentationWindow target{window.Handle(), splashExtensions, &createWindowSurface, &windowDrawableSize, flip->width, flip->height, nullptr};
+                        AgcDriverPresentBuffer_nid_postfix(target, flip->display, [](void*) {}, &splashContext);
+                    } else {
+                        AgcDriverPresentClear_nid_postfix(splash, true, [](void*) {}, &splashContext);
                     }
                 }
             }
