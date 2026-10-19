@@ -232,6 +232,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationScaler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationPass.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceOverlay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/LoadingSplash.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleTarget.cpp
@@ -1568,6 +1569,30 @@ if(BUILD_TESTING)
     set_tests_properties(agc_performance_overlay_device_selection_cpu PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_performance_overlay_statistics agc_performance_overlay agc_performance_overlay_device_selection agc_performance_overlay_device_selection_cpu PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_loading_splash_tests EXCLUDE_FROM_ALL
+        tests/LoadingSplash.cpp
+)
+target_include_directories(agc_loading_splash_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+)
+target_link_libraries(agc_loading_splash_tests PRIVATE
+        libSceAgcDriver
+        libc
+)
+set_target_properties(agc_loading_splash_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_loading_splash_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_loading_splash_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_loading_splash COMMAND agc_loading_splash_tests)
+    set_tests_properties(agc_loading_splash PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_loading_splash PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
