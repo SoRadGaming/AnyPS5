@@ -424,6 +424,7 @@ struct VulkanDevice::State {
     std::unique_ptr<PresentationScaler> splashScaler;
     std::unique_ptr<Graphics::Buffer> splashUpload;
     std::unique_ptr<PerformanceOverlay> splashPanel;
+    VkFormat splashSurfaceFormat = VK_FORMAT_UNDEFINED;
     bool splashUploaded = false;
     bool swapchainReadable = false;
     std::size_t splashIdle = 0;
@@ -753,6 +754,7 @@ struct VulkanDevice::State {
             for (auto& slot : presentSlots) {
                 slot.dumpBuffer.reset();
                 slot.dumpScaler.reset();
+                slot.probeBuffer.reset();
             }
             // Results still in the unit shadows reach guest memory before the device goes; the
             // slabs (kept by the publishing batch) are freed by the recorder's teardown.
@@ -796,6 +798,9 @@ struct VulkanDevice::State {
             detiler.reset();
             colorTransfer.reset();
             overlay.reset();
+            splashPanel.reset();
+            splashScaler.reset();
+            splashUpload.reset();
             presentation.reset();
             scaler.reset();
             hdrScaler.reset();
@@ -3417,17 +3422,20 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         pipelineBarrier(commands, written, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
         Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
         // The picture is in sRGB: an sRGB swapchain gets an sRGB source so the blit keeps its values.
-        // An HDR10 swapchain shows the panel alone.
-        const auto picture = passthrough ? LoadingSplash::Picture{} : LoadingSplash::CurrentPicture();
+        // An HDR10 swapchain (clear presents included) shows the panel alone, and so does a swapchain
+        // whose format changed after the picture's scaler was made for another one.
+        const bool hdr10 = state->surfaceColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+        const auto picture = hdr10 ? LoadingSplash::Picture{} : LoadingSplash::CurrentPicture();
         if (picture.rgba != nullptr && state->splashScaler == nullptr) {
             const bool srgb = state->surfaceFormat == VK_FORMAT_B8G8R8A8_SRGB || state->surfaceFormat == VK_FORMAT_R8G8B8A8_SRGB || state->surfaceFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
             state->splashScaler = std::make_unique<PresentationScaler>(graphicsContext(), srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, state->surfaceFormat);
             state->splashScaler->EnsureSourceImage(picture.width, picture.height);
             state->splashUpload = std::make_unique<Graphics::Buffer>(graphicsContext(), picture.rgba->size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(state->splashUpload->Bytes().data(), picture.rgba->data(), picture.rgba->size());
+            state->splashSurfaceFormat = state->surfaceFormat;
             state->splashUploaded = false;
         }
-        if (state->splashScaler != nullptr && !passthrough) {
+        if (state->splashScaler != nullptr && !hdr10 && state->splashSurfaceFormat == state->surfaceFormat) {
             if (!state->splashUploaded) {
                 state->splashScaler->RecordUpload(commands, state->splashUpload->Handle());
                 state->splashUploaded = true;
@@ -3440,13 +3448,13 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             state->DeviceFunction<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, barrier.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &barrier.subresourceRange);
         }
         if (!state->splashPanel) state->splashPanel = std::make_unique<PerformanceOverlay>(graphicsContext(), state->presentSlots.size());
-        state->splashPanel->Record(commands, slotIndex, barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, overlay ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, LoadingSplash::Content(std::chrono::steady_clock::now()), OverlayCorner::BottomRight);
+        state->splashPanel->Record(commands, slotIndex, barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, overlay ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, LoadingSplash::Content(std::chrono::steady_clock::now()), OverlayCorner::BottomRight);
         state->splashIdle = 0;
     }
     if (overlay) {
         if (!state->overlay) state->overlay = std::make_unique<PerformanceOverlay>(graphicsContext(), state->presentSlots.size());
         state->overlay->NotePresent(std::chrono::steady_clock::now(), clearOnly ? VkExtent2D{} : VkExtent2D{width, height});
-        state->overlay->Record(commands, static_cast<std::size_t>(&slot - state->presentSlots.data()), barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, splashing || !drawn ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        state->overlay->Record(commands, static_cast<std::size_t>(&slot - state->presentSlots.data()), barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, splashing || drawn ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else if (!drawn && !splashing) {
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = 0;

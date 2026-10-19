@@ -41,14 +41,14 @@ std::vector<std::byte> probe(VkFormat format, std::size_t lit, std::uint32_t bri
 }
 
 void classificationTests() {
-    const auto onePercent = Splash::ProbeSamples / 100;
     require(!Splash::ContentFrame(probe(VK_FORMAT_B8G8R8A8_UNORM, 0, 0), VK_FORMAT_B8G8R8A8_UNORM), "a dithered black frame reads as content");
-    require(!Splash::ContentFrame(probe(VK_FORMAT_B8G8R8A8_UNORM, onePercent - 1, 255), VK_FORMAT_B8G8R8A8_UNORM), "a few bright samples read as content");
-    require(Splash::ContentFrame(probe(VK_FORMAT_B8G8R8A8_UNORM, onePercent, 255), VK_FORMAT_B8G8R8A8_UNORM), "1% of the samples at full brightness read as black");
+    require(!Splash::ContentFrame(probe(VK_FORMAT_B8G8R8A8_UNORM, 1, 255), VK_FORMAT_B8G8R8A8_UNORM), "one bright sample reads as content");
+    require(Splash::ContentFrame(probe(VK_FORMAT_B8G8R8A8_UNORM, 2, 255), VK_FORMAT_B8G8R8A8_UNORM), "two bright samples (a line of text) read as black");
     require(!Splash::ContentFrame(probe(VK_FORMAT_R8G8B8A8_SRGB, Splash::ProbeSamples, 39), VK_FORMAT_R8G8B8A8_SRGB), "a uniform 39/255 frame reads as content");
     require(Splash::ContentFrame(probe(VK_FORMAT_R8G8B8A8_SRGB, Splash::ProbeSamples, 40), VK_FORMAT_R8G8B8A8_SRGB), "a uniform 40/255 frame reads as black");
     require(!Splash::ContentFrame(probe(VK_FORMAT_A2B10G10R10_UNORM_PACK32, 0, 0), VK_FORMAT_A2B10G10R10_UNORM_PACK32), "a black HDR10 frame reads as content");
-    require(Splash::ContentFrame(probe(VK_FORMAT_A2B10G10R10_UNORM_PACK32, 50, 600), VK_FORMAT_A2B10G10R10_UNORM_PACK32), "a lit HDR10 frame reads as black");
+    require(!Splash::ContentFrame(probe(VK_FORMAT_A2B10G10R10_UNORM_PACK32, Splash::ProbeSamples, 243), VK_FORMAT_A2B10G10R10_UNORM_PACK32), "an HDR10 frame below 4.3 nits reads as content");
+    require(Splash::ContentFrame(probe(VK_FORMAT_A2B10G10R10_UNORM_PACK32, Splash::ProbeSamples, 244), VK_FORMAT_A2B10G10R10_UNORM_PACK32), "an HDR10 frame at 4.3 nits reads as black");
     require(!Splash::ContentFrame(probe(VK_FORMAT_R16G16B16A16_SFLOAT, 0, 0), VK_FORMAT_R16G16B16A16_SFLOAT), "a near-black scRGB frame reads as content");
     require(Splash::ContentFrame(probe(VK_FORMAT_R16G16B16A16_SFLOAT, 50, 1), VK_FORMAT_R16G16B16A16_SFLOAT), "a lit scRGB frame reads as black");
     require(Splash::ProbeTexelBytes(VK_FORMAT_R5G6B5_UNORM_PACK16) == 0, "an unreadable format has a probe size");

@@ -23,9 +23,9 @@ Clock::time_point startedAt() {
 std::chrono::seconds maxDuration() {
     static const std::chrono::seconds limit = [] {
         const char* value = std::getenv("APS5_LOADING_SPLASH_MAX_SECONDS");
-        if (value == nullptr) return std::chrono::seconds(600);
+        if (value == nullptr) return std::chrono::seconds(300);
         const long parsed = std::strtol(value, nullptr, 10);
-        return std::chrono::seconds(parsed > 0 ? parsed : 600);
+        return std::chrono::seconds(parsed > 0 ? parsed : 300);
     }();
     return limit;
 }
@@ -43,7 +43,8 @@ float halfToFloat(std::uint16_t half) {
     return sign * std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
 }
 
-// A texel with a color channel at 40/255 or more (or the same level in the 10-bit and float formats).
+// A texel with a color channel at 40/255 or more: sRGB 40/255 is 2.1% of white, 4.3 nits at the
+// 203-nit reference white, PQ code 244 of 1023 on an HDR10 swapchain, and 0.021 in linear scRGB.
 bool litTexel(const std::byte* texel, VkFormat format) {
     switch (format) {
         case VK_FORMAT_B8G8R8A8_UNORM:
@@ -58,13 +59,12 @@ bool litTexel(const std::byte* texel, VkFormat format) {
         case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
             std::uint32_t word = 0;
             std::memcpy(&word, texel, sizeof(word));
-            return std::max({word & 0x3ffu, (word >> 10) & 0x3ffu, (word >> 20) & 0x3ffu}) >= 160u;
+            return std::max({word & 0x3ffu, (word >> 10) & 0x3ffu, (word >> 20) & 0x3ffu}) >= 244u;
         }
         case VK_FORMAT_R16G16B16A16_SFLOAT: {
             std::uint16_t channels[3] = {};
             std::memcpy(channels, texel, sizeof(channels));
-            // scRGB is linear: 0.02 is about 40/255 after the sRGB curve.
-            return std::max({halfToFloat(channels[0]), halfToFloat(channels[1]), halfToFloat(channels[2])}) >= 0.02f;
+            return std::max({halfToFloat(channels[0]), halfToFloat(channels[1]), halfToFloat(channels[2])}) >= 0.021f;
         }
         default:
             return true;
@@ -130,7 +130,7 @@ bool ContentFrame(std::span<const std::byte> texels, VkFormat format) {
     for (std::size_t i = 0; i < samples; ++i) {
         if (litTexel(texels.data() + i * bytes, format)) ++lit;
     }
-    return lit >= std::max<std::size_t>(2, samples / 100);
+    return lit >= 2;
 }
 
 void NoteProbe(std::span<const std::byte> texels, VkFormat format) {
@@ -168,6 +168,10 @@ OverlayContent Content(Clock::time_point now) {
 
 extern "C" bool AgcDriverLoadingSplashShowing_nid_postfix() {
     return AgcDriver::LoadingSplash::Showing();
+}
+
+extern "C" void AgcDriverFinishLoadingSplash_nid_postfix(const char* reason) {
+    AgcDriver::LoadingSplash::Finish(reason != nullptr ? reason : "ended by the host");
 }
 
 extern "C" void AgcDriverSetLoadingSplashPicture_nid_postfix(std::uint32_t width, std::uint32_t height, const std::uint8_t* rgba, std::size_t bytes) {

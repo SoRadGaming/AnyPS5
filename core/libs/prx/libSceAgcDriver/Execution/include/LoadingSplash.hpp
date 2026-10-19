@@ -14,8 +14,9 @@
 // APS5_LOADING_SPLASH=1: while a title boots and shows nothing but black frames, the window shows
 // its key art (sce_sys/pic0.png, handed over by VideoOut) with a loading panel instead. Each
 // presented frame is sampled on a grid of swapchain texels (read back when its slot retires); the
-// first frame with content ends the splash for good. Presents with no game frame (before the first
-// flip, black flips) show it too. Off by default.
+// first frame with content ends the splash for good, and so do the first key, button or click and
+// APS5_LOADING_SPLASH_MAX_SECONDS. Presents with no game frame (before the first flip, black flips)
+// show it too. Off by default.
 namespace AgcDriver::LoadingSplash {
 
 inline constexpr std::uint32_t ProbeColumns = 32;
@@ -30,8 +31,7 @@ struct Picture {
 };
 
 bool Enabled();
-// Enabled, no frame with content seen yet, and within APS5_LOADING_SPLASH_MAX_SECONDS (default
-// 600) of the first call.
+// Enabled, not finished, and within APS5_LOADING_SPLASH_MAX_SECONDS (default 300) of the first call.
 bool Showing();
 void Finish(const char* reason);
 
@@ -40,8 +40,9 @@ void Finish(const char* reason);
 std::uint32_t ProbeTexelBytes(VkFormat format);
 // The probe's sample positions in a destination of `extent`: centers of a ProbeColumns x ProbeRows grid.
 VkOffset3D ProbeOffset(std::uint32_t sample, VkExtent2D extent);
-// True when the sampled texels show content: at least 1% of them (and 2) have a color channel at
-// 40/255 or more (dithered near-black loading frames stay well below that).
+// True when at least two sampled texels have a color channel at 40/255 or more (for HDR10, the PQ
+// code of that level at 203 nits). Dithered near-black loading frames stay well below it; a line of
+// text on black reaches it.
 bool ContentFrame(std::span<const std::byte> texels, VkFormat format);
 // Classifies a frame's probe read back after its submission; content ends the splash.
 void NoteProbe(std::span<const std::byte> texels, VkFormat format);
