@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -15,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
@@ -35,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -961,6 +964,204 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
     reportDraw(timer.us, built, outcome);
 }
 
+constexpr VkMemoryPropertyFlags HostBufferProperties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+constexpr VkMemoryPropertyFlags RebarBufferProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | HostBufferProperties;
+
+// A switch that is on unless unset, empty or "0".
+bool switchOn(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): whether a draw input copy was asked for in
+// device-local (ReBAR) memory, which the CPU only writes.
+bool copyInDeviceMemory(const DrawInputCopy& copy) {
+    return copy.buffer != nullptr && (copy.buffer->Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+}
+
+// LOCAL DEBUG (APS5_DEBUG_DRAW_INPUT_BYTES, GPU-MEMORY-PLAN C0): the counters of the [draw-inputs]
+// line, by DrawInputBytes kind; the 10 s ones are taken by the report.
+constexpr std::size_t DrawInputBytesKinds = static_cast<std::size_t>(DrawInputBytes::Count);
+constexpr std::array<const char*, static_cast<std::size_t>(DrawInputSite::Count)> DrawInputSiteNames{"index copy", "vertex copy", "solo zero-padded copy", "clamped indices", "snapshot arena chunk", "draw upload chunk", "reusable snapshot", "moved word buffer"};
+
+struct DrawInputCounters {
+    std::array<std::atomic<std::uint64_t>, DrawInputBytesKinds> uses{};
+    std::array<std::atomic<std::uint64_t>, DrawInputBytesKinds> bytes{};
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> indexed{0};
+    // The buffers NoteDrawInputBuffer saw, [0] on a host heap and [1] on a device-local heap, and
+    // those of them asked for without DEVICE_LOCAL that still got a device-local heap.
+    std::array<std::atomic<std::uint64_t>, 2> buffers{};
+    std::array<std::atomic<std::uint64_t>, 2> bufferBytes{};
+    std::atomic<std::uint64_t> hostOnDevice{0};
+    std::atomic<std::uint64_t> hostOnDeviceBytes{0};
+    // Every Buffer the budget moved to another heap (NoteBufferHeapSpill); cumulative.
+    std::atomic<std::uint64_t> spills{0};
+    std::atomic<std::uint64_t> spillBytes{0};
+    std::atomic<std::int64_t> lastReportMs{0};
+    // The (site, properties, memory type) keys already printed, then the host import triples.
+    std::array<std::atomic<std::uint64_t>, 64> seen{};
+    std::mutex seenMutex;
+    std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> imports;
+};
+
+DrawInputCounters& drawInputCounters() {
+    static DrawInputCounters counters;
+    return counters;
+}
+
+// Whether `key` (never 0) was not seen before; a full table answers yes again.
+bool firstSeen(DrawInputCounters& counters, std::uint64_t key) {
+    for (const auto& slot : counters.seen) {
+        const auto held = slot.load(std::memory_order_relaxed);
+        if (held == key) return false;
+        if (held == 0) break;
+    }
+    std::lock_guard lock(counters.seenMutex);
+    for (auto& slot : counters.seen) {
+        const auto held = slot.load(std::memory_order_relaxed);
+        if (held == key) return false;
+        if (held == 0) {
+            slot.store(key, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return true;
+}
+
+bool deviceLocalType(const Context& context, std::uint32_t type) {
+    return type < context.memory.memoryTypeCount && (context.memory.memoryHeaps[context.memory.memoryTypes[type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+}
+
+std::uint32_t typeHeap(const Context& context, std::uint32_t type) {
+    return type < context.memory.memoryTypeCount ? context.memory.memoryTypes[type].heapIndex : 0u;
+}
+
+VkMemoryPropertyFlags typeFlags(const Context& context, std::uint32_t type) {
+    return type < context.memory.memoryTypeCount ? context.memory.memoryTypes[type].propertyFlags : 0u;
+}
+
+void reportDrawInputBytes(const Context& context, DrawInputCounters& counters) {
+    std::array<unsigned long long, DrawInputBytesKinds> uses{};
+    std::array<double, DrawInputBytesKinds> mib{};
+    for (std::size_t i = 0; i < DrawInputBytesKinds; ++i) {
+        uses[i] = counters.uses[i].exchange(0, std::memory_order_relaxed);
+        mib[i] = static_cast<double>(counters.bytes[i].exchange(0, std::memory_order_relaxed)) / 1048576.0;
+    }
+    const auto at = [](DrawInputBytes kind) { return static_cast<std::size_t>(kind); };
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto takeMib = [](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) / 1048576.0; };
+    char line[2048];
+    int n = std::snprintf(line, sizeof(line), "[draw-inputs] (10 s) %llu draws (%llu indexed); index buffers in place 16-bit %.1f MiB (%llu), 32-bit %.1f MiB (%llu); copied 16-bit %.1f MiB (%llu), 32-bit %.1f MiB (%llu); copies reused 16-bit %.1f MiB (%llu), 32-bit %.1f MiB (%llu); clamped 16-bit %.1f MiB (%llu), 32-bit %.1f MiB (%llu)", take(counters.draws), take(counters.indexed), mib[at(DrawInputBytes::IndexInPlace16)], uses[at(DrawInputBytes::IndexInPlace16)], mib[at(DrawInputBytes::IndexInPlace32)], uses[at(DrawInputBytes::IndexInPlace32)], mib[at(DrawInputBytes::IndexCopied16)], uses[at(DrawInputBytes::IndexCopied16)], mib[at(DrawInputBytes::IndexCopied32)], uses[at(DrawInputBytes::IndexCopied32)], mib[at(DrawInputBytes::IndexReused16)], uses[at(DrawInputBytes::IndexReused16)], mib[at(DrawInputBytes::IndexReused32)], uses[at(DrawInputBytes::IndexReused32)], mib[at(DrawInputBytes::IndexClamped16)], uses[at(DrawInputBytes::IndexClamped16)], mib[at(DrawInputBytes::IndexClamped32)], uses[at(DrawInputBytes::IndexClamped32)]);
+    const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; vertex ranges in place %.1f MiB (%llu), copied %.1f MiB (%llu), copies reused %.1f MiB (%llu); solo zero-padded %.1f MiB (%llu)", mib[at(DrawInputBytes::VertexInPlace)], uses[at(DrawInputBytes::VertexInPlace)], mib[at(DrawInputBytes::VertexCopied)], uses[at(DrawInputBytes::VertexCopied)], mib[at(DrawInputBytes::VertexReused)], uses[at(DrawInputBytes::VertexReused)], mib[at(DrawInputBytes::Solo)], uses[at(DrawInputBytes::Solo)]);
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; snapshots (draws and dispatches): arena slices copied %.1f MiB (%llu), epoch memo %.1f MiB (%llu), kept %.1f MiB (%llu); uploads %.1f MiB (%llu); reusable copied %.1f MiB (%llu), epoch memo %.1f MiB (%llu), reused %.1f MiB (%llu); moved words copied %.1f MiB (%llu), reused %.1f MiB (%llu)", mib[at(DrawInputBytes::SliceCopied)], uses[at(DrawInputBytes::SliceCopied)], mib[at(DrawInputBytes::SliceEpoch)], uses[at(DrawInputBytes::SliceEpoch)], mib[at(DrawInputBytes::SliceKept)], uses[at(DrawInputBytes::SliceKept)], mib[at(DrawInputBytes::Upload)], uses[at(DrawInputBytes::Upload)], mib[at(DrawInputBytes::SnapshotCopied)], uses[at(DrawInputBytes::SnapshotCopied)], mib[at(DrawInputBytes::SnapshotEpoch)], uses[at(DrawInputBytes::SnapshotEpoch)], mib[at(DrawInputBytes::SnapshotReused)], uses[at(DrawInputBytes::SnapshotReused)], mib[at(DrawInputBytes::MovedCopied)], uses[at(DrawInputBytes::MovedCopied)], mib[at(DrawInputBytes::MovedReused)], uses[at(DrawInputBytes::MovedReused)]);
+    if (room()) {
+        const auto hostBuffers = take(counters.buffers[0]);
+        const auto hostMib = takeMib(counters.bufferBytes[0]);
+        const auto deviceBuffers = take(counters.buffers[1]);
+        const auto deviceMib = takeMib(counters.bufferBytes[1]);
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; new buffers of these on host heaps %llu (%.1f MiB), on device-local heaps %llu (%.1f MiB), of them asked for without DEVICE_LOCAL %llu (%.1f MiB); budget heap spills of any buffer (cumulative) %llu (%.1f MiB); switches inputs %d snapshots %d", hostBuffers, hostMib, deviceBuffers, deviceMib, take(counters.hostOnDevice), takeMib(counters.hostOnDeviceBytes), static_cast<unsigned long long>(counters.spills.load(std::memory_order_relaxed)), static_cast<double>(counters.spillBytes.load(std::memory_order_relaxed)) / 1048576.0, DrawInputsVram(), DrawSnapshotsVram() ? 1 : 0);
+    }
+    if (room() && context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        context.memoryProperties2(context.physical, &properties);
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; heaps used of budget:");
+        for (std::uint32_t heap = 0; heap < context.memory.memoryHeapCount && heap < VK_MAX_MEMORY_HEAPS && room(); ++heap) {
+            const bool device = (context.memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %u%s %llu of %llu MiB", heap, device ? " (device-local)" : "", static_cast<unsigned long long>(reported.heapUsage[heap] >> 20u), static_cast<unsigned long long>(reported.heapBudget[heap] >> 20u));
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+}
+
+}
+
+int DrawInputsVram() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_DRAW_INPUTS_VRAM");
+        const int value = text == nullptr ? 0 : text[0] == '1' ? 1 : text[0] == '2' ? 2 : 0;
+        if (value != 0) std::fprintf(stderr, "[draw-inputs] APS5_EXPERIMENT_DRAW_INPUTS_VRAM=%d: index and vertex inputs are copied into %s buffers, except vertex ranges with a pending GPU write\n", value, value == 1 ? "DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (ReBAR VRAM)" : "default host");
+        return value;
+    }();
+    return mode;
+}
+
+VkMemoryPropertyFlags DrawInputCopyProperties() {
+    return DrawInputsVram() == 1 ? RebarBufferProperties : HostBufferProperties;
+}
+
+bool DrawSnapshotsVram() {
+    static const bool enabled = [] {
+        const bool on = switchOn("APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM");
+        if (on) std::fprintf(stderr, "[draw-inputs] APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1: snapshot arena chunks, draw upload chunks and moved word buffers are DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT (ReBAR VRAM)\n");
+        return on;
+    }();
+    return enabled;
+}
+
+VkMemoryPropertyFlags DrawSnapshotChunkProperties() {
+    return DrawSnapshotsVram() ? RebarBufferProperties : HostBufferProperties;
+}
+
+bool DebugDrawInputBytes() {
+    static const bool enabled = switchOn("APS5_DEBUG_DRAW_INPUT_BYTES");
+    return enabled;
+}
+
+void CountDrawInputBytes(DrawInputBytes kind, std::uint64_t bytes) {
+    auto& counters = drawInputCounters();
+    const auto index = static_cast<std::size_t>(kind);
+    counters.uses[index].fetch_add(1, std::memory_order_relaxed);
+    counters.bytes[index].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void CountDrawInputDraw(const Context& context, bool indexed) {
+    auto& counters = drawInputCounters();
+    counters.draws.fetch_add(1, std::memory_order_relaxed);
+    if (indexed) counters.indexed.fetch_add(1, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReportMs.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counters.lastReportMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed);
+        return;
+    }
+    if (nowMs - last < 10000 || !counters.lastReportMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed)) return;
+    reportDrawInputBytes(context, counters);
+}
+
+void NoteDrawInputBuffer(const Context& context, DrawInputSite site, const Buffer& buffer, std::size_t bytes) {
+    auto& counters = drawInputCounters();
+    const auto type = buffer.MemoryType();
+    const auto properties = buffer.Properties();
+    const bool device = deviceLocalType(context, type);
+    counters.buffers[device ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+    counters.bufferBytes[device ? 1 : 0].fetch_add(bytes, std::memory_order_relaxed);
+    if (device && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+        counters.hostOnDevice.fetch_add(1, std::memory_order_relaxed);
+        counters.hostOnDeviceBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    const auto key = ((static_cast<std::uint64_t>(site) + 1u) << 48u) | (static_cast<std::uint64_t>(properties & 0xffffffffu) << 8u) | (type & 0xffu);
+    if (firstSeen(counters, key)) AgcDriver::ProfilePrint_nid_no_patch("[draw-inputs] memory: %s buffers asked for properties 0x%x got memory type %u (heap %u%s, flags 0x%x)\n", DrawInputSiteNames[static_cast<std::size_t>(site)], static_cast<unsigned>(properties), type, typeHeap(context, type), device ? ", device-local" : "", static_cast<unsigned>(typeFlags(context, type)));
+}
+
+void NoteHostImportMemory(const Context& context, std::uint32_t importTypes, std::uint32_t bufferTypes, std::uint32_t chosen) {
+    if (!DebugDrawInputBytes()) return;
+    auto& counters = drawInputCounters();
+    {
+        std::lock_guard lock(counters.seenMutex);
+        if (!counters.imports.insert({importTypes, bufferTypes, chosen}).second) return;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-inputs] memory: host imports with import types 0x%x and buffer types 0x%x got memory type %u (heap %u%s, flags 0x%x)\n", importTypes, bufferTypes, chosen, typeHeap(context, chosen), deviceLocalType(context, chosen) ? ", device-local" : "", static_cast<unsigned>(typeFlags(context, chosen)));
+}
+
+void NoteBufferHeapSpill(const Context& context, VkMemoryPropertyFlags properties, std::uint32_t type, VkDeviceSize bytes) {
+    if (!DebugDrawInputBytes()) return;
+    auto& counters = drawInputCounters();
+    const auto count = counters.spills.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto total = counters.spillBytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    if (count <= 5 || (count & (count - 1)) == 0) AgcDriver::ProfilePrint_nid_no_patch("[draw-inputs] budget spill: a buffer asking for properties 0x%x (%llu bytes) got memory type %u on heap %u%s, its first heap being over its VK_EXT_memory_budget budget; %llu such buffers, %.1f MiB\n", static_cast<unsigned>(properties), static_cast<unsigned long long>(bytes), type, typeHeap(context, type), deviceLocalType(context, type) ? " (device-local)" : "", static_cast<unsigned long long>(count), static_cast<double>(total) / 1048576.0);
 }
 
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
@@ -976,7 +1177,10 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             return copy;
         }
     }
-    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): the copy is made in ReBAR VRAM; the CPU
+    // only writes it (the reads of an index copy go to the guest range, see prepareDrawInputs).
+    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, DrawInputCopyProperties());
+    if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, use == Recorder::SnapshotUse::Vertex ? DrawInputSite::VertexCopy : DrawInputSite::IndexCopy, *copy.buffer, bytes);
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
     return copy;
 }
@@ -985,7 +1189,9 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
     GuestMemory::FlushGpuWrites(address, bytes);
     DrawInputCopy copy;
-    copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): in ReBAR VRAM; the CPU only writes it.
+    copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, DrawInputCopyProperties());
+    if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, DrawInputSite::SoloCopy, *copy.buffer, bytes);
     const auto span = copy.buffer->Bytes();
     auto readable = validBytes;
     if (stride != 0 && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), validBytes)) {
@@ -1021,6 +1227,10 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1|2): the draw binds a copy instead
+    // (CopyDrawInput), except a vertex range a pending GPU write produces, which stays in place
+    // behind its producer. An index range with a pending write was refused above.
+    if (DrawInputsVram() != 0 && !behind) return nullptr;
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
     return import;
@@ -1339,7 +1549,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             auto* replay = replayInputs(recipe);
             highest = replay != nullptr ? replayHighestIndex(*context.recorder, *replay, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart) : InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): a copy in device-local memory
+            // (write-combined ReBAR VRAM, uncached for the CPU) is not scanned: the guest range
+            // CopyDrawInput just read it from is.
+            const auto scanned = copyInDeviceMemory(copy) ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : std::span<const std::byte>(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)));
+            highest = HighestDrawIndex(scanned, draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
             highest = copy.derived;
@@ -1351,17 +1565,22 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             return inputs;
         }
         constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+        bool clampedCopy = false;
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
                 GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                // Host memory under every APS5_EXPERIMENT_DRAW_INPUTS_VRAM arm: ClampDrawIndices
+                // reads and rewrites it in place.
                 auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, DrawInputSite::ClampedIndices, *clamped, static_cast<std::size_t>(indexBytes));
                 const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
                 GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
                 highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
                 import = nullptr;
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
+                clampedCopy = true;
                 if (!highest) {
                     inputs.nothing = true;
                     return inputs;
@@ -1372,8 +1591,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(!fanGeometry || !state.primitiveRestart || *highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
         inputs.maxIndex = *highest;
         if (skipRestart && state.stages.mesh && state.stages.mesh->inputPrimitive == 6) {
-            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): a copy in device-local memory is
+            // read from its guest range, which it equals (the clamped copy is host memory).
+            const bool guestRange = import != nullptr || copyInDeviceMemory(copy);
+            const auto indexSpan = guestRange ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
+        }
+        // LOCAL DEBUG (APS5_DEBUG_DRAW_INPUT_BYTES): where the bound index bytes come from.
+        if (DebugDrawInputBytes()) {
+            const bool narrow = draw.indexSize == 2;
+            const auto kind = clampedCopy ? (narrow ? DrawInputBytes::IndexClamped16 : DrawInputBytes::IndexClamped32) : import != nullptr ? (narrow ? DrawInputBytes::IndexInPlace16 : DrawInputBytes::IndexInPlace32) : copy.reused ? (narrow ? DrawInputBytes::IndexReused16 : DrawInputBytes::IndexReused32) : (narrow ? DrawInputBytes::IndexCopied16 : DrawInputBytes::IndexCopied32);
+            CountDrawInputBytes(kind, indexBytes);
         }
         if (import != nullptr) {
             inputs.indexHandle = import->buffer;
@@ -1452,12 +1680,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         RequireNoMultisampleTarget(begin, bytes, "a vertex buffer read");
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
+            if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::VertexInPlace, bytes);
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        if (DebugDrawInputBytes()) CountDrawInputBytes(copy.reused ? DrawInputBytes::VertexReused : DrawInputBytes::VertexCopied, bytes);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
@@ -1469,6 +1699,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
         auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride);
+        if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::Solo, bytes);
         soloHandles[f] = copy.buffer->Handle();
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
@@ -1489,6 +1720,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
     }
+    if (DebugDrawInputBytes()) CountDrawInputDraw(context, draw.indexed);
     timer.phase(PhaseVertex);
     return inputs;
 }

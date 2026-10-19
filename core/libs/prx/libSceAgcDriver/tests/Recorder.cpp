@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -4115,16 +4116,27 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     context.recorder = &recorder;
     recorder.Sync();
     const auto vertices = address + 4096;
-    const auto* import = InPlaceDrawInput(context, vertices, 256, 4);
-    Require(import != nullptr && import->base <= vertices && vertices + 256 <= import->base + import->bytes, "an imported draw input was not bound in place");
-    const auto read = recorder.DescribePendingRead(vertices, 256);
-    Require(read.has_value() && read->kind == Recorder::ReadKind::DrawInput && read->open, "an in-place draw input's read was not noted on the open batch");
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1|2, ctest agc_draw_inputs_in_place_vram1
+    // and _vram2): InPlaceDrawInput refuses every range without a pending GPU write (the draw binds
+    // a copy) and still binds a vertex range under one in place, behind it. Unset or 0 such a free
+    // range binds in place; `freeRange` checks whichever the switch expects.
+    const bool refused = DrawInputsVram() != 0;
+    const auto freeRange = [refused](const HostImport* bound) { return refused ? bound == nullptr : bound != nullptr; };
+    if (refused) std::cout << "APS5_EXPERIMENT_DRAW_INPUTS_VRAM=" << DrawInputsVram() << ": draw inputs free of pending GPU writes are expected to be refused\n";
+    const auto* import = refused ? HostImportFor(context, vertices, 256) : InPlaceDrawInput(context, vertices, 256, 4);
+    if (refused) {
+        Require(import != nullptr && InPlaceDrawInput(context, vertices, 256, 4) == nullptr && !recorder.PendingReadOverlaps(vertices, 256), "an imported draw input was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM");
+    } else {
+        Require(import != nullptr && import->base <= vertices && vertices + 256 <= import->base + import->bytes, "an imported draw input was not bound in place");
+        const auto read = recorder.DescribePendingRead(vertices, 256);
+        Require(read.has_value() && read->kind == Recorder::ReadKind::DrawInput && read->open, "an in-place draw input's read was not noted on the open batch");
+    }
     Require(InPlaceDrawInput(context, vertices + 2, 256, 4) == nullptr, "a draw input misaligned for its format was bound in place");
-    Require(InPlaceDrawInput(context, vertices + 2, 256, 2) != nullptr, "an aligned 16-bit draw input was not bound in place");
+    Require(freeRange(InPlaceDrawInput(context, vertices + 2, 256, 2)), refused ? "an aligned 16-bit draw input was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM" : "an aligned 16-bit draw input was not bound in place");
     recorder.NotePendingWrite(address + 8192, 16);
-    Require(InPlaceDrawInput(context, address + 8192, 256, 4) != nullptr && !recorder.PendingWriteOverlaps(address + 8192, 256), "a draw input under a pending GPU write was bound before the write completed");
+    Require(freeRange(InPlaceDrawInput(context, address + 8192, 256, 4)) && !recorder.PendingWriteOverlaps(address + 8192, 256), refused ? "a draw input after a completed GPU write was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM, or the write was not completed" : "a draw input under a pending GPU write was bound before the write completed");
     bool behind = false;
-    Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && !behind, "a vertex input free of pending GPU writes was marked as ordered behind one");
+    Require(freeRange(InPlaceDrawInput(context, address + 20480, 256, 4, &behind)) && !behind, refused ? "a vertex input free of pending GPU writes was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM or marked as ordered behind one" : "a vertex input free of pending GPU writes was marked as ordered behind one");
     recorder.NotePendingWrite(address + 20480, 16);
     Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && behind && recorder.PendingWriteOverlaps(address + 20480, 256), "a vertex input under a pending GPU write was not bound in place behind it");
     const std::array<std::byte, 4> label{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
@@ -4133,7 +4145,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(context, address + 12288, 256, 4) == nullptr, "a draw input under a queued label store was bound in place");
     behind = false;
     Require(InPlaceDrawInput(context, address + 12288, 256, 4, &behind) == nullptr, "a vertex input under a queued label store was bound in place");
-    Require(InPlaceDrawInput(context, address + 16384, 256, 4) != nullptr, "a queued label store refused a disjoint draw input");
+    Require(freeRange(InPlaceDrawInput(context, address + 16384, 256, 4)), refused ? "a disjoint draw input beside a queued label store was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM" : "a queued label store refused a disjoint draw input");
     alignas(64) static std::array<std::byte, 256> unregistered{};
     Require(InPlaceDrawInput(context, reinterpret_cast<std::uint64_t>(unregistered.data()), unregistered.size(), 4) == nullptr, "memory without a host import was bound in place");
     auto unrecorded = context;

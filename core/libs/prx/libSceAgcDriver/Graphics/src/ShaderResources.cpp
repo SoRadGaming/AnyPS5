@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -5335,8 +5336,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             std::shared_ptr<Buffer> buffer;
             if (held != movedWordBuffers.end()) {
                 buffer = held->buffer;
+                if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::MovedReused, override->size);
             } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1): in ReBAR VRAM; the CPU
+                // only writes it (the words and the patches below; a hit compares `words`).
+                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, DrawSnapshotChunkProperties());
+                if (DebugDrawInputBytes()) {
+                    NoteDrawInputBuffer(context, DrawInputSite::MovedWords, *buffer, override->size);
+                    CountDrawInputBytes(DrawInputBytes::MovedCopied, override->size);
+                }
                 std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
@@ -5374,6 +5382,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (const auto* held = epochMemo ? recorder.UnwrittenDrawSlice(begin, bytes, stamp) : nullptr) {
                 slice = *held;
                 recorder.KeepSlice(slice);
+                if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::SliceEpoch, bytes);
                 if (verifySnapshots) {
                     static std::atomic<std::uint64_t> checked{0}, differing{0};
                     if (std::memcmp(slice.bytes.data(), reinterpret_cast<const void*>(begin), bytes) != 0) differing.fetch_add(1);
@@ -5384,10 +5393,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (const auto* kept = recorder.ReusableDrawSlice(begin, bytes, registryGeneration)) {
                     slice = *kept;
                     recorder.KeepSlice(slice);
+                    if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::SliceKept, bytes);
                 } else {
                     slice = recorder.AllocateSnapshot(bytes);
                     std::memcpy(slice.bytes.data(), reinterpret_cast<const void*>(begin), bytes);
                     recorder.KeepDrawSlice(begin, slice, generation, registryGeneration);
+                    if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::SliceCopied, bytes);
                 }
                 if (epochMemo && GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSlice(begin, stamp, slice);
                 else if (epochMemo) stamped = false;
@@ -5408,6 +5419,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
+        if (buffer != nullptr && DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::SnapshotEpoch, bytes);
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
@@ -5415,11 +5427,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
+                if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::Upload, bytes);
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+                if (buffer != nullptr && DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::SnapshotReused, bytes);
                 if (buffer == nullptr) {
+                    // Host memory under APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM too: refreshDrawSnapshot
+                    // compares its bytes on the CPU.
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                    if (DebugDrawInputBytes()) {
+                        NoteDrawInputBuffer(context, DrawInputSite::ReusableSnapshot, *buffer, bytes);
+                        CountDrawInputBytes(DrawInputBytes::SnapshotCopied, bytes);
+                    }
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 }
