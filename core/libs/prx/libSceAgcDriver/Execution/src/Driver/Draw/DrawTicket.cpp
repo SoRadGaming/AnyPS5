@@ -1,0 +1,106 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <string>
+
+namespace AgcDriver::DriverDetail {
+
+// LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS, COMMITTER-SPLIT-PLAN S0): the [q0prep] line. Queue 0 prints
+// it every 10 s after a draw enqueue: the depth its draws found the pipeline at and how long they
+// waited for room (the time a ticket could use), the committer's write-watch walks by draw step and
+// enqueue depth (GuestMemory::WalkStats), and how many committed draws used a draw-ahead
+// PreparedDraw against the draw-ahead compiles and drops.
+namespace {
+
+std::atomic<std::uint64_t> committedDraws{0};
+
+struct Q0PrepReport {
+    bool started = false;
+    std::chrono::steady_clock::time_point last{};
+    std::uint64_t preparedUses = 0;
+    std::uint64_t compiled = 0;
+    std::uint64_t dropped = 0;
+};
+
+double percent(std::uint64_t part, std::uint64_t whole) {
+    return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
+}
+
+}
+
+void Driver::noteQ0PrepCommit() {
+    committedDraws.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Driver::reportQ0Prep() {
+    // Only queue 0 enqueues pipelined draws, so only queue 0 reports.
+    static Q0PrepReport state;
+    const auto now = std::chrono::steady_clock::now();
+    if (!state.started) {
+        state.started = true;
+        state.last = now;
+        state.preparedUses = Graphics::PreparedDrawUses();
+        state.compiled = drawAheadCounts.compiled.load(std::memory_order_relaxed);
+        state.dropped = drawAheadCounts.dropped.load(std::memory_order_relaxed);
+        DrawPipeline::Queue0().TakePrepStats();
+        GuestMemory::TakeWalkStats();
+        committedDraws.store(0, std::memory_order_relaxed);
+        return;
+    }
+    if (now - state.last < std::chrono::seconds(10)) return;
+    state.last = now;
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    const auto pipeline = DrawPipeline::Queue0().TakePrepStats();
+    const auto depth = DrawPipeline::Depth();
+    std::string depths;
+    std::uint64_t atLeastTwo = 0, atLeastThree = 0, full = 0;
+    for (std::size_t bucket = 0; bucket < pipeline.drawDepths.size(); ++bucket) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %zu%s:%llu", bucket, bucket + 1 == pipeline.drawDepths.size() ? "+" : "", count(pipeline.drawDepths[bucket]));
+        depths += item;
+        if (bucket >= 2) atLeastTwo += pipeline.drawDepths[bucket];
+        if (bucket >= 3) atLeastThree += pipeline.drawDepths[bucket];
+        if (bucket >= depth) full += pipeline.drawDepths[bucket];
+    }
+    const auto preparedUses = Graphics::PreparedDrawUses();
+    const auto compiled = drawAheadCounts.compiled.load(std::memory_order_relaxed);
+    const auto dropped = drawAheadCounts.dropped.load(std::memory_order_relaxed);
+    const auto committed = committedDraws.exchange(0, std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[q0prep] (10 s, depth %zu) draws %llu enqueued behind:%s; d>=2 %.1f%%, d>=3 %.1f%%, full %.1f%%; room waits: draws %llu (%.1f%%) %.1f ms (%.1f us per waiting draw, %.1f us per draw), labels %llu of %llu %.1f ms; committed draws %llu, %llu used a draw-ahead PreparedDraw (%.1f%%); draw-ahead compiled %llu, dropped %llu\n", depth, count(pipeline.draws), depths.c_str(), percent(atLeastTwo, pipeline.draws), percent(atLeastThree, pipeline.draws), percent(full, pipeline.draws), count(pipeline.drawWaits), percent(pipeline.drawWaits, pipeline.draws), static_cast<double>(pipeline.drawWaitNs) / 1e6, pipeline.drawWaits == 0 ? 0.0 : static_cast<double>(pipeline.drawWaitNs) / 1e3 / static_cast<double>(pipeline.drawWaits), pipeline.draws == 0 ? 0.0 : static_cast<double>(pipeline.drawWaitNs) / 1e3 / static_cast<double>(pipeline.draws), count(pipeline.labelWaits), count(pipeline.labels), static_cast<double>(pipeline.labelWaitNs) / 1e6, count(committed), count(preparedUses - state.preparedUses), percent(preparedUses - state.preparedUses, committed), count(compiled - state.compiled), count(dropped - state.dropped));
+    state.preparedUses = preparedUses;
+    state.compiled = compiled;
+    state.dropped = dropped;
+    // The committer's walks: per draw step, the ms and the share of it in draws enqueued at d >= 2,
+    // d >= 3 and at full depth (the predictable part a ticket or a receipt could move).
+    static constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WalkCaller::Count)> callers{"other", "revalidate", "index", "target", "depth", "bindings"};
+    const auto walks = GuestMemory::TakeWalkStats();
+    std::string steps;
+    std::uint64_t totalNs = 0, totalTwoNs = 0, totalWalks = 0;
+    for (std::size_t caller = 0; caller < callers.size(); ++caller) {
+        std::uint64_t n = 0, ns = 0, bytes = 0, twoNs = 0, threeNs = 0, fullNs = 0;
+        for (std::size_t bucket = 0; bucket < GuestMemory::WalkDepthBuckets; ++bucket) {
+            n += walks.walks[caller][bucket];
+            ns += walks.ns[caller][bucket];
+            bytes += walks.bytes[caller][bucket];
+            if (bucket >= 2) twoNs += walks.ns[caller][bucket];
+            if (bucket >= 3) threeNs += walks.ns[caller][bucket];
+            if (bucket >= depth) fullNs += walks.ns[caller][bucket];
+        }
+        totalNs += ns;
+        totalTwoNs += twoNs;
+        totalWalks += n;
+        char item[160];
+        std::snprintf(item, sizeof(item), " %s %llu walks %.1f ms %.0f MiB (d>=2 %.0f%%, d>=3 %.0f%%, full %.0f%%);", callers[caller], count(n), static_cast<double>(ns) / 1e6, static_cast<double>(bytes) / 1048576.0, percent(twoNs, ns), percent(threeNs, ns), percent(fullNs, ns));
+        steps += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[q0prep] committer walks (10 s) by draw step:%s total %llu walks %.1f ms, %.1f ms of it in draws enqueued at d>=2\n", steps.c_str(), count(totalWalks), static_cast<double>(totalNs) / 1e6, static_cast<double>(totalTwoNs) / 1e6);
+}
+
+}

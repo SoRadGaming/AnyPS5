@@ -165,6 +165,16 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         commit();
         return;
     }
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the depth this item is enqueued behind and its room
+    // wait, for the [q0prep] line; the depth also rides with the item for the committer's walks.
+    const auto enqueueDepth = items.size();
+    const bool prepStatsOn = GuestMemory::Q0PrepStats() != 0;
+    if (prepStatsOn && kind == ItemKind::Draw) {
+        ++prepStats.draws;
+        ++prepStats.drawDepths[std::min(enqueueDepth, PrepDepthBuckets - 1)];
+    } else if (prepStatsOn && kind == ItemKind::Label) {
+        ++prepStats.labels;
+    }
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
@@ -183,12 +193,20 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             room.wait(lock, [&] { return items.size() < Depth(); });
             --roomWaiters;
         }
-        fullWaitNs += elapsedNs(start);
+        const auto waitedNs = elapsedNs(start);
+        fullWaitNs += waitedNs;
+        if (prepStatsOn && kind == ItemKind::Draw) {
+            ++prepStats.drawWaits;
+            prepStats.drawWaitNs += waitedNs;
+        } else if (prepStatsOn && kind == ItemKind::Label) {
+            ++prepStats.labelWaits;
+            prepStats.labelWaitNs += waitedNs;
+        }
         rethrowFailure();
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -237,6 +255,11 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     drainWaitNs = {};
 }
 
+DrawPipeline::PrepStats DrawPipeline::TakePrepStats() {
+    std::lock_guard lock(mutex);
+    return std::exchange(prepStats, PrepStats{});
+}
+
 void DrawPipeline::run() {
     StartCommitterSampler();
     PerformanceTrace::BindThread("draw committer");
@@ -264,6 +287,17 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
     auto outcome = guarded([&] {
         if (front == nullptr) return;
         PerformanceTimer itemTiming("Committer.Item");
+        // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the committer's walks inside a draw's commit are
+        // filed under the depth the draw was enqueued behind.
+        struct ItemDepth {
+            bool set;
+            explicit ItemDepth(const Item& item) : set(GuestMemory::Q0PrepStats() != 0 && item.kind == ItemKind::Draw) {
+                if (set) GuestMemory::SetWalkItemDepth(item.enqueueDepth + 1);
+            }
+            ~ItemDepth() {
+                if (set) GuestMemory::SetWalkItemDepth(0);
+            }
+        } itemDepth{*front};
         if (front->labels.empty()) {
             front->commit();
             return;

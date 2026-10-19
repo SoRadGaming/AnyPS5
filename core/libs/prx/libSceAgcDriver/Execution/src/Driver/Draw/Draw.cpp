@@ -664,6 +664,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw);
+        if (GuestMemory::Q0PrepStats() != 0) reportQ0Prep();
         if (exactBatchCap()) drawCountedAtCommit() = true;
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
@@ -719,6 +720,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             if (!DrawPipeline::DeferToRunEnd(&Driver::submitDueAfterRun)) driver.submitDueAfterCommit(device.get());
         }
     } submitDue{*this, localDevice, exactBatchCap()};
+    if (GuestMemory::Q0PrepStats() != 0) noteQ0PrepCommit();
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
     if (recipe != nullptr) {

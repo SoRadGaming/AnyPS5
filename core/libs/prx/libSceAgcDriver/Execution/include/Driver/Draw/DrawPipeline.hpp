@@ -72,6 +72,21 @@ public:
     // registered: the caller then enqueues the label as an item of its own. Like Enqueue, it first
     // rethrows the failure of an earlier commit.
     bool AppendLabel(LabelPart& label);
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): what queue 0's enqueues found, for the [q0prep] line:
+    // the queue depth each draw was enqueued behind (index = depth, the last bucket holds deeper
+    // ones), and the time draws and labels waited for room. TakePrepStats returns the counts since
+    // the last call and resets them.
+    static constexpr std::size_t PrepDepthBuckets = 10;
+    struct PrepStats {
+        std::array<std::uint64_t, PrepDepthBuckets> drawDepths{};
+        std::uint64_t draws = 0;
+        std::uint64_t drawWaits = 0;
+        std::uint64_t drawWaitNs = 0;
+        std::uint64_t labels = 0;
+        std::uint64_t labelWaits = 0;
+        std::uint64_t labelWaitNs = 0;
+    };
+    PrepStats TakePrepStats();
 
 private:
     struct Item {
@@ -83,6 +98,8 @@ private:
         // Appended labels, in the order they were queued; only the producer adds them, under the
         // mutex and only while the item is not the front, so the committer reads them unlocked.
         std::vector<LabelPart> labels;
+        // The queue depth the item was enqueued behind (APS5_DEBUG_Q0_PREP_STATS attribution).
+        std::uint32_t enqueueDepth = 0;
     };
     struct CommitRun;
     DrawPipeline() = default;
@@ -128,6 +145,7 @@ private:
     std::uint64_t runCommits = 0;
     std::atomic<LabelCommit> labelCommit{nullptr};
     std::uint64_t labelsAppended = 0;
+    PrepStats prepStats;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

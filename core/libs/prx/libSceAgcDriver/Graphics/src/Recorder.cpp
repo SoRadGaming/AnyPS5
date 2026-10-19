@@ -1465,6 +1465,7 @@ int Recorder::PassStateFilter() {
 }
 
 BoundState* Recorder::PassBoundState() {
+    GuestMemory::AssertGpuLockHeld("Recorder::PassBoundState");
     const int mode = PassStateFilter();
     if (mode == 0 || open == nullptr) return nullptr;
     auto& bound = open->renderPass.bound;
@@ -1830,6 +1831,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
 }
 
 bool Recorder::QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::AssertGpuLockHeld("Recorder::QueuedStoreOverlaps");
     if (open == nullptr || bytes == 0) return false;
     const auto end = address + bytes;
     return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return address < store.End() && store.address < end; });
@@ -2673,6 +2675,7 @@ SnapshotArena::Slice SnapshotArena::Allocate(const Context& context, std::size_t
 }
 
 SnapshotArena::Slice Recorder::AllocateSnapshot(std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("Recorder::AllocateSnapshot");
     ensureOpen();
     auto slice = snapshotArena.Allocate(context, bytes);
     open->keptBytes += slice.consumed;
@@ -2690,6 +2693,7 @@ void Recorder::KeepSlice(const SnapshotArena::Slice& slice) {
 }
 
 const SnapshotArena::Slice* Recorder::UnwrittenDrawSlice(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) {
+    GuestMemory::AssertGpuLockHeld("Recorder::UnwrittenDrawSlice");
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSlices.find(address);
     if (found == unwrittenSlices.end() || found->second.bytes.size() != bytes) return nullptr;
@@ -2697,6 +2701,7 @@ const SnapshotArena::Slice* Recorder::UnwrittenDrawSlice(std::uint64_t address, 
 }
 
 const SnapshotArena::Slice* Recorder::ReusableDrawSlice(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration) {
+    GuestMemory::AssertGpuLockHeld("Recorder::ReusableDrawSlice");
     const auto found = keptSlices.find(address);
     if (found == keptSlices.end()) return nullptr;
     if (found->second.slice.bytes.size() != bytes || found->second.registryGeneration != registryGeneration || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
@@ -2793,6 +2798,7 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
+    GuestMemory::AssertGpuLockHeld("Recorder::ReusableDrawSnapshot");
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -2911,6 +2917,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
 }
 
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
+    GuestMemory::AssertGpuLockHeld("Recorder::KnownHighestIndex");
     const auto found = indexRanges.find({address, use, bytes});
     if (found == indexRanges.end()) return false;
     if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
@@ -3100,6 +3107,7 @@ bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t
 }
 
 bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    GuestMemory::AssertGpuLockHeld("Recorder::PendingWriteOverlaps");
     if (bytes == 0) return false;
     if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;

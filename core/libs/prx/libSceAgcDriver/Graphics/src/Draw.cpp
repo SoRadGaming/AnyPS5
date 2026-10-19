@@ -1556,6 +1556,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
             auto* replay = replayInputs(recipe);
+            const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Index);
             highest = replay != nullptr ? replayHighestIndex(*context.recorder, *replay, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart) : InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
             // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): a copy in device-local memory
@@ -1799,7 +1800,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         if (prepared != nullptr && !prepared->contentKey.empty()) resolved.preparedKey = &prepared->contentKey;
         else resolved.builtKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = SharedResourceCache().Find(resolved.ContentKey())) {
-            const bool valid = cached->Revalidate(shaders);
+            const bool valid = [&] {
+                const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Revalidate);
+                return cached->Revalidate(shaders);
+            }();
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
@@ -2316,7 +2320,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->FlushStores();
         outcome.storesFlushed = true;
     }
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    const auto drawBindings = [&] {
+        const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Bindings);
+        return resources.PrepareDrawBindings(*recorder, record.moved);
+    }();
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -2767,6 +2774,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
+            const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Target);
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
@@ -2824,7 +2832,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
-    if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
+    if (state.depth) {
+        const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Depth);
+        targetViews.push_back(DepthSurfaceView(context, *state.depth));
+    }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
