@@ -1420,6 +1420,9 @@ constexpr std::size_t WalkCallers = static_cast<std::size_t>(WalkCaller::Count);
 std::array<std::array<std::atomic<std::uint64_t>, WalkDepthBuckets>, WalkCallers> walkCounts{};
 std::array<std::array<std::atomic<std::uint64_t>, WalkDepthBuckets>, WalkCallers> walkNs{};
 std::array<std::array<std::atomic<std::uint64_t>, WalkDepthBuckets>, WalkCallers> walkBytes{};
+std::array<std::atomic<std::uint64_t>, WalkCallers> walkFullNs{};
+// The depth slot holds depth + 1, with this bit set for a draw enqueued at full depth.
+constexpr std::uint32_t WalkItemFullBit = 0x80000000u;
 // Times one collect from its tracker lock on, when the calling thread is inside a committed draw;
 // a shared-memo hit under the lock (no walk) leaves `walked` false and is not counted.
 struct WalkNote {
@@ -1430,11 +1433,12 @@ struct WalkNote {
     ~WalkNote() {
         if (depth == 0 || !walked) return;
         const auto caller = std::min<std::size_t>(WalkCallerSlot::Get(), WalkCallers - 1);
-        const auto bucket = std::min<std::size_t>(depth - 1, WalkDepthBuckets - 1);
+        const auto bucket = std::min<std::size_t>((depth & ~WalkItemFullBit) - 1, WalkDepthBuckets - 1);
         const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
         walkCounts[caller][bucket].fetch_add(1, std::memory_order_relaxed);
         walkNs[caller][bucket].fetch_add(ns, std::memory_order_relaxed);
         walkBytes[caller][bucket].fetch_add(bytes, std::memory_order_relaxed);
+        if ((depth & WalkItemFullBit) != 0) walkFullNs[caller].fetch_add(ns, std::memory_order_relaxed);
     }
 };
 std::uint32_t walkNoteDepth() {
@@ -2388,8 +2392,8 @@ WalkCallerScope::~WalkCallerScope() {
     if (active) WalkCallerSlot::Set(previous);
 }
 
-void SetWalkItemDepth(std::uint32_t depthPlusOne) {
-    WalkDepthSlot::Set(depthPlusOne);
+void SetWalkItemDepth(std::uint32_t depthPlusOne, bool full) {
+    WalkDepthSlot::Set(depthPlusOne != 0 && full ? depthPlusOne | WalkItemFullBit : depthPlusOne);
 }
 
 WalkStats TakeWalkStats() {
@@ -2400,6 +2404,7 @@ WalkStats TakeWalkStats() {
             stats.ns[caller][bucket] = walkNs[caller][bucket].exchange(0, std::memory_order_relaxed);
             stats.bytes[caller][bucket] = walkBytes[caller][bucket].exchange(0, std::memory_order_relaxed);
         }
+        stats.fullNs[caller] = walkFullNs[caller].exchange(0, std::memory_order_relaxed);
     }
     return stats;
 }

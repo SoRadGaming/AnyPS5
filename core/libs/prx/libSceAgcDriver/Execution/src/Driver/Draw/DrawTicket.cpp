@@ -161,15 +161,16 @@ void Driver::reportQ0Prep() {
     const auto pipeline = DrawPipeline::Queue0().TakePrepStats();
     const auto depth = DrawPipeline::Depth();
     std::string depths;
-    std::uint64_t atLeastTwo = 0, atLeastThree = 0, full = 0;
+    std::uint64_t atLeastTwo = 0, atLeastThree = 0;
     for (std::size_t bucket = 0; bucket < pipeline.drawDepths.size(); ++bucket) {
         char item[48];
         std::snprintf(item, sizeof(item), " %zu%s:%llu", bucket, bucket + 1 == pipeline.drawDepths.size() ? "+" : "", count(pipeline.drawDepths[bucket]));
         depths += item;
         if (bucket >= 2) atLeastTwo += pipeline.drawDepths[bucket];
         if (bucket >= 3) atLeastThree += pipeline.drawDepths[bucket];
-        if (bucket >= depth) full += pipeline.drawDepths[bucket];
     }
+    // Full depth is counted at the enqueue (Depth() may exceed the last bucket).
+    const auto full = pipeline.fullDraws;
     const auto preparedUses = Graphics::PreparedDrawUses();
     const auto compiled = drawAheadCounts.compiled.load(std::memory_order_relaxed);
     const auto dropped = drawAheadCounts.dropped.load(std::memory_order_relaxed);
@@ -185,15 +186,15 @@ void Driver::reportQ0Prep() {
     std::string steps;
     std::uint64_t totalNs = 0, totalTwoNs = 0, totalWalks = 0;
     for (std::size_t caller = 0; caller < callers.size(); ++caller) {
-        std::uint64_t n = 0, ns = 0, bytes = 0, twoNs = 0, threeNs = 0, fullNs = 0;
+        std::uint64_t n = 0, ns = 0, bytes = 0, twoNs = 0, threeNs = 0;
         for (std::size_t bucket = 0; bucket < GuestMemory::WalkDepthBuckets; ++bucket) {
             n += walks.walks[caller][bucket];
             ns += walks.ns[caller][bucket];
             bytes += walks.bytes[caller][bucket];
             if (bucket >= 2) twoNs += walks.ns[caller][bucket];
             if (bucket >= 3) threeNs += walks.ns[caller][bucket];
-            if (bucket >= depth) fullNs += walks.ns[caller][bucket];
         }
+        const auto fullNs = walks.fullNs[caller];
         totalNs += ns;
         totalTwoNs += twoNs;
         totalWalks += n;

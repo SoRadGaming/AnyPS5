@@ -200,7 +200,9 @@ int Q0PrepStats();
 // collects that reached the tracker, not memo hits) by the draw step that made them
 // (WalkCallerScope, innermost wins) and by the queue depth the draw was enqueued behind
 // (SetWalkItemDepth, set by the committer around a draw's commit: depth + 1, 0 outside one).
-// Walks outside a committed draw are not counted.
+// Walks outside a committed draw are not counted. The time of walks in draws enqueued at full
+// depth (DrawPipeline's PrepareBudget::full test, passed as `full`) is also summed apart, since
+// DrawPipeline::Depth() may exceed the last depth bucket.
 enum class WalkCaller : std::uint8_t { Other, Revalidate, Index, Target, Depth, Bindings, Count };
 constexpr std::size_t WalkDepthBuckets = 10;
 class WalkCallerScope {
@@ -214,11 +216,12 @@ private:
     std::uint32_t previous;
     bool active;
 };
-void SetWalkItemDepth(std::uint32_t depthPlusOne);
+void SetWalkItemDepth(std::uint32_t depthPlusOne, bool full = false);
 struct WalkStats {
     std::array<std::array<std::uint64_t, WalkDepthBuckets>, static_cast<std::size_t>(WalkCaller::Count)> walks{};
     std::array<std::array<std::uint64_t, WalkDepthBuckets>, static_cast<std::size_t>(WalkCaller::Count)> ns{};
     std::array<std::array<std::uint64_t, WalkDepthBuckets>, static_cast<std::size_t>(WalkCaller::Count)> bytes{};
+    std::array<std::uint64_t, static_cast<std::size_t>(WalkCaller::Count)> fullNs{};
 };
 // The counts since the last call (reset by it).
 WalkStats TakeWalkStats();

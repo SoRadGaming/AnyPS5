@@ -100,12 +100,14 @@ public:
     bool AppendLabel(LabelPart& label);
     // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): what queue 0's enqueues found, for the [q0prep] line:
     // the queue depth each draw was enqueued behind (index = depth, the last bucket holds deeper
-    // ones), and the time draws and labels waited for room. TakePrepStats returns the counts since
-    // the last call and resets them.
+    // ones), the draws enqueued at full depth (PrepareBudget::full's own test, counted apart since
+    // Depth() may exceed the last bucket), and the time draws and labels waited for room.
+    // TakePrepStats returns the counts since the last call and resets them.
     static constexpr std::size_t PrepDepthBuckets = 10;
     struct PrepStats {
         std::array<std::uint64_t, PrepDepthBuckets> drawDepths{};
         std::uint64_t draws = 0;
+        std::uint64_t fullDraws = 0;
         std::uint64_t drawWaits = 0;
         std::uint64_t drawWaitNs = 0;
         std::uint64_t labels = 0;
@@ -124,8 +126,10 @@ private:
         // Appended labels, in the order they were queued; only the producer adds them, under the
         // mutex and only while the item is not the front, so the committer reads them unlocked.
         std::vector<LabelPart> labels;
-        // The queue depth the item was enqueued behind (APS5_DEBUG_Q0_PREP_STATS attribution).
+        // The queue depth the item was enqueued behind, and whether that was a full pipeline
+        // (APS5_DEBUG_Q0_PREP_STATS attribution).
         std::uint32_t enqueueDepth = 0;
+        bool full = false;
     };
     struct CommitRun;
     DrawPipeline() = default;

@@ -167,11 +167,14 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the depth this item is enqueued behind and its room
     // wait, for the [q0prep] line; the depth also rides with the item for the committer's walks.
+    // Full depth is its own count (and the budget's flag), as Depth() may exceed the last bucket.
     const auto enqueueDepth = items.size();
+    const bool full = enqueueDepth >= Depth();
     const bool prepStatsOn = GuestMemory::Q0PrepStats() != 0;
     if (prepStatsOn && kind == ItemKind::Draw) {
         ++prepStats.draws;
         ++prepStats.drawDepths[std::min(enqueueDepth, PrepDepthBuckets - 1)];
+        if (full) ++prepStats.fullDraws;
     } else if (prepStatsOn && kind == ItemKind::Label) {
         ++prepStats.labels;
     }
@@ -184,7 +187,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         } else if (GuestMemory::GpuMutex().HeldByThisThread()) {
             if (prepare->skipped != nullptr) prepare->skipped(prepare->self, PrepareSkip::Locked);
         } else {
-            const PrepareBudget budget{this, enqueueDepth, enqueueDepth >= Depth(), prepare->bail};
+            const PrepareBudget budget{this, enqueueDepth, full, prepare->bail};
             lock.unlock();
             {
                 const GuestMemory::PrepareScope scope;
@@ -230,7 +233,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth)});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -316,7 +319,7 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
         struct ItemDepth {
             bool set;
             explicit ItemDepth(const Item& item) : set(GuestMemory::Q0PrepStats() != 0 && item.kind == ItemKind::Draw) {
-                if (set) GuestMemory::SetWalkItemDepth(item.enqueueDepth + 1);
+                if (set) GuestMemory::SetWalkItemDepth(item.enqueueDepth + 1, item.full);
             }
             ~ItemDepth() {
                 if (set) GuestMemory::SetWalkItemDepth(0);
