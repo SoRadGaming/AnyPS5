@@ -254,6 +254,7 @@ void DrawPipeline::run() {
         if (front != nullptr && front->kind != ItemKind::Other && commitRunItems() != 0) commitRun(front);
         else commitFront(front, nullptr);
     }
+    runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 // Commits the front item (nothing once the pipeline stopped), then pops and retires it. Inside a
@@ -394,7 +395,6 @@ void DrawPipeline::reap() {
         }
         batch.clear();
     }
-    runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void DrawPipeline::Stop() {
