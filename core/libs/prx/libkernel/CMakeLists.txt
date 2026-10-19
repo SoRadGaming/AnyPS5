@@ -238,7 +238,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME guest_dynamic_loader COMMAND guest_dynamic_loader_tests $<TARGET_FILE_NAME:guest_module_fixture>)
     set_tests_properties(guest_dynamic_loader PROPERTIES
-        WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>")
+        WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>" RESOURCE_LOCK guest_dynamic_loader_files)
     if(WIN32)
         set_tests_properties(guest_dynamic_loader PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
@@ -271,7 +271,7 @@ if(BUILD_TESTING)
         target_link_options(guest_dynamic_loader_fixed_base_tests PRIVATE -no-pie -fuse-ld=bfd)
         add_test(NAME guest_dynamic_loader_fixed_base COMMAND guest_dynamic_loader_fixed_base_tests $<TARGET_FILE_NAME:guest_module_fixture>)
         set_tests_properties(guest_dynamic_loader_fixed_base PROPERTIES
-            WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>")
+            WORKING_DIRECTORY "$<TARGET_FILE_DIR:guest_module_fixture>" RESOURCE_LOCK guest_dynamic_loader_files)
     endif()
     add_test_executable(guest_module_info_tests ${LIBS_INCLUDE_DIR}/tests/GuestModuleInfo.cpp)
     target_include_directories(guest_module_info_tests PRIVATE ${LIBS_INCLUDE_DIR})

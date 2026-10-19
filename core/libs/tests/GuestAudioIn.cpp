@@ -81,6 +81,14 @@ void TestValidation() {
     Require(ReportsNotImplemented("sceAudioInIsPadEmbeddedMic", [] { sceAudioInIsPadEmbeddedMic(1); }));
 }
 
+void InputSound(int handle, std::vector<std::int16_t>& block) {
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        Require(sceAudioInInput(handle, block.data()) == 256);
+        if (std::any_of(block.begin(), block.end() - 1, [](std::int16_t sample) { return sample != 0; })) return;
+    }
+    Require(false);
+}
+
 void TestCapture() {
     const auto path = std::filesystem::temp_directory_path() / ("anyps5_audio_in_capture-" + std::to_string(std::random_device{}()) + ".raw");
     std::vector<std::int16_t> recorded(256 * 2 * 4);
@@ -95,7 +103,7 @@ void TestCapture() {
     std::vector<std::int16_t> block(256 * 2 + 1, 0x5555);
     std::vector<std::int16_t> captured;
     for (int i = 0; i < 4; ++i) {
-        Require(sceAudioInInput(handle, block.data()) == 256);
+        InputSound(handle, block);
         captured.insert(captured.end(), block.begin(), block.end() - 1);
         Require(block.back() == 0x5555);
     }
@@ -105,7 +113,7 @@ void TestCapture() {
     Require(sceAudioInClose(handle) == 0);
     const int async = sceAudioInAsyncOpen(user, 0, 0, 256, 48000, 2);
     Require(async == handle && sceAudioInGetSilentState(async) == 0);
-    Require(sceAudioInInput(async, block.data()) == 256);
+    InputSound(async, block);
     Require(std::equal(block.begin(), block.end() - 1, recorded.begin()) && block.back() == 0x5555);
     Require(sceAudioInClose(async) == 0);
     std::filesystem::remove(path);

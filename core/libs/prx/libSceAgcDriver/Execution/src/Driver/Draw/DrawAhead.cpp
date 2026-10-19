@@ -454,7 +454,7 @@ void DrawAhead::scan(Scan& work, std::stop_token token) {
                 }
                 if (!cached) {
                     try {
-                        queueJob({work.serial, draw.offset, record.key, record.shape, driver.decodeDraw(draw.state, *work.shaders), record.parameters, device});
+                        queueJob({work.serial, draw.offset, record.key, record.shape, driver.decodeDraw(draw.state, *work.shaders, device->graphicsContext()), record.parameters, device});
                     } catch (...) {
                         driver.drawAheadCounts.dropped.fetch_add(1, std::memory_order_relaxed);
                     }

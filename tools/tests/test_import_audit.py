@@ -207,6 +207,18 @@ class Workspace:
 
 
 class ImportAuditTests(unittest.TestCase):
+    def test_cli_error_paths_are_utf8_under_an_ascii_environment(self):
+        registry = self.work.root / "\u65e5\u672c\u8a9e.json"
+        result = subprocess.run(
+            [sys.executable, str(Path(import_audit.__file__)), str(registry),
+             "--libs", str(self.work.libs), "--source", str(self.work.source)],
+            env=dict(os.environ, PYTHONIOENCODING="ascii"), capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(str(registry), result.stderr.decode("utf-8"))
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assertEqual(result.stdout, b"")
+
+
     def test_registry_weak_flags_are_booleans(self):
         registry = self.work.root / "game.json"
         output = self.work.root / "audit.json"
@@ -1333,6 +1345,18 @@ class ImportAuditTests(unittest.TestCase):
         struct.pack_into("<qQ", image, dynamic, 1, 1)
         struct.pack_into("<qQ", image, dynamic + 16, 0, 0)
         self.assertEqual(import_audit.elf_imports("module.prx", image)[1], {"libc.prx"})
+
+    def test_read_modules_uses_pe_exports_and_no_host_imports(self):
+        module = self.work.modules / "libc.prx.guest.prx"
+        module.write_bytes(build_pe(["sceKernelGettimeofday#guest", "sceKernelSleep"]))
+
+        imports, exports = import_audit.read_modules([self.work.modules])
+
+        self.assertEqual(imports, {module.name: ([], [])})
+        self.assertEqual(exports, {
+            "sceKernelGettimeofday": [module.name],
+            "sceKernelSleep": [module.name],
+        })
 
     def test_pe32_uses_its_own_directory_layout(self):
         image = bytearray(build_pe(["alpha"]))

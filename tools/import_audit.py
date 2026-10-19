@@ -410,10 +410,11 @@ def module_files(directory):
     for file in directory_files(directory, "*"):
         with file.open("rb") as handle:
             magic = handle.read(4)
-        if magic == b"\x7fELF":
+        if magic == b"\x7fELF" or (magic.startswith(b"MZ") and file.name.endswith(".guest.prx")):
             yield file
         elif (file.suffix.lower() in (".prx", ".sprx", ".suprx", ".debug_prx", ".elf")
-              or magic.startswith(b"MZ") or magic in (b"\x4f\x15\x3d\x1d", b"\x54\x14\xf5\xee")):
+              or magic.startswith(b"MZ")
+              or magic in (b"\x4f\x15\x3d\x1d", b"\x54\x14\xf5\xee")):
             raise AuditError(f"{file}: expected ELF module (first bytes {magic!r})")
 
 
@@ -431,11 +432,15 @@ def read_modules(directories):
                     raise AuditError(f"ambiguous guest module {file.name}: {previous} and {file} have different contents")
                 continue
             images[file.name] = (file, digest)
-            own = elf_imports(file, data)
-            symbols, needed = own
-            imports[file.name] = (sorted(symbols), sorted(needed))
-            for name in elf_exports(file, data):
-                exports[name].add(file.name)
+            if data.startswith(b"MZ"):
+                imports[file.name] = ([], [])
+                names = pe_exports(file, data)
+            else:
+                symbols, needed = elf_imports(file, data)
+                imports[file.name] = (sorted(symbols), sorted(needed))
+                names = elf_exports(file, data)
+            for name in names:
+                exports[name.split(MODULE_SUFFIX, 1)[0]].add(file.name)
     return imports, {name: sorted(files) for name, files in exports.items()}
 
 
@@ -739,6 +744,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     raise SystemExit(main())

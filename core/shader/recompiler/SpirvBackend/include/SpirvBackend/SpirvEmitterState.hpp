@@ -105,6 +105,8 @@ struct SpirvEmitterState {
     std::uint32_t spannedExchangeVariable = 0;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool depthRangeRemap = false;
+    std::uint32_t depthRemapClipIndex = 0;
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
