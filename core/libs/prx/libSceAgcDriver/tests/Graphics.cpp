@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -4719,6 +4720,36 @@ AgcDriver::Graphics::Context mockContext() {
     return context;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1, APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1, ctest
+// agc_driver_graphics_draw_inputs_vram1 and agc_driver_graphics_draw_snapshots_vram): under these
+// switches the zero-padded vertex copies and the draw snapshot chunks ask for DEVICE_LOCAL|
+// HOST_VISIBLE|HOST_COHERENT (ReBAR VRAM), which mockContext() lacks. rebarMockContext() adds it as
+// a second memory type and a RebarMockBuffers lets the mock's buffers take it while alive. With
+// both switches off they are mockContext() and the mock unchanged, so the memory types the other
+// tests check stay as they are.
+bool rebarMockType() {
+    return (AgcDriver::Graphics::DrawInputCopyProperties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 || AgcDriver::Graphics::DrawSnapshotsVram();
+}
+
+AgcDriver::Graphics::Context rebarMockContext() {
+    auto context = mockContext();
+    if (rebarMockType()) {
+        context.memory.memoryTypeCount = 2;
+        context.memory.memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    }
+    return context;
+}
+
+struct RebarMockBuffers {
+    std::uint32_t previousBits = mock.bufferMemoryTypeBits;
+    RebarMockBuffers() {
+        if (rebarMockType()) mock.bufferMemoryTypeBits |= 2u;
+    }
+    ~RebarMockBuffers() { mock.bufferMemoryTypeBits = previousBits; }
+    RebarMockBuffers(const RebarMockBuffers&) = delete;
+    RebarMockBuffers& operator=(const RebarMockBuffers&) = delete;
+};
+
 struct CommandBatchFailureProbe {
     VkResult allocation = VK_SUCCESS;
     VkResult creation = VK_SUCCESS;
@@ -5328,7 +5359,9 @@ void descriptorSnapshotTests() {
     for (const unsigned selected : {1u, 2u, 3u}) {
         mock = MockVulkan{};
         mock.allowCopies = true;
-        auto context = mockContext();
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1): the snapshot chunks' memory type.
+        auto context = rebarMockContext();
+        const RebarMockBuffers rebar;
         {
             DescriptorCache cache(context);
             context.descriptorCache = &cache;
@@ -5921,7 +5954,9 @@ void imageTableSnapshotAllocationTests() {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
-    auto context = mockContext();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1): the snapshot chunks' memory type.
+    auto context = rebarMockContext();
+    const RebarMockBuffers rebar;
     context.imageTableCapacity = 2;
     context.limits.maxDescriptorSetSampledImages = 2;
     context.limits.maxPerStageDescriptorSampledImages = 2;
@@ -9011,7 +9046,9 @@ void vertexZeroFillTests() {
     std::vector<std::byte> guest(extent);
     std::fill(guest.begin(), guest.begin() + static_cast<std::ptrdiff_t>(valid), std::byte{0x7a});
     std::fill(guest.begin() + static_cast<std::ptrdiff_t>(valid), guest.end(), std::byte{0x55});
-    const auto copy = CopyZeroPaddedDrawInput(mockContext(), reinterpret_cast<std::uint64_t>(guest.data()), extent, valid);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): the copy's memory type.
+    const RebarMockBuffers rebar;
+    const auto copy = CopyZeroPaddedDrawInput(rebarMockContext(), reinterpret_cast<std::uint64_t>(guest.data()), extent, valid);
     const auto bytes = copy.buffer->Bytes();
     Require(bytes.size() == extent, "a zero-padded vertex fetch changed its size");
     Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(valid), [](std::byte value) { return value == std::byte{0x7a}; }), "a vertex fetch did not copy the bytes within the record count");
@@ -9035,15 +9072,17 @@ void vertexOverhangTests() {
     const auto readable = page - offset;
     std::fill(block + offset, block + page, std::byte{0x7a});
     const auto address = reinterpret_cast<std::uint64_t>(block) + offset;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): the copies' memory type.
+    const RebarMockBuffers rebar;
     {
-        const auto copy = CopyZeroPaddedDrawInput(mockContext(), address, readable + overhang, readable + overhang, stride);
+        const auto copy = CopyZeroPaddedDrawInput(rebarMockContext(), address, readable + overhang, readable + overhang, stride);
         const auto bytes = copy.buffer->Bytes();
         Require(bytes.size() == readable + overhang, "an overhanging vertex fetch changed its size");
         Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(readable), [](std::byte value) { return value == std::byte{0x7a}; }), "an overhanging vertex fetch did not copy the readable bytes");
         Require(std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(readable), bytes.end(), [](std::byte value) { return value == std::byte{0}; }), "an overhanging vertex fetch did not zero its last record");
     }
-    expectFailure([&] { CopyZeroPaddedDrawInput(mockContext(), address, readable + stride, readable + stride, stride); }, "is not readable");
-    expectFailure([&] { CopyZeroPaddedDrawInput(mockContext(), address, readable + overhang, readable + overhang, 0); }, "is not readable");
+    expectFailure([&] { CopyZeroPaddedDrawInput(rebarMockContext(), address, readable + stride, readable + stride, stride); }, "is not readable");
+    expectFailure([&] { CopyZeroPaddedDrawInput(rebarMockContext(), address, readable + overhang, readable + overhang, 0); }, "is not readable");
 #ifdef _WIN32
     VirtualFree(block, 0, MEM_RELEASE);
 #else

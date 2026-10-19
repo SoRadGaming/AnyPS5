@@ -1395,6 +1395,18 @@ if(BUILD_TESTING)
         set_tests_properties(agc_draw_snapshots_replay_bindings agc_draw_snapshot_epoch_replay_bindings agc_draw_inputs_in_place_replay_bindings PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM): the in-place draw input suite with the
+    # draw inputs copied into ReBAR VRAM (1) and into host memory (2): ranges free of pending GPU
+    # writes are refused, a vertex range under one still binds in place behind it.
+    add_test(NAME agc_draw_inputs_in_place_vram1 COMMAND agc_driver_recorder_tests --draw-inputs-in-place-only)
+    add_test(NAME agc_draw_inputs_in_place_vram2 COMMAND agc_driver_recorder_tests --draw-inputs-in-place-only)
+    set_tests_properties(agc_draw_inputs_in_place_vram1 agc_draw_inputs_in_place_vram2 PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_draw_inputs_in_place_vram1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+    set_tests_properties(agc_draw_inputs_in_place_vram2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DRAW_INPUTS_VRAM=2")
+    if(WIN32)
+        set_tests_properties(agc_draw_inputs_in_place_vram1 agc_draw_inputs_in_place_vram2 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     # LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION): the suites whose memos are keyed by the
     # tracker generation, with the bump at a walk's first stamp.
     add_test(NAME agc_draw_snapshots_lazy_generation COMMAND agc_driver_recorder_tests --draw-snapshots-only)
@@ -2346,6 +2358,17 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1, APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1): the
+    # graphics suite with the zero-padded vertex copies, and with the draw snapshot chunks, in ReBAR
+    # VRAM (rebarMockContext gives the mock context that memory type under either switch).
+    add_test(NAME agc_driver_graphics_draw_inputs_vram1 COMMAND agc_driver_graphics_tests)
+    add_test(NAME agc_driver_graphics_draw_snapshots_vram COMMAND agc_driver_graphics_tests)
+    set_tests_properties(agc_driver_graphics_draw_inputs_vram1 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_graphics_draw_snapshots_vram PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_DRAW_SNAPSHOTS_VRAM=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_graphics_draw_inputs_vram1 agc_driver_graphics_draw_snapshots_vram PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 
     add_test(NAME agc_driver_stencil_replay_no_gpl COMMAND agc_driver_stencil_replay_tests)
     set_tests_properties(agc_driver_stencil_replay_no_gpl PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" TIMEOUT 30 SKIP_RETURN_CODE 77)
