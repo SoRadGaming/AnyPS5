@@ -18,7 +18,7 @@ struct HostImport;
 
 struct PreparedDraw {
     std::shared_ptr<const VertexInputLayout> vertexInput;
-    std::set<std::uint32_t> fragmentOutputs;
+    std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     std::vector<std::uint32_t> contentKey;
     VkDevice device = VK_NULL_HANDLE;
