@@ -88,6 +88,25 @@ void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, s
     }
 }
 
+bool AppendDrawWriterRanges(std::span<const Graphics::CompiledShader> stages, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    if (std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program == nullptr; })) return false;
+    for (const auto& stage : stages) {
+        visitWrittenBuffers(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+    }
+    return true;
+}
+
+void Driver::noteDrawWriterRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t queue) {
+    // noteForeignWriter's rules, per range in order, under one hold of the ring's mutex.
+    if (!foreignWriters() || !(writeEvidenceEnabled() || traceCapSync()) || ranges.empty()) return;
+    std::lock_guard lock(writtenBuffersMutex);
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        writtenBuffers.push_back({0, begin, end, ++writtenBufferSerial, queue, false});
+        while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
+    }
+}
+
 bool ExactDrawWrites() {
     static const bool exact = [] { const char* text = std::getenv("APS5_EXACT_DRAW_WRITES"); return text == nullptr || std::strcmp(text, "0") != 0; }();
     return exact;

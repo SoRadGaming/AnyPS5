@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -1464,9 +1465,18 @@ std::atomic<std::uint64_t> preparedDrawUses{0};
 
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
-// instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const PreparedDraw* prepared = nullptr) {
+// instead of computed. LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): with the ticket's Validated
+// part the pure parameter, mesh and tessellation checks and the viewport, depth bounds and sample
+// mask validators are not repeated (queue 0 ran them on the same closure objects, see
+// ticketDrawChecks); CheckRange, RequireNoMultisampleTarget and every empty-draw return stay.
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const PreparedDraw* prepared = nullptr, const DrawTicket* ticket = nullptr) {
     DrawInputs inputs;
+    const auto validatedUse = TicketPartUse(ticket, DrawTicket::Validated);
+    const auto check = [&](bool condition, const char* reason) {
+        if (condition || validatedUse == TicketUse::Use) return;
+        if (validatedUse != TicketUse::None) TicketDisagrees(DrawTicket::Validated, validatedUse, reason);
+        Require(condition, reason);
+    };
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
     APS5_LOG_OUT_DEBUG("Viewport x=%f y=%f w=%f h=%f minDepth=%f maxDepth=%f", state.viewport.x, state.viewport.y, state.viewport.width, state.viewport.height, state.viewport.minDepth, state.viewport.maxDepth);
@@ -1475,18 +1485,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // read by the GPU from the host import or, when the GPU could not see their current bytes, by
     // the CPU (Draw's `records`). The driver resolved every non-vertex-path draw before this.
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
-    Require(draw.indexed ? draw.flags == 0 : (draw.flags & ~0x20u) == 0, "draw modifiers are unsupported");
+    check(draw.indexed ? draw.flags == 0 : (draw.flags & ~0x20u) == 0, "draw modifiers are unsupported");
     if (draw.indexed) {
-        Require(draw.indexSize == 2 || draw.indexSize == 4, "only uint16 and uint32 index buffers are supported");
+        check(draw.indexSize == 2 || draw.indexSize == 4, "only uint16 and uint32 index buffers are supported");
     } else {
-        Require(draw.indexAddress == 0 && draw.indexSize == 0, "auto draw must not reference an index buffer");
+        check(draw.indexAddress == 0 && draw.indexSize == 0, "auto draw must not reference an index buffer");
         if (args == nullptr) {
             if (draw.indexCount == 0 || draw.instanceCount == 0) {
                 inputs.nothing = true;
                 return inputs;
             }
-            Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u), "auto draw vertex range overflow");
-            Require(draw.firstInstance <= std::numeric_limits<std::uint32_t>::max() - (draw.instanceCount - 1u), "auto draw instance range overflow");
+            check(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u), "auto draw vertex range overflow");
+            check(draw.firstInstance <= std::numeric_limits<std::uint32_t>::max() - (draw.instanceCount - 1u), "auto draw instance range overflow");
         }
     }
     if (args == nullptr) {
@@ -1498,10 +1508,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     inputs.indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     const auto indexBytes = inputs.indexBytes;
     APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
-    Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
+    check(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
     if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
-    Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
+    check(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
     if (draw.indexed) RequireNoMultisampleTarget(draw.indexAddress, static_cast<std::size_t>(indexBytes), "an index buffer read");
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
     if (recipe != nullptr) {
@@ -1520,11 +1530,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     APS5_LOG_OUT_DEBUG("PipelineStages=0x%x", static_cast<unsigned>(inputs.shaderStages));
     if (state.stages.mesh) {
         APS5_LOG_CHARS_OUT_DEBUG("Mesh path");
-        Require(context.meshShader, "device does not support mesh shaders");
+        check(context.meshShader, "device does not support mesh shaders");
         const auto& mesh = *state.stages.mesh;
         const auto inputSize = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
-        Require(mesh.primitivesPerGroup != 0, "mesh pipeline groups no primitive (zero primitives per group)");
-        Require(((state.stages.registerValue >> 19u) & 3u) == 0 || !draw.indexed, "indexed fast-launch draws are unsupported");
+        check(mesh.primitivesPerGroup != 0, "mesh pipeline groups no primitive (zero primitives per group)");
+        check(((state.stages.registerValue >> 19u) & 3u) == 0 || !draw.indexed, "indexed fast-launch draws are unsupported");
         if (args == nullptr && draw.indexCount < inputSize) {
             inputs.nothing = true;
             return inputs;
@@ -1534,14 +1544,16 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             const auto primitives = (draw.indexCount - inputSize) / step + 1u;
             inputs.meshGroups = (primitives - 1u) / mesh.primitivesPerGroup + 1u;
             APS5_LOG_OUT_DEBUG("Mesh primitives=%u groups=%u", primitives, inputs.meshGroups);
-            Require(inputs.meshGroups <= context.meshLimits.maxMeshWorkGroupCount[0] && draw.instanceCount <= context.meshLimits.maxMeshWorkGroupCount[1] && static_cast<std::uint64_t>(inputs.meshGroups) * draw.instanceCount <= context.meshLimits.maxMeshWorkGroupTotalCount, "mesh draw exceeds workgroup count limits");
+            check(inputs.meshGroups <= context.meshLimits.maxMeshWorkGroupCount[0] && draw.instanceCount <= context.meshLimits.maxMeshWorkGroupCount[1] && static_cast<std::uint64_t>(inputs.meshGroups) * draw.instanceCount <= context.meshLimits.maxMeshWorkGroupTotalCount, "mesh draw exceeds workgroup count limits");
         }
     }
-    if (state.stages.tessellation) Require(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
+    if (state.stages.tessellation) check(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
     // Viewport and scissor are dynamic pipeline state, so their limits are checked here per draw.
-    ValidateViewport(context, state.viewport);
-    ValidateDepthBounds(context, state);
-    ValidateSampleMask(context, state, shaders);
+    TicketChecks(validatedUse, DrawTicket::Validated, [&] {
+        ValidateViewport(context, state.viewport);
+        ValidateDepthBounds(context, state);
+        ValidateSampleMask(context, state, shaders);
+    });
     timer.phase(PhaseValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {
@@ -1781,7 +1793,7 @@ struct ResolvedResources {
     const ResourceCache::Key& ContentKey() const { return preparedKey != nullptr ? *preparedKey : builtKey; }
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const PreparedDraw* prepared) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const PreparedDraw* prepared, const DrawTicket* ticket) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1808,7 +1820,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
-                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): skipped when the ticket ran them.
+                if (trimKey) TicketChecks(TicketPartUse(ticket, DrawTicket::AliasesChecked), DrawTicket::AliasesChecked, [&] { CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes); });
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -2669,26 +2682,147 @@ void NoteRecipeSlot(int reason) {
     noteRecipeRefusal(SlotNoRegisterKey + static_cast<std::size_t>(reason));
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDraw* prepared) {
+namespace {
+
+// What a draw whose fragment stage carries stencil-replay references must satisfy (Draw).
+void checkStencilReplay(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    Require(!draw.indirect && !state.primitiveRestart && !state.rectList && !state.stages.mesh && !state.stages.tessellation && state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "stencil replay supports direct triangle lists without restart, mesh or tessellation");
+    Require(!state.depthBiasPerFace && !ShadersWriteMemory(shaders), "stencil replay refuses face splits and shader memory writes");
+    Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->stencilReplaySafe && (shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Fragment); }), "stencil replay refuses stages with side effects, clocks, subgroup dependencies or primitive ID inputs");
+    for (const auto& shader : shaders) {
+        if (shader.stage != ShaderRecompiler::ShaderStage::Vertex) continue;
+        Require((shader.program->hostSubgroupSize == 1u || shader.program->hostSubgroupSize == context.subgroup.subgroupSize) && shader.program->spirv.size() >= 5u && shader.program->spirv[1] >= 0x00010000u && shader.program->spirv[1] < 0x00010600u, "stencil replay vertex subgroup contract differs from the physical device");
+    }
+    Require(static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount <= 0x100000000ull && (draw.indexed || static_cast<std::uint64_t>(draw.firstVertex) + draw.indexCount <= 0x100000000ull), "stencil replay draw indices overflow");
+    Require(state.samples == 1u && (!state.depth || HasStencil(state.depth->format)), "stencil replay requires single-sample rendering and an eight-bit stencil format");
+}
+
+// The pure checks of prepareDrawInputs for a direct, non-empty draw (a ticket's Validated part):
+// every check prepareDrawInputs skips under the part, in its order, a superset where an empty
+// mesh draw returns early there. Throws as prepareDrawInputs would.
+void ticketDrawChecks(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    Require(draw.indexed ? draw.flags == 0 : (draw.flags & ~0x20u) == 0, "draw modifiers are unsupported");
+    if (draw.indexed) {
+        Require(draw.indexSize == 2 || draw.indexSize == 4, "only uint16 and uint32 index buffers are supported");
+    } else {
+        Require(draw.indexAddress == 0 && draw.indexSize == 0, "auto draw must not reference an index buffer");
+        Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u), "auto draw vertex range overflow");
+        Require(draw.firstInstance <= std::numeric_limits<std::uint32_t>::max() - (draw.instanceCount - 1u), "auto draw instance range overflow");
+    }
+    const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
+    Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
+    if (state.stages.mesh) {
+        Require(context.meshShader, "device does not support mesh shaders");
+        const auto& mesh = *state.stages.mesh;
+        const auto inputSize = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
+        Require(mesh.primitivesPerGroup != 0, "mesh pipeline groups no primitive (zero primitives per group)");
+        Require(((state.stages.registerValue >> 19u) & 3u) == 0 || !draw.indexed, "indexed fast-launch draws are unsupported");
+        if (draw.indexCount >= inputSize) {
+            const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : inputSize;
+            const auto primitives = (draw.indexCount - inputSize) / step + 1u;
+            const auto groups = (primitives - 1u) / mesh.primitivesPerGroup + 1u;
+            Require(groups <= context.meshLimits.maxMeshWorkGroupCount[0] && draw.instanceCount <= context.meshLimits.maxMeshWorkGroupCount[1] && static_cast<std::uint64_t>(groups) * draw.instanceCount <= context.meshLimits.maxMeshWorkGroupTotalCount, "mesh draw exceeds workgroup count limits");
+        }
+    }
+    if (state.stages.tessellation) Require(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
+    ValidateViewport(context, state.viewport);
+    ValidateDepthBounds(context, state);
+    ValidateSampleMask(context, state, shaders);
+}
+
+bool sameSurface(const GuestTextureResource& a, const GuestTextureResource& b) {
+    return a.baseAddress == b.baseAddress && a.width == b.width && a.height == b.height && a.depthOrLastArray == b.depthOrLastArray && a.baseArray == b.baseArray && a.mipCount == b.mipCount && a.baseLevel == b.baseLevel && a.tileMode == b.tileMode && a.dimension == b.dimension && a.format == b.format && a.dstSelX == b.dstSelX && a.dstSelY == b.dstSelY && a.dstSelZ == b.dstSelZ && a.dstSelW == b.dstSelW && a.pipeBankXor == b.pipeBankXor && a.bcSwizzle == b.bcSwizzle && a.lastLevel == b.lastLevel && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.iterate256 == b.iterate256 && a.minLod == b.minLod && a.allocatedMipCount == b.allocatedMipCount && a.samples == b.samples;
+}
+
+bool sameLayout(const ColorTargetLayout& a, const ColorTargetLayout& b) {
+    return a.Bytes() == b.Bytes() && a.LinearBytes() == b.LinearBytes() && a.Alignment() == b.Alignment() && a.BlocksPerRow() == b.BlocksPerRow();
+}
+
+// A ticket part's time on queue 0 (APS5_DEBUG_Q0_PREP_STATS).
+struct TicketPartTimer {
+    DrawTicket::Part part;
+    bool timed = GuestMemory::Q0PrepStats() != 0;
+    std::chrono::steady_clock::time_point start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ~TicketPartTimer() {
+        if (timed) NoteTicketPartNs(part, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
+};
+
+}
+
+void FillDrawTicketChecks(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    // Each part is stored only when every check in it passed; a throw only leaves its bit clear,
+    // and the committer then runs the checks at their place.
+    {
+        const TicketPartTimer timer{DrawTicket::StencilChecked};
+        try {
+            const std::vector<std::uint32_t>* references = nullptr;
+            for (const auto& shader : shaders) {
+                if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
+                    Require(shader.stage == ShaderRecompiler::ShaderStage::Fragment && references == nullptr, "stencil replay requires exactly one fragment stage");
+                    references = &shader.program->stencilReferences;
+                }
+            }
+            if (references != nullptr) checkStencilReplay(context, state, draw, shaders);
+            ticket.parts |= DrawTicket::StencilChecked;
+        } catch (const std::exception&) {
+        }
+    }
+    {
+        const TicketPartTimer timer{DrawTicket::Validated};
+        try {
+            ticketDrawChecks(context, state, draw, shaders);
+            ticket.parts |= DrawTicket::Validated;
+        } catch (const std::exception&) {
+        }
+    }
+    {
+        const TicketPartTimer timer{DrawTicket::AliasesChecked};
+        try {
+            CheckBufferAliases(shaders, state.color, draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize);
+            ticket.parts |= DrawTicket::AliasesChecked;
+        } catch (const std::exception&) {
+        }
+    }
+    {
+        // Graphics::Draw's per-target layout and the surface its resident lookup asks for
+        // (SurfaceForTarget / ArraySurfaceForTarget only: StorageSurface and CachedStorageSurface
+        // register extended levels and stay on the committer).
+        const TicketPartTimer timer{DrawTicket::Targets};
+        try {
+            ticket.targets.resize(state.colors.size());
+            for (std::size_t index = 0; index < state.colors.size(); ++index) {
+                const auto& color = state.colors[index];
+                auto& target = ticket.targets[index];
+                target.multisampled = color.samples > 1;
+                if (target.multisampled) continue;
+                target.layout.emplace(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+                target.surface = color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
+            }
+            ticket.parts |= DrawTicket::Targets;
+        } catch (const std::exception&) {
+            ticket.targets.clear();
+        }
+    }
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDraw* prepared, DrawTicket* ticket) {
     const bool slotOffered = recipeOut != nullptr;
     prepared = PreparedDrawFor(prepared, context);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): the ticket queue 0 prepared for this draw, when
+    // it was built for this device and pool (null otherwise, and always without the switch).
+    ticket = TicketFor(ticket, context);
+    const auto stencilUse = TicketPartUse(ticket, DrawTicket::StencilChecked);
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
-            Require(shader.stage == ShaderRecompiler::ShaderStage::Fragment && stencilReferences.empty(), "stencil replay requires exactly one fragment stage");
+            TicketChecks(stencilUse, DrawTicket::StencilChecked, [&] { Require(shader.stage == ShaderRecompiler::ShaderStage::Fragment && stencilReferences.empty(), "stencil replay requires exactly one fragment stage"); });
             stencilReferences = shader.program->stencilReferences;
         }
     }
     if (!stencilReferences.empty()) {
-        Require(!draw.indirect && !state.primitiveRestart && !state.rectList && !state.stages.mesh && !state.stages.tessellation && state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "stencil replay supports direct triangle lists without restart, mesh or tessellation");
-        Require(!state.depthBiasPerFace && !ShadersWriteMemory(shaders), "stencil replay refuses face splits and shader memory writes");
-        Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->stencilReplaySafe && (shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Fragment); }), "stencil replay refuses stages with side effects, clocks, subgroup dependencies or primitive ID inputs");
-        for (const auto& shader : shaders) {
-            if (shader.stage != ShaderRecompiler::ShaderStage::Vertex) continue;
-            Require((shader.program->hostSubgroupSize == 1u || shader.program->hostSubgroupSize == context.subgroup.subgroupSize) && shader.program->spirv.size() >= 5u && shader.program->spirv[1] >= 0x00010000u && shader.program->spirv[1] < 0x00010600u, "stencil replay vertex subgroup contract differs from the physical device");
-        }
-        Require(static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount <= 0x100000000ull && (draw.indexed || static_cast<std::uint64_t>(draw.firstVertex) + draw.indexCount <= 0x100000000ull), "stencil replay draw indices overflow");
-        Require(state.samples == 1u && (!state.depth || HasStencil(state.depth->format)), "stencil replay requires single-sample rendering and an eight-bit stencil format");
+        TicketChecks(stencilUse, DrawTicket::StencilChecked, [&] { checkStencilReplay(context, state, draw, shaders); });
         if (recipeOut != nullptr) noteRecipeRefusal(RefusalStencilReplay);
         recipeOut = nullptr;
     }
@@ -2710,7 +2844,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared);
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared, ticket);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2746,6 +2880,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     std::vector<TargetBinding> targets(state.colors.size());
     std::vector<VkImageView> targetViews;
     targetViews.reserve(state.colors.size() + 1);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): each single-sample target's layout and the
+    // surface its resident lookup asks for, from the ticket's Targets part (the same closure state).
+    auto targetsUse = TicketPartUse(ticket, DrawTicket::Targets);
+    const auto describes = [&](std::size_t index) { return ticket->targets[index].multisampled == (state.colors[index].samples > 1) && ticket->targets[index].layout.has_value() != ticket->targets[index].multisampled; };
+    if (targetsUse != TicketUse::None && ticket->targets.size() != state.colors.size()) targetsUse = TicketUse::None;
+    for (std::size_t index = 0; targetsUse != TicketUse::None && index < state.colors.size(); ++index) {
+        if (!describes(index)) targetsUse = TicketUse::None;
+    }
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -2759,7 +2901,18 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             continue;
         }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
-        const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        const auto* ticketTarget = targetsUse != TicketUse::None ? &ticket->targets[index] : nullptr;
+        std::optional<ColorTargetLayout> ownLayout;
+        if (targetsUse != TicketUse::Use) ownLayout.emplace(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        if (ticketTarget != nullptr && targetsUse != TicketUse::Use && (!ticketTarget->layout.has_value() || !sameLayout(*ticketTarget->layout, *ownLayout))) TicketDisagrees(DrawTicket::Targets, targetsUse, "a color target layout");
+        const ColorTargetLayout& colorLayout = targetsUse == TicketUse::Use ? *ticketTarget->layout : *ownLayout;
+        // The surface the resident lookup asks for: the ticket's, or computed here as before.
+        const auto targetSurface = [&](bool array) {
+            if (targetsUse == TicketUse::Use) return ticketTarget->surface;
+            auto surface = array ? ArraySurfaceForTarget(color) : SurfaceForTarget(color);
+            if (ticketTarget != nullptr && !sameSurface(surface, ticketTarget->surface)) TicketDisagrees(DrawTicket::Targets, targetsUse, "a color target surface");
+            return surface;
+        };
         RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
@@ -2778,13 +2931,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
-                    const auto array = ArraySurfaceForTarget(color);
+                    const auto array = targetSurface(true);
                     Require(color.surfaceAddress == color.arrayAddress + color.arraySlice * DescribeSurface(array).layerBytes, "the array image's layer pitch differs from the color view's slice offset");
                     auto resident = CachedStorageSurface(context, array);
                     Require(resident->Attachable(), "storage format cannot be a color attachment");
                     return resident;
                 }
-                auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
+                auto resident = CachedStorageSurface(context, targetSurface(false));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
@@ -2840,7 +2993,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared, ticket);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {

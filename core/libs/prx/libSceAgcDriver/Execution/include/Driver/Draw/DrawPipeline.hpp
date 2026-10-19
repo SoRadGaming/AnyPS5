@@ -36,7 +36,33 @@ public:
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, room-wait draw tickets): work the producer does
+    // for the item it enqueues (Enqueue's optional `prepare`) while the committer works through the
+    // queue, before the push. When Enqueue finds at least `pre` items queued and the producer does
+    // not hold GuestMemory::GpuMutex, it drops the pipeline mutex, runs `run` inside a
+    // GuestMemory::PrepareScope (the queue may only shrink meanwhile), takes the mutex
+    // again, rethrows a committer failure and re-checks closing (an inline commit then), and only
+    // then waits for room and pushes as before; otherwise it calls `skipped` (under the pipeline
+    // mutex, to count) and enqueues at once. The push under the mutex publishes what `run` wrote
+    // into the item to the committer, which takes the front under the same mutex.
+    struct PrepareBudget {
+        const DrawPipeline* pipeline = nullptr;
+        // Items queued when Enqueue looked, and whether that was a full pipeline.
+        std::size_t depth = 0;
+        bool full = false;
+        std::size_t bail = 0;
+        // Whether to stop between parts: the committer is close to running dry.
+        bool Stop() const { return pipeline->Outstanding() <= bail; }
+    };
+    enum class PrepareSkip : std::uint8_t { Shallow, Locked };
+    struct Prepare {
+        void* self = nullptr;
+        void (*run)(void* self, const PrepareBudget& budget) = nullptr;
+        void (*skipped)(void* self, PrepareSkip why) = nullptr;
+        std::size_t pre = 0;
+        std::size_t bail = 0;
+    };
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);

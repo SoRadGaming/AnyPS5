@@ -1,8 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTicketBuild.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -33,6 +37,67 @@ double percent(std::uint64_t part, std::uint64_t whole) {
     return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
 }
 
+// A ticket part's time on queue 0 (APS5_DEBUG_Q0_PREP_STATS).
+struct PartTimer {
+    Graphics::DrawTicket::Part part;
+    bool timed = GuestMemory::Q0PrepStats() != 0;
+    std::chrono::steady_clock::time_point start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    ~PartTimer() {
+        if (timed) Graphics::NoteTicketPartNs(part, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
+};
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, COMMITTER-SPLIT-PLAN Q1): queue 0 builds the draw's
+// ticket inside Enqueue, in a GuestMemory::PrepareScope and without GpuMutex. The context is the
+// device's without a recorder or copied writers, so any recorder use on this path faults at once;
+// nothing here reads guest bytes. A part whose checks throw is left out (the committer runs them).
+void prepareTicket(void* self, const DrawPipeline::PrepareBudget& budget) {
+    auto& inputs = *static_cast<TicketInputs*>(self);
+    // A stage without a compiled program fails VulkanDevice::Draw's first check; the checks after
+    // it assume programs, so such a draw gets no ticket.
+    if (std::any_of(inputs.stages.begin(), inputs.stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program == nullptr; })) return;
+    try {
+        auto ticket = std::make_unique<Graphics::DrawTicket>();
+        auto context = inputs.device->graphicsContext();
+        context.recorder = nullptr;
+        context.copiedWriters = nullptr;
+        ticket->device = context.device;
+        ticket->pool = context.bufferPool;
+        ticket->token = inputs.token;
+        ticket->enqueueDepth = static_cast<std::uint32_t>(budget.depth);
+        ticket->shadow = Graphics::Q0Ticket() == 0;
+        {
+            const PartTimer timer{Graphics::DrawTicket::AbiChecked};
+            if (VulkanDevice::DrawStagesAbiCurrent(inputs.stages)) ticket->parts |= Graphics::DrawTicket::AbiChecked;
+        }
+        {
+            const PartTimer timer{Graphics::DrawTicket::WriterRanges};
+            if (AppendDrawWriterRanges(inputs.stages, ticket->writerRanges)) ticket->parts |= Graphics::DrawTicket::WriterRanges;
+            else ticket->writerRanges.clear();
+        }
+        Graphics::FillDrawTicketChecks(*ticket, context, *inputs.state, inputs.parameters, inputs.stages);
+        Graphics::NoteTicketBuilt(*ticket);
+        *inputs.slot = std::move(ticket);
+    } catch (const std::exception&) {
+        // No ticket: the committer runs today's code for every part.
+    }
+}
+
+void skippedTicket(void*, DrawPipeline::PrepareSkip why) {
+    Graphics::NoteTicketSkip(why == DrawPipeline::PrepareSkip::Shallow ? Graphics::TicketSkip::Shallow : Graphics::TicketSkip::Locked);
+}
+
+}
+
+DrawPipeline::Prepare DrawTicketPrepare(TicketInputs& inputs) {
+    const auto& depths = Graphics::Q0PrepDepths();
+    DrawPipeline::Prepare prepare;
+    prepare.self = &inputs;
+    prepare.run = &prepareTicket;
+    prepare.skipped = &skippedTicket;
+    prepare.pre = depths.pre;
+    prepare.bail = depths.bail;
+    return prepare;
 }
 
 void Driver::noteQ0PrepCommit() {
@@ -51,6 +116,7 @@ void Driver::reportQ0Prep() {
         state.dropped = drawAheadCounts.dropped.load(std::memory_order_relaxed);
         DrawPipeline::Queue0().TakePrepStats();
         GuestMemory::TakeWalkStats();
+        Graphics::TakeTicketCounts();
         committedDraws.store(0, std::memory_order_relaxed);
         return;
     }
@@ -101,6 +167,18 @@ void Driver::reportQ0Prep() {
         steps += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[q0prep] committer walks (10 s) by draw step:%s total %llu walks %.1f ms, %.1f ms of it in draws enqueued at d>=2\n", steps.c_str(), count(totalWalks), static_cast<double>(totalNs) / 1e6, static_cast<double>(totalTwoNs) / 1e6);
+    if (!Graphics::Q0TicketsBuilt()) return;
+    // Tickets (APS5_EXPERIMENT_Q0_TICKET, or shadow tickets under =2): built, skipped, refused at
+    // the commit; per part how often queue 0 filled it, its queue-0 time, how often the committer
+    // consumed it (used, verified or compared), found it clear in a ticket, and disagreements.
+    const auto tickets = Graphics::TakeTicketCounts();
+    std::string parts;
+    for (std::size_t index = 0; index < Graphics::DrawTicket::PartCount; ++index) {
+        char item[200];
+        std::snprintf(item, sizeof(item), " %s filled %llu (%.2f us) used %llu clear %llu disagreed %llu;", Graphics::DrawTicket::PartNames[index], count(tickets.filled[index]), tickets.filled[index] == 0 ? 0.0 : static_cast<double>(tickets.buildNs[index]) / 1e3 / static_cast<double>(tickets.built), count(tickets.used[index]), count(tickets.clear[index]), count(tickets.disagreed[index]));
+        parts += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[q0prep] tickets (10 s, %s): built %llu, skipped shallow %llu, skipped holding the GPU mutex %llu; refused at the commit: device %llu, pool %llu; parts:%s\n", Graphics::Q0Ticket() == 0 ? "shadow" : Graphics::Q0Ticket() == 2 ? "verify" : "used", count(tickets.built), count(tickets.shallow), count(tickets.locked), count(tickets.refusedDevice), count(tickets.refusedPool), parts.c_str());
 }
 
 }

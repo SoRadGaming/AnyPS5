@@ -28,6 +28,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -3915,18 +3916,31 @@ std::shared_ptr<const Graphics::PreparedDraw> VulkanDevice::PrepareDraw(const Gr
     return Graphics::PrepareDraw(graphicsContext(built), graphics, shaders);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const Graphics::PreparedDraw* prepared) {
+bool VulkanDevice::DrawStagesAbiCurrent(std::span<const Graphics::CompiledShader> shaders) {
+    return std::all_of(shaders.begin(), shaders.end(), [](const Graphics::CompiledShader& shader) { return shader.program != nullptr && shader.program->runtimeAbiVersion == ShaderRecompiler::RuntimeAbi::Version; });
+}
+
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, const Graphics::PreparedDraw* prepared, Graphics::DrawTicket* ticket) {
     startJournalReplay();
-    for (const auto& shader : shaders) {
-        require(shader.program != nullptr, "missing compiled shader");
-        ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
-    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): the ABI checks are skipped when queue 0 ran them
+    // on the same stages (they do not depend on the device).
+    Graphics::TicketChecks(Graphics::TicketPartUse(ticket, Graphics::DrawTicket::AbiChecked), Graphics::DrawTicket::AbiChecked, [&] {
+        for (const auto& shader : shaders) {
+            require(shader.program != nullptr, "missing compiled shader");
+            ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
+        }
+    });
     // Two stdout lines per draw cost ~1.3 ms per frame of the queue-0 worker (part of it under the
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     std::optional<Graphics::Context> built;
-    Graphics::Draw(graphicsContext(built), graphics, draw, shaders, snapshots, recipe, prepared);
+    const auto& context = graphicsContext(built);
+    // References tickets left (a stopped pipeline, a commit that threw) are settled here, under
+    // the mutex, and the ones this draw's ticket still holds after it.
+    if (Graphics::Q0TicketsBuilt()) Graphics::DrainTicketRelease(context);
+    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, prepared, ticket);
+    if (ticket != nullptr) Graphics::ReleaseTicketReferences(*ticket, context);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 

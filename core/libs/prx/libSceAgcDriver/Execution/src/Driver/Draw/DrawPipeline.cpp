@@ -156,7 +156,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_REPORT") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -174,6 +174,30 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         ++prepStats.drawDepths[std::min(enqueueDepth, PrepDepthBuckets - 1)];
     } else if (prepStatsOn && kind == ItemKind::Label) {
         ++prepStats.labels;
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): the producer's preparation (see Prepare), only
+    // when the queue is deep enough for the committer to stay busy meanwhile and never while the
+    // producer holds the GPU mutex.
+    if (prepare != nullptr && prepare->run != nullptr) {
+        if (enqueueDepth < prepare->pre) {
+            if (prepare->skipped != nullptr) prepare->skipped(prepare->self, PrepareSkip::Shallow);
+        } else if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            if (prepare->skipped != nullptr) prepare->skipped(prepare->self, PrepareSkip::Locked);
+        } else {
+            const PrepareBudget budget{this, enqueueDepth, enqueueDepth >= Depth(), prepare->bail};
+            lock.unlock();
+            {
+                const GuestMemory::PrepareScope scope;
+                prepare->run(prepare->self, budget);
+            }
+            lock.lock();
+            rethrowFailure();
+            if (closing) {
+                lock.unlock();
+                commit();
+                return;
+            }
+        }
     }
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");

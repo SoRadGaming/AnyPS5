@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTicketBuild.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -48,6 +50,16 @@ void notePipelinePrograms(const std::vector<DrawProgram>& programs) {
     line += '\n';
     std::fwrite(line.data(), 1, line.size(), stderr);
 }
+
+// A pipelined draw's commit closure with its ticket (LOCAL EXPERIMENT, APS5_EXPERIMENT_Q0_TICKET):
+// the ticket rides in the item it was built for, queue 0 fills it before the push (null without
+// one), and the commit hands it to commitDraw.
+template <typename TCommit>
+struct PipelinedDraw {
+    explicit PipelinedDraw(TCommit&& body) : commit(std::move(body)) {}
+    TCommit commit;
+    std::unique_ptr<Graphics::DrawTicket> ticket;
+};
 
 }
 
@@ -656,14 +668,35 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), prepared, drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, or the shadow tickets of
+        // APS5_DEBUG_Q0_PREP_STATS=2): queue 0 prepares the draw's ticket inside Enqueue from the
+        // objects the closure below owns; none for a recipe draw or an empty one (indirect draws
+        // and draws behind deferred labels never reach this branch).
+        const bool ticketed = Graphics::Q0TicketsBuilt() && recipe == nullptr && drawParameters.indexCount != 0 && drawParameters.instanceCount != 0;
+        TicketInputs ticketInputs;
+        if (ticketed) {
+            ticketInputs.device = localDevice.get();
+            // The state object the commit reads (decode->state; `graphics` can name the decode a
+            // relocation replaced, whose state is a copy).
+            ticketInputs.state = &decode->state;
+            ticketInputs.parameters = drawParameters;
+            ticketInputs.stages = stages;
+            ticketInputs.prepared = prepared;
+            ticketInputs.token = epoch;
+        }
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), prepared, drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)](Graphics::DrawTicket* ticket) {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, prepared, ticket);
             notePipelinePrograms(programs);
         };
-        auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw);
+        auto held = std::make_shared<PipelinedDraw<decltype(commit)>>(std::move(commit));
+        DrawPipeline::Prepare prepare;
+        if (ticketed) {
+            ticketInputs.slot = &held->ticket;
+            prepare = DrawTicketPrepare(ticketInputs);
+        }
+        DrawPipeline::Queue0().Enqueue([held] { held->commit(held->ticket.get()); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw, ticketed ? &prepare : nullptr);
         if (GuestMemory::Q0PrepStats() != 0) reportQ0Prep();
         if (exactBatchCap()) drawCountedAtCommit() = true;
         phaseTiming.Phase(DrawRowLockWait);
@@ -705,7 +738,7 @@ bool& Driver::drawCountedAtCommit() {
     return counted;
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const Graphics::PreparedDraw* prepared) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const Graphics::PreparedDraw* prepared, Graphics::DrawTicket* ticket) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
@@ -722,13 +755,24 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     } submitDue{*this, localDevice, exactBatchCap()};
     if (GuestMemory::Q0PrepStats() != 0) noteQ0PrepCommit();
     recordLabelsForPacket(localDevice.get(), queue);
-    noteDrawWriters(stages, queue);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): the ranges queue 0 listed are noted here, at
+    // the commit as before (noting them before the enqueue could make a later dispatch the newest
+    // writer and turn a Sync into a Raw evidence read); only the walk over the stages moved.
+    if (const auto writersUse = Graphics::TicketPartUse(ticket, Graphics::DrawTicket::WriterRanges); writersUse == Graphics::TicketUse::None) {
+        noteDrawWriters(stages, queue);
+    } else if (writersUse == Graphics::TicketUse::Use) {
+        noteDrawWriterRanges(ticket->writerRanges, queue);
+    } else {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        if (!AppendDrawWriterRanges(stages, ranges) || ranges != ticket->writerRanges) Graphics::TicketDisagrees(Graphics::DrawTicket::WriterRanges, writersUse, "the written buffer ranges");
+        noteDrawWriters(stages, queue);
+    }
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared, ticket);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 

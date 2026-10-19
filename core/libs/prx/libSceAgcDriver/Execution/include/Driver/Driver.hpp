@@ -249,8 +249,11 @@ private:
     static void appendWrittenRanges(const ShaderRecompiler::RecompileResult& compiled, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): noteDrawWriters from ranges queue 0 listed
+    // (AppendDrawWriterRanges): the same entries, serials and order, under one lock.
+    void noteDrawWriterRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t queue);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
-    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const Graphics::PreparedDraw* prepared);
+    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const Graphics::PreparedDraw* prepared, Graphics::DrawTicket* ticket = nullptr);
     // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS, Draw/DrawTicket.cpp): the [q0prep] line, printed by
     // queue 0 after a draw enqueue every 10 s; noteQ0PrepCommit counts the draws the committer
     // committed (against PreparedDrawUses and the draw-ahead counts).
