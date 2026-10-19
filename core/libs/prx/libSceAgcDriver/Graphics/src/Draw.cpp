@@ -2337,7 +2337,49 @@ std::shared_ptr<const PreparedDraw> PrepareDraw(const Context& context, const St
     return prepared;
 }
 
+// LOCAL DEBUG (APS5_DEBUG_RECIPE_REFUSALS=1): why a recorded draw builds no recipe, by the first
+// failing term of the build condition, and why queue 0 offers no recipe slot (NoteRecipeSlot).
+// Printed every 10 s as [recipe-refusals].
+enum RecipeRefusal : std::size_t { RefusalNoSlot, RefusalStencilReplay, RefusalProxied, RefusalDisabled, RefusalUncacheable, RefusalWaited, RefusalIndirect, RefusalNotReusable, RefusalMoved, RefusalMultisampled, RefusalBuilt, SlotNoRegisterKey, SlotIndirect, SlotPatched, SlotRecipesOff, SlotNoVariants, SlotOffered, LookupNoEntry, LookupNoRecords, LookupExpired, LookupMismatch, LookupHit, AttachNoEntry, AttachStored, RefusalCount };
+std::atomic<std::uint64_t> recipeRefusals[RefusalCount]{};
+
+bool RecipeRefusalStats() {
+    static const bool enabled = std::getenv("APS5_DEBUG_RECIPE_REFUSALS") != nullptr;
+    return enabled;
+}
+
+void reportRecipeRefusals() {
+    static std::atomic<std::int64_t> last{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (previous == 0) {
+        last.compare_exchange_strong(previous, now);
+        return;
+    }
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
+    static constexpr const char* names[RefusalCount] = {"no-slot", "stencil-replay", "proxied", "disabled", "uncacheable", "waited", "indirect", "not-reusable", "moved", "multisampled", "built", "slot:no-register-key", "slot:indirect", "slot:patched", "slot:recipes-off", "slot:no-variants", "slot:offered", "lookup:no-entry", "lookup:no-records", "lookup:expired", "lookup:mismatch", "lookup:hit", "attach:no-entry", "attach:stored"};
+    std::string line = "[recipe-refusals] (10 s)";
+    for (std::size_t i = 0; i < RefusalCount; ++i) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " %s %llu", names[i], static_cast<unsigned long long>(recipeRefusals[i].exchange(0, std::memory_order_relaxed)));
+        line += text;
+    }
+    line += '\n';
+    std::fwrite(line.data(), 1, line.size(), stderr);
+}
+
+void noteRecipeRefusal(std::size_t reason) {
+    if (!RecipeRefusalStats()) return;
+    recipeRefusals[reason].fetch_add(1, std::memory_order_relaxed);
+    reportRecipeRefusals();
+}
+
+void NoteRecipeSlot(int reason) {
+    noteRecipeRefusal(SlotNoRegisterKey + static_cast<std::size_t>(reason));
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDraw* prepared) {
+    const bool slotOffered = recipeOut != nullptr;
     prepared = PreparedDrawFor(prepared, context);
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
@@ -2356,6 +2398,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         Require(static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount <= 0x100000000ull && (draw.indexed || static_cast<std::uint64_t>(draw.firstVertex) + draw.indexCount <= 0x100000000ull), "stencil replay draw indices overflow");
         Require(state.samples == 1u && (!state.depth || HasStencil(state.depth->format)), "stencil replay requires single-sample rendering and an eight-bit stencil format");
+        if (recipeOut != nullptr) noteRecipeRefusal(RefusalStencilReplay);
         recipeOut = nullptr;
     }
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
@@ -2649,7 +2692,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
-    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
+    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) {
+        if (recipeOut != nullptr) noteRecipeRefusal(RefusalProxied);
+        recipeOut = nullptr;
+    }
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
         if (!masked.has_value()) masked = state;
@@ -2714,6 +2760,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // hit's proof is the template's ProveCurrent and nothing needs completion work. A hit whose
         // read-only buffers moved builds one only under APS5_EXPERIMENT_MOVED_RECIPES, whose hits
         // list their moved buffers again (DrawWithRecipe).
+        if (RecipeRefusalStats()) {
+            const auto refusal = recipeOut == nullptr ? (slotOffered ? RefusalCount : RefusalNoSlot) : !DrawRecipes() ? RefusalDisabled : !cacheable ? RefusalUncacheable : outcome.waited ? RefusalWaited : args != nullptr ? RefusalIndirect : !resources->Reusable() ? RefusalNotReusable : !(resolved.moved.empty() || MovedRecipes() != 0) ? RefusalMoved : multisampled ? RefusalMultisampled : RefusalBuilt;
+            if (refusal != RefusalCount) noteRecipeRefusal(refusal);
+        }
         if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (resolved.moved.empty() || MovedRecipes() != 0) && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;

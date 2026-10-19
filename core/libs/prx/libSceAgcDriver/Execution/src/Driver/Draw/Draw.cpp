@@ -16,6 +16,8 @@
 
 namespace AgcDriver::Graphics {
 VkPipeline& LastBoundPipeline();
+bool RecipeRefusalStats();
+void NoteRecipeSlot(int reason);
 }
 
 namespace AgcDriver::DriverDetail {
@@ -616,10 +618,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    // LOCAL DEBUG (APS5_DEBUG_RECIPE_REFUSALS): why this draw gets no recipe slot.
+    if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(!registerKey ? 0 : drawParameters.indirect ? 1 : patchedStages ? 2 : !Graphics::DrawRecipes() ? 3 : 5);
     if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
-        if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
+        if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) {
+            recipeStages.clear();
+            if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(4);
+        }
     }
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {

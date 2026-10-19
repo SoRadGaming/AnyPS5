@@ -5,7 +5,9 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -114,6 +116,17 @@ void DisplayWindow::UpdateTitle() {
     const auto frequency = sceKernelGetProcessTimeCounterFrequency();
     frameNum++;
     fpsFrames++;
+    // LOCAL DEBUG: APS5_FRAME_LOG=<file> appends each present's wall-clock time in microseconds since
+    // the Unix epoch, so a benchmark can take frame-time percentiles over windows it aligns itself.
+    static std::FILE* frameLog = [] {
+        const char* path = std::getenv("APS5_FRAME_LOG");
+        return path != nullptr ? std::fopen(path, "w") : nullptr;
+    }();
+    if (frameLog != nullptr) {
+        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        std::fprintf(frameLog, "%lld\n", static_cast<long long>(micros));
+        if ((frameNum & 15u) == 0u) std::fflush(frameLog);
+    }
     if (now - fpsStart >= frequency * 2) {
         currentFps = static_cast<double>(fpsFrames) * static_cast<double>(frequency) / static_cast<double>(now - fpsStart);
         fpsStart = now;

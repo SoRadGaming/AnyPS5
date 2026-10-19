@@ -8,6 +8,11 @@
 #include <cstdlib>
 #include <utility>
 
+namespace AgcDriver::Graphics {
+bool RecipeRefusalStats();
+void NoteRecipeSlot(int reason);
+}
+
 namespace AgcDriver::DriverDetail {
 
 bool DrawRecipeRecord::Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const {
@@ -309,13 +314,24 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     {
         std::lock_guard cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
-        if (found == drawCache.end()) return nullptr;
+        if (found == drawCache.end()) {
+            if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(6);
+            return nullptr;
+        }
         records = found->second->recipes.load();
     }
-    if (records == nullptr) return nullptr;
-    for (const auto& record : *records) {
-        if (record.Matches(stages)) return record.recipe;
+    if (records == nullptr) {
+        if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(7);
+        return nullptr;
     }
+    for (const auto& record : *records) {
+        if (record.Matches(stages)) {
+            if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(10);
+            return record.recipe;
+        }
+    }
+    // LOCAL DEBUG (APS5_DEBUG_RECIPE_REFUSALS): every record expired, or live records for other variants.
+    if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(std::all_of(records->begin(), records->end(), [](const DrawRecipeRecord& record) { return record.Expired(); }) ? 8 : 9);
     return nullptr;
 }
 
@@ -324,9 +340,13 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
     {
         std::lock_guard cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
-        if (found == drawCache.end()) return;
+        if (found == drawCache.end()) {
+            if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(11);
+            return;
+        }
         entry = found->second;
     }
+    if (Graphics::RecipeRefusalStats()) Graphics::NoteRecipeSlot(12);
     const auto old = entry->recipes.load();
     auto records = std::make_shared<std::vector<DrawRecipeRecord>>();
     records->push_back({std::vector<std::weak_ptr<const DispatchVariant>>(stages.begin(), stages.end()), std::move(recipe)});

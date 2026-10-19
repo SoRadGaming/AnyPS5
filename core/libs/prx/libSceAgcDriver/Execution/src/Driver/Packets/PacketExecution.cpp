@@ -124,7 +124,10 @@ void Driver::execute(const Submission& submission) {
         state = &queues[submission.queue];
     }
     auto& queue = *state;
-    if (submission.queue == 0 && drawEntries() && registerKeyEnabled()) {
+    // LOCAL EXPERIMENT: APS5_NO_DRAW_AHEAD=1 runs without draw-ahead, for measuring how it interacts with
+    // draw relocation and recipes (an ahead entry makes queue 0 never miss, so relocation never learns).
+    static const bool noDrawAhead = std::getenv("APS5_NO_DRAW_AHEAD") != nullptr;
+    if (submission.queue == 0 && drawEntries() && registerKeyEnabled() && !noDrawAhead) {
         if (drawAhead == nullptr) drawAhead = std::make_unique<DrawAhead>(*this, DrawAhead::Workers());
         drawAhead->Post(submission, queue);
     }
