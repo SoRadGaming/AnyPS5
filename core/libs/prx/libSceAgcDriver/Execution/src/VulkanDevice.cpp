@@ -2995,6 +2995,28 @@ struct FrameDumps {
     int every = 1;
     int dumped = 0;
     std::uint64_t presents = 0;
+    // LOCAL DEBUG: APS5_DUMP_FRAMES_FROM=<n> skips the first n presents (the loading screen).
+    std::uint64_t from = [] {
+        const char* value = std::getenv("APS5_DUMP_FRAMES_FROM");
+        return value ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    // LOCAL DEBUG: APS5_DUMP_FRAMES_AFTER_SLOW=<n> starts counting only after n consecutive presents
+    // more than 60 ms apart, so the dumps begin in a scene, not in a fast loading screen.
+    std::uint64_t slowNeeded = [] {
+        const char* value = std::getenv("APS5_DUMP_FRAMES_AFTER_SLOW");
+        return value ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    std::uint64_t slowSeen = 0;
+    std::chrono::steady_clock::time_point last{};
+
+    // Whether this present counts toward the dump schedule.
+    bool Armed() {
+        if (slowNeeded == 0 || slowSeen >= slowNeeded) return true;
+        const auto now = std::chrono::steady_clock::now();
+        slowSeen = last != std::chrono::steady_clock::time_point{} && now - last > std::chrono::milliseconds(60) ? slowSeen + 1 : 0;
+        last = now;
+        return slowSeen >= slowNeeded;
+    }
 };
 
 FrameDumps& Dumps() {
@@ -3021,7 +3043,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         if (passthrough) ensureHdrScaler(DisplayTexelFormat(buffer.pixelFormat));
         const auto pixels = passthrough ? ReadDisplayBufferTexels(buffer) : ReadDisplayBuffer(buffer);
         bool dumpFrame = false;
-        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && dumps.Armed() && ++dumps.presents > dumps.from && (dumps.presents - dumps.from) % static_cast<std::uint64_t>(dumps.every) == 0) {
             if (passthrough) {
                 WriteFrameBmp(dumps.dumped++, buffer.width, buffer.height, ReadDisplayBuffer(buffer), DumpScale());
             } else if (dumps.cpu) {
@@ -3076,7 +3098,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     }
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     bool dumpFrame = false;
-    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && dumps.Armed() && ++dumps.presents > dumps.from && (dumps.presents - dumps.from) % static_cast<std::uint64_t>(dumps.every) == 0) {
         if (dumps.cpu || (passthrough && resident == nullptr)) {
             auto full = cleared ? std::vector<std::byte>(static_cast<std::size_t>(buffer.width) * buffer.height * cleared->size()) : ReadDisplayBuffer(buffer);
             for (std::size_t offset = 0; cleared && offset < full.size(); offset += cleared->size()) std::memcpy(full.data() + offset, cleared->data(), cleared->size());
