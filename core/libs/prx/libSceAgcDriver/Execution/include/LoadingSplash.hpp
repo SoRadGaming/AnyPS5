@@ -14,8 +14,8 @@
 // APS5_LOADING_SPLASH=1: while a title boots and shows nothing but black frames, the window shows
 // its key art (sce_sys/pic0.png, handed over by VideoOut) with a loading panel instead. Each
 // presented frame is sampled on a grid of swapchain texels (read back when its slot retires); the
-// first frame with content ends the splash for good, and so do the first key, button or click and
-// APS5_LOADING_SPLASH_MAX_SECONDS. Presents with no game frame (before the first flip, black flips)
+// first frame with content ends the splash for good, and so do Enter, Space, Escape or a controller
+// button (VideoOut) and APS5_LOADING_SPLASH_MAX_SECONDS. Presents with no game frame (before the first flip, black flips)
 // show it too. Off by default.
 namespace AgcDriver::LoadingSplash {
 
