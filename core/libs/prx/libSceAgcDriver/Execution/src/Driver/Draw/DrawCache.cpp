@@ -213,7 +213,7 @@ bool Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     for (std::size_t i = 0; i < resolved.size(); ++i) {
         if (resolved[i] == nullptr) continue;
         auto& variants = replacement->stages[i];
-        const auto kept = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& variant) { return variant->pushOffset == resolved[i]->pushOffset && variant->meshIndexDescriptor == resolved[i]->meshIndexDescriptor && variant->runs == resolved[i]->runs && variant->words == resolved[i]->words; });
+        const auto kept = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& variant) { return variant->pushOffset == resolved[i]->pushOffset && variant->meshIndexDescriptor == resolved[i]->meshIndexDescriptor && variant->runs == resolved[i]->runs && SameCapturedWords(variant->words, variant->shared, resolved[i]->words, resolved[i]->shared); });
         if (kept != variants.end()) {
             ++present;
             resolved[i] = *kept;

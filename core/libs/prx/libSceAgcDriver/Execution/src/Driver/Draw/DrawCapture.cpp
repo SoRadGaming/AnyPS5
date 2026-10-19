@@ -43,9 +43,9 @@ std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, co
     variant->pushOffset = capture.pushOffset;
     if (vertexInfo) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfo);
     std::vector<ShaderRecompiler::MemoryRegion> regions(capture.regions.begin(), capture.regions.end());
-    for (const auto& read : decodeReads) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
+    for (const auto& read : decodeReads) regions.push_back({read.address, read.Bytes()});
     std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-    Driver::tagVariantRuns(*variant, regions, capture.userDataUse, decodeReads.empty() && (!vertexInfo || vertexInfo->resourcesNum == 0), program.hiddenUserWords);
+    Driver::tagVariantRuns(*variant, regions, capture.userDataUse, decodeReads.empty() && (!vertexInfo || vertexInfo->resourcesNum == 0), program.hiddenUserWords, capture.supplied);
     return variant;
 }
 
@@ -55,7 +55,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     const auto& program = programs[i];
     auto request = DrawStageRequest(program, graphics, pixel, vertexInfos[i], memory, linked, drawParameters, localDevice->Target(), pushOffset);
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-    const auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
+    auto invocation = InvocationFor(*program.snapshot, program.codeOffset, request);
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
@@ -77,13 +77,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
         try {
-            return shaderMemory.Capture(invocation);
+            return CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
         } catch (const std::exception& error) {
             throw named(error);
         }
     }();
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
+    stageCapture.supplied = shaderMemory.SuppliedBlocks();
     stageCapture.userDataUse = capture->userDataUse;
     recompiled[i] = true;
     memory = shaderMemory.Regions();
@@ -155,7 +156,7 @@ void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderReco
     for (const auto& [begin, end] : variant.runs) {
         for (const auto& read : decodeReads) {
             const auto from = std::max(begin, read.address);
-            const auto to = std::min(end, read.address + read.bytes.size());
+            const auto to = std::min(end, read.address + read.size);
             if (from >= to) continue;
             for (auto word = (from - begin) / sizeof(std::uint32_t); word < (to - begin + sizeof(std::uint32_t) - 1) / sizeof(std::uint32_t); ++word) decoded[offset + static_cast<std::size_t>(word)] = true;
         }
@@ -219,6 +220,7 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
         stageCapture.pushOffset = pushCursorBytes;
         const auto capture = shaderMemory.Capture(invocation);
         stageCapture.regions = shaderMemory.TakeRecentRegions();
+        stageCapture.supplied = shaderMemory.SuppliedBlocks();
         stageCapture.userDataUse = capture->userDataUse;
         memory = shaderMemory.Regions();
         stageCapture.compiled = invocation.Materialize(*capture);

@@ -33,6 +33,7 @@ int APS5_VABI sceSslClose(int);
 int APS5_VABI sceSslGetNotBefore(int, void*, SceSsl::RtcTick*);
 int APS5_VABI sceSslGetNotAfter(int, void*, SceSsl::RtcTick*);
 int APS5_VABI sceSslGetFingerprint(int, void*, int, unsigned char*);
+int APS5_VABI sceSslGetPem(int, void*, char*, std::size_t*);
 }
 
 namespace {
@@ -278,6 +279,23 @@ void CertificateReaders() {
     Throws([&] { sceSslGetFingerprint(id, fake, 3, sha256); });
     Throws([&] { sceSslGetFingerprint(9999, cert, 3, sha256); });
 
+    std::size_t pemLen = 0;
+    Check(sceSslGetPem(id, cert, nullptr, &pemLen) == 0, "query pem size failed");
+    Check(pemLen > 0, "pem length is 0");
+    std::vector<char> pemBuf(pemLen);
+    std::size_t writtenLen = pemBuf.size();
+    Check(sceSslGetPem(id, cert, pemBuf.data(), &writtenLen) == 0, "write pem failed");
+    Check(writtenLen == pemLen, "written pem length mismatch");
+    Check(std::strstr(pemBuf.data(), "-----BEGIN CERTIFICATE-----\n") != nullptr, "pem header missing");
+    Check(std::strstr(pemBuf.data(), "-----END CERTIFICATE-----\n") != nullptr, "pem footer missing");
+
+    char smallPem[8]{};
+    std::size_t smallPemLen = sizeof(smallPem);
+    Throws([&] { sceSslGetPem(id, cert, smallPem, &smallPemLen); });
+    Check(sceSslGetPem(id, cert, pemBuf.data(), nullptr) == static_cast<int>(0x8095177a), "null pem len accepted");
+    Throws([&] { sceSslGetPem(id, nullptr, pemBuf.data(), &writtenLen); });
+    Throws([&] { sceSslGetPem(id, fake, pemBuf.data(), &writtenLen); });
+
     Throws([&] { sceSslClose(1); });
 
     Check(sceSslFreeCaList(id, &handles) == 0, "free ca list failed");
@@ -288,6 +306,7 @@ void CertificateReaders() {
     Throws([&] { sceSslGetNotBefore(id, cert, &begin); });
     Throws([&] { sceSslGetNotAfter(id, cert, &limit); });
     Throws([&] { sceSslGetFingerprint(id, cert, 3, sha256); });
+    Throws([&] { sceSslGetPem(id, cert, pemBuf.data(), &writtenLen); });
 
     const int id2 = sceSslInit_nid_postfix(1024 * 1024);
     Check(sceSslLoadCert(id2, 1, &pointer, nullptr, nullptr) == 0, "CA load failed");
@@ -304,6 +323,7 @@ void CertificateReaders() {
     Throws([&] { sceSslGetNotBefore(id2, cert2, &begin); });
     Throws([&] { sceSslGetNotAfter(id2, cert2, &limit); });
     Throws([&] { sceSslGetFingerprint(id2, cert2, 3, sha256); });
+    Throws([&] { sceSslGetPem(id2, cert2, pemBuf.data(), &writtenLen); });
     Check(sceSslTerm_nid_postfix(id2) == 0, "term failed");
     Throws([&] { sceSslGetNameEntryCount(id2, subject2); });
     Throws([&] { sceSslFreeSslCertName(id2, subject2); });

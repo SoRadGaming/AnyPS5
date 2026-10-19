@@ -1260,6 +1260,12 @@ bool wouldRetireImport(const HostImports& state, const ImportRun& run) {
     return previous.base + previous.bytes > run.base;
 }
 
+bool sameRange(const ImportFailure& entry, const GuestAllocations::Lease& lease) {
+    const auto current = entry.ranges.size() == 1 ? leasedRangeOwner(lease, entry.base, entry.base + entry.bytes) : nullptr;
+    if (current != nullptr && entry.bytes < current->bytes) return !entry.ranges.front().owner_before(current) && !current.owner_before(entry.ranges.front());
+    return sameRun(entry, importRun(lease, entry.base));
+}
+
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
     if (entry.ranges.size() == 1 && !entry.joined && entry.bytes < entry.ranges.front()->bytes) {
         const auto current = leasedRangeOwner(lease, entry.base, entry.base + entry.bytes);
@@ -1305,9 +1311,9 @@ std::uint64_t physicalMemoryBytes() {
 
 std::atomic<std::uint64_t> budgetOverride{0};
 
-// Pinned imports count against the driver's system memory heap, which imports and type-3 mirrors share; past it
-// ordinary host allocations fail. The budget is APS5_HOST_IMPORT_MIB, else the larger of 6 GiB and half the physical
-// memory, at most the largest host heap less 2 GiB.
+// Pinned imports count against the driver's system memory heap, which imports, type-3 mirrors, buffers and textures
+// placed in host memory share; past it ordinary host allocations fail. The budget is APS5_HOST_IMPORT_MIB, else
+// HostImportBudget.
 std::uint64_t importBudget(const Context& context) {
     if (const auto set = budgetOverride.load(std::memory_order_relaxed); set != 0) return set;
     static const std::uint64_t configured = []() -> std::uint64_t {
@@ -1315,13 +1321,7 @@ std::uint64_t importBudget(const Context& context) {
         return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0u;
     }();
     if (configured != 0) return configured;
-    std::uint64_t hostHeap = 0;
-    for (std::uint32_t index = 0; index < context.memory.memoryHeapCount; ++index) {
-        if ((context.memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) hostHeap = std::max<std::uint64_t>(hostHeap, context.memory.memoryHeaps[index].size);
-    }
-    const auto fromMemory = std::max<std::uint64_t>(6144ull << 20u, physicalMemoryBytes() / 2);
-    constexpr std::uint64_t reserve = 2048ull << 20u;
-    return hostHeap > reserve ? std::min(fromMemory, hostHeap - reserve) : fromMemory;
+    return HostImportBudget(context.memory, physicalMemoryBytes());
 }
 
 std::atomic<std::uint64_t> rangeImportWindow{64ull << 20u};
@@ -1401,7 +1401,10 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     if (fresh && end != 0) {
         if (const auto* current = findImport(state, address, end)) return current;
     } else if (!fresh) {
-        if (const auto* current = findImport(state, address, address + 1); current != nullptr && current->joined && sameRange(*current, lease)) return current;
+        if (const auto* current = peekImport(state, address, address + 1); current != nullptr && current->joined && sameRange(*current, lease)) {
+            current->lastUse = ++state.useCounter;
+            return current;
+        }
     }
     auto run = importRun(lease, address);
     // Without an end the caller views the whole run through the import (AcquireRegistered): a window that holds the
@@ -1432,7 +1435,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         failures.insert_or_assign(base, ImportFailure{base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end())});
         return nullptr;
     }
-    if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) return &found->second;
+    if (const auto found = state.imports.find(base); found != state.imports.end() && sameRun(found->second, run)) {
+        found->second.lastUse = ++state.useCounter;
+        return &found->second;
+    }
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return nullptr;
     if (const auto failed = failures.find(base); failed != failures.end()) {
         if (sameRun(failed->second, run)) return nullptr;
@@ -1678,7 +1684,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         retireImport(context.device, state, it, lease);
         it = next;
     }
-    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRun(it->second, importRun(lease, it->first)) ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.failed.begin(); it != state.failed.end();) it = sameRange(it->second, lease) ? std::next(it) : state.failed.erase(it);
     for (auto it = state.failedJoins.begin(); it != state.failedJoins.end();) it = sameRun(it->second, joinedRun(lease, it->second.base, it->second.base + it->second.bytes)) ? std::next(it) : state.failedJoins.erase(it);
 }
 
@@ -2975,6 +2981,16 @@ void SetHostImportDeferredSettles(bool enabled) {
 #else
     static_cast<void>(enabled);
 #endif
+}
+
+std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, const std::uint64_t physicalBytes) {
+    std::uint64_t hostHeap = 0;
+    for (std::uint32_t index = 0; index < std::min<std::uint32_t>(memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS); ++index) {
+        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) hostHeap = std::max<std::uint64_t>(hostHeap, memory.memoryHeaps[index].size);
+    }
+    const auto fromMemory = std::max<std::uint64_t>(6144ull << 20u, physicalBytes / 2);
+    const auto reserve = std::max<std::uint64_t>(2048ull << 20u, hostHeap / 2);
+    return hostHeap > reserve ? std::min(fromMemory, hostHeap - reserve) : fromMemory;
 }
 
 std::uint64_t HostImportLiveBytes() {
@@ -4381,7 +4397,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
             copySource = inputSnapshot->Handle();
             copyOffset = 0;
-            recorder->Keep(inputSnapshot);
+            recorder->Keep(inputSnapshot, inputSnapshot->Bytes().size());
             CaptureTrace::Log("copy-input-snapshot batch=%llu address=%llx bytes=%llu", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
         }
         if (capture && bytes == 32) {

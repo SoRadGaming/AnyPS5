@@ -257,6 +257,16 @@ bool Listening(const Socket& socket) {
     socklen_t size = sizeof(listening);
     return ::getsockopt(socket.value, SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<char*>(&listening), &size) == 0 && listening != 0;
 }
+bool ZeroPortConnect(const Socket& socket, const void* address, std::uint32_t length) {
+    if (!address || (socket.type != 1 && socket.type != 2) || (socket.family != 2 && socket.family != 28)) return false;
+    const auto* bytes = static_cast<const unsigned char*>(address);
+    if (length < (socket.family == 2 ? 16u : 28u) || bytes[1] != socket.family || (bytes[2] | bytes[3]) != 0) return false;
+    sockaddr_storage peer{};
+    socklen_t peerSize = sizeof(peer);
+    if (::getpeername(socket.value, reinterpret_cast<sockaddr*>(&peer), &peerSize) == 0) return false;
+    Fail(49);
+    return true;
+}
 int Disconnect(const Socket& socket) {
     sockaddr_storage peer{};
     socklen_t peerSize = sizeof(peer);
@@ -943,6 +953,20 @@ int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...) {
     socket->options.nonblocking = enabled != 0;
     return 0;
 }
+int APS5_VABI _fcntl_nid_postfix(int descriptor, int command, ...) {
+#ifdef _WIN32
+    __builtin_sysv_va_list arguments;
+    __builtin_sysv_va_start(arguments, command);
+    const auto argument = __builtin_va_arg(arguments, std::uint64_t);
+    __builtin_sysv_va_end(arguments);
+#else
+    std::va_list arguments;
+    va_start(arguments, command);
+    const auto argument = va_arg(arguments, std::uint64_t);
+    va_end(arguments);
+#endif
+    return fcntl_nid_postfix(descriptor, command, argument);
+}
 int APS5_VABI setsockopt_nid_postfix(int descriptor, int level, int option,
                                     const void* value, std::uint32_t length) {
     int netError = 0;
@@ -1003,6 +1027,10 @@ int APS5_VABI socket_nid_postfix(int family, int type, int protocol) {
         return Fail(12);
     }
 }
+int APS5_VABI __sys_socketex_nid_postfix(const char* name, int family, int type, int protocol) {
+    static_cast<void>(name);
+    return socket_nid_postfix(family, type, protocol);
+}
 int APS5_VABI socketpair_nid_postfix(int family, int type, int protocol, int* descriptors) {
     const bool nonblocking = (type & GuestNonBlocking) != 0;
     const int plainType = type & ~(GuestCloseOnExec | GuestNonBlocking);
@@ -1055,6 +1083,7 @@ int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint
     if (socket->type == 1) RefuseClosedLoopbackAtOnce_nid_no_patch(socket->value, reinterpret_cast<const sockaddr*>(&native));
 #endif
     if (socket->type == 1 && Listening(*socket)) return Fail(45);
+    if (ZeroPortConnect(*socket, address, length)) return -1;
     if (native.ss_family != (socket->family == 2 ? AF_INET : AF_INET6)) return Fail(47);
     {
         std::lock_guard lock(socket->modeMutex);

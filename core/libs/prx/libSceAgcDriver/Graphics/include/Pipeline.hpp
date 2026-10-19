@@ -48,7 +48,7 @@ public:
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
     VkPipelineLayout Layout() const;
-    std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers = 1, std::span<const std::uint8_t> persistent = {});
+    std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
     // With `bound` (APS5_EXPERIMENT_PASS_STATE_FILTER) the binds and states the record already
     // holds are left out and the record notes the rest, here and in the calls below.
@@ -69,10 +69,11 @@ public:
 private:
     struct CachedFramebuffer {
         std::vector<VkImageView> views;
-        std::vector<std::weak_ptr<StorageTexture>> owners;
+        std::vector<std::weak_ptr<void>> owners;
         std::vector<bool> owned;
         VkExtent2D extent;
         std::uint32_t layers = 1;
+        std::uint64_t depthReleases = 0;
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
