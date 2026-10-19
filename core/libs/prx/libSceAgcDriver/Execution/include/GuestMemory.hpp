@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -175,6 +176,55 @@ std::uint64_t GpuHoldSerial();
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
 void AssertGpuLockHeld(const char* where);
+// LOCAL EXPERIMENT (COMMITTER-SPLIT-PLAN, room-wait draw tickets): queue 0 prepares a draw's ticket
+// inside DrawPipeline::Enqueue without GpuMutex, and must never take it there (a committer that
+// waits for queue 0 while queue 0 waits for the mutex would deadlock, and nothing it prepares may
+// record). The scope marks the calling thread for its lifetime; under APS5_ASSERT_GPU_LOCK=1 a
+// lock() of GpuMutex inside it aborts with a [lock] line.
+class PrepareScope {
+public:
+    PrepareScope();
+    ~PrepareScope();
+    PrepareScope(const PrepareScope&) = delete;
+    PrepareScope& operator=(const PrepareScope&) = delete;
+
+private:
+    bool previous;
+};
+// LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=1|2|3): the level of the switch (0 when unset), read once.
+// 1 counts what queue 0 finds at its draw enqueues and the committer's write-watch walks by draw
+// step and enqueue depth; 2 also shadows tickets (built, compared at commit, never used); 3 also
+// the byte-derived shadow. Printed every 10 s as [q0prep].
+int Q0PrepStats();
+// LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the committer's write-watch walks (completed and failed
+// collects that reached the tracker, not memo hits) by the draw step that made them
+// (WalkCallerScope, innermost wins) and by the queue depth the draw was enqueued behind
+// (SetWalkItemDepth, set by the committer around a draw's commit: depth + 1, 0 outside one).
+// Walks outside a committed draw are not counted. The time of walks in draws enqueued at full
+// depth (DrawPipeline's PrepareBudget::full test, passed as `full`) is also summed apart, since
+// DrawPipeline::Depth() may exceed the last depth bucket.
+enum class WalkCaller : std::uint8_t { Other, Revalidate, Index, Target, Depth, Bindings, Count };
+constexpr std::size_t WalkDepthBuckets = 10;
+class WalkCallerScope {
+public:
+    explicit WalkCallerScope(WalkCaller caller);
+    ~WalkCallerScope();
+    WalkCallerScope(const WalkCallerScope&) = delete;
+    WalkCallerScope& operator=(const WalkCallerScope&) = delete;
+
+private:
+    std::uint32_t previous;
+    bool active;
+};
+void SetWalkItemDepth(std::uint32_t depthPlusOne, bool full = false);
+struct WalkStats {
+    std::array<std::array<std::uint64_t, WalkDepthBuckets>, static_cast<std::size_t>(WalkCaller::Count)> walks{};
+    std::array<std::array<std::uint64_t, WalkDepthBuckets>, static_cast<std::size_t>(WalkCaller::Count)> ns{};
+    std::array<std::array<std::uint64_t, WalkDepthBuckets>, static_cast<std::size_t>(WalkCaller::Count)> bytes{};
+    std::array<std::uint64_t, static_cast<std::size_t>(WalkCaller::Count)> fullNs{};
+};
+// The counts since the last call (reset by it).
+WalkStats TakeWalkStats();
 void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.

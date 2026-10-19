@@ -1410,6 +1410,41 @@ void reportMissStats() {
     st.lastEpoch = lastEpoch;
 }
 
+// LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the committer's walks by draw step and enqueue depth
+// (see WalkCallerScope in the header). Only the committer adds; the [q0prep] reporter takes them.
+struct WalkCallerTag {};
+struct WalkDepthTag {};
+using WalkCallerSlot = HostThreadSlot<std::uint32_t, WalkCallerTag>;
+using WalkDepthSlot = HostThreadSlot<std::uint32_t, WalkDepthTag>;
+constexpr std::size_t WalkCallers = static_cast<std::size_t>(WalkCaller::Count);
+std::array<std::array<std::atomic<std::uint64_t>, WalkDepthBuckets>, WalkCallers> walkCounts{};
+std::array<std::array<std::atomic<std::uint64_t>, WalkDepthBuckets>, WalkCallers> walkNs{};
+std::array<std::array<std::atomic<std::uint64_t>, WalkDepthBuckets>, WalkCallers> walkBytes{};
+std::array<std::atomic<std::uint64_t>, WalkCallers> walkFullNs{};
+// The depth slot holds depth + 1, with this bit set for a draw enqueued at full depth.
+constexpr std::uint32_t WalkItemFullBit = 0x80000000u;
+// Times one collect from its tracker lock on, when the calling thread is inside a committed draw;
+// a shared-memo hit under the lock (no walk) leaves `walked` false and is not counted.
+struct WalkNote {
+    std::uint32_t depth;
+    std::chrono::steady_clock::time_point start;
+    std::uint64_t bytes;
+    bool walked = false;
+    ~WalkNote() {
+        if (depth == 0 || !walked) return;
+        const auto caller = std::min<std::size_t>(WalkCallerSlot::Get(), WalkCallers - 1);
+        const auto bucket = std::min<std::size_t>((depth & ~WalkItemFullBit) - 1, WalkDepthBuckets - 1);
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        walkCounts[caller][bucket].fetch_add(1, std::memory_order_relaxed);
+        walkNs[caller][bucket].fetch_add(ns, std::memory_order_relaxed);
+        walkBytes[caller][bucket].fetch_add(bytes, std::memory_order_relaxed);
+        if ((depth & WalkItemFullBit) != 0) walkFullNs[caller].fetch_add(ns, std::memory_order_relaxed);
+    }
+};
+std::uint32_t walkNoteDepth() {
+    return Q0PrepStats() != 0 ? WalkDepthSlot::Get() : 0u;
+}
+
 // Epoch coverage (APS5_DEBUG_COVERAGE=1, local experiment): the merged page ranges this thread walked in
 // its current epoch under one unwatch serial. A collect inside them is served like a memo hit.
 struct EpochCoverage {
@@ -1468,14 +1503,18 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (epochCoverageEnabled() && epochCovers(epoch, unwatched, first, stop)) {
             noteCollectMemoHit();
             if (missStatsEnabled()) ++threadMissStats().memoHits;
-            return tracker.generation.load(std::memory_order_relaxed);
+            // Acquire (here and on the two memo hits below): a caller that collects first and then
+            // checks pending writers must not have this load moved after those checks (a writer
+            // that published and stamped in between would pass both, COMMITTER-MAP 3.2 step 2).
+            // Free on x86; it only stops the compiler from reordering.
+            return tracker.generation.load(std::memory_order_acquire);
         }
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                 noteCollectMemoHit();
                 if (missStatsEnabled()) ++threadMissStats().memoHits;
-                return tracker.generation.load(std::memory_order_relaxed);
+                return tracker.generation.load(std::memory_order_acquire);
             }
         }
         for (const auto& entry : threadCollectMemo().entries) {
@@ -1485,7 +1524,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // make every later UnchangedSince fail until the epoch ends.
                 noteCollectMemoHit();
                 if (missStatsEnabled()) ++threadMissStats().memoHits;
-                return tracker.generation.load(std::memory_order_relaxed);
+                return tracker.generation.load(std::memory_order_acquire);
             }
         }
     }
@@ -1512,6 +1551,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const auto missStart = missKind >= 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto walkDepth = walkNoteDepth();
+    WalkNote walkNote{walkDepth, walkDepth != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}, stop - first};
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
@@ -1560,6 +1601,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             stop = end;
         }
     }
+    walkNote.walked = true;
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
 #ifdef _WIN32
         // Windows coverage does not know which pages of a block are committed or inaccessible, and a
@@ -2313,7 +2355,67 @@ void AssertGpuLockHeld(const char* where) {
     std::abort();
 }
 
+namespace {
+struct PrepareScopeTag {};
+using PrepareScopeSlot = HostThreadSlot<bool, PrepareScopeTag>;
+bool assertGpuLock() {
+    static const bool enabled = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
+    return enabled;
+}
+}
+
+PrepareScope::PrepareScope() : previous(PrepareScopeSlot::Get()) {
+    PrepareScopeSlot::Set(true);
+}
+
+PrepareScope::~PrepareScope() {
+    PrepareScopeSlot::Set(previous);
+}
+
+int Q0PrepStats() {
+    static const int level = [] {
+        const char* text = std::getenv("APS5_DEBUG_Q0_PREP_STATS");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value >= 3 ? 3 : value == 2 ? 2 : 1;
+    }();
+    return level;
+}
+
+WalkCallerScope::WalkCallerScope(WalkCaller caller) : previous(0), active(Q0PrepStats() != 0) {
+    if (!active) return;
+    previous = WalkCallerSlot::Get();
+    WalkCallerSlot::Set(static_cast<std::uint32_t>(caller));
+}
+
+WalkCallerScope::~WalkCallerScope() {
+    if (active) WalkCallerSlot::Set(previous);
+}
+
+void SetWalkItemDepth(std::uint32_t depthPlusOne, bool full) {
+    WalkDepthSlot::Set(depthPlusOne != 0 && full ? depthPlusOne | WalkItemFullBit : depthPlusOne);
+}
+
+WalkStats TakeWalkStats() {
+    WalkStats stats;
+    for (std::size_t caller = 0; caller < WalkCallers; ++caller) {
+        for (std::size_t bucket = 0; bucket < WalkDepthBuckets; ++bucket) {
+            stats.walks[caller][bucket] = walkCounts[caller][bucket].exchange(0, std::memory_order_relaxed);
+            stats.ns[caller][bucket] = walkNs[caller][bucket].exchange(0, std::memory_order_relaxed);
+            stats.bytes[caller][bucket] = walkBytes[caller][bucket].exchange(0, std::memory_order_relaxed);
+        }
+        stats.fullNs[caller] = walkFullNs[caller].exchange(0, std::memory_order_relaxed);
+    }
+    return stats;
+}
+
 void GpuMutexType::lock() {
+    // LOCAL EXPERIMENT (room-wait draw tickets): queue 0 never takes the mutex while it prepares
+    // a ticket (PrepareScope); under APS5_ASSERT_GPU_LOCK=1 doing so aborts here.
+    if (assertGpuLock() && PrepareScopeSlot::Get()) {
+        std::fprintf(stderr, "[lock] ASSERT: GuestMemory::GpuMutex taken inside a PrepareScope (queue 0 preparing a draw ticket) on thread tagged 0x%x\n", GpuLockThreadTag());
+        std::abort();
+    }
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {

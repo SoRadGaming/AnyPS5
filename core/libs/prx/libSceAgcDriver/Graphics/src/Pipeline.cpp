@@ -1238,6 +1238,31 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     return pipeline;
 }
 
+std::shared_ptr<Pipeline> CachedPipelineIfPresent(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool use) {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled) return nullptr;
+    auto& store = Pipelines();
+    struct PipelineKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::byte>, PipelineKeyStorage>();
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (key.empty()) return nullptr;
+    const auto hash = hashKey(key);
+    std::lock_guard lock(store.mutex);
+    const auto found = store.index.find(hash);
+    if (found == store.index.end()) return nullptr;
+    const auto it = found->second;
+    if (it->key != key || it->device != context.device) return nullptr;
+    // alive() without its side effects: an entry that does not track a pool yet is left alone, and
+    // the pool is compared by owner (no temporary strong reference on the preparing thread).
+    if (context.bufferPool != nullptr && (!it->tracksPool || it->pool.owner_before(context.bufferPool) || context.bufferPool.owner_before(it->pool))) return nullptr;
+    if (use) {
+        store.entries.splice(store.entries.end(), store.entries, it);
+        ++store.hits;
+        ++store.totals.hits;
+    }
+    return it->pipeline;
+}
+
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
 }

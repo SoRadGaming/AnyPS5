@@ -36,7 +36,33 @@ public:
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, room-wait draw tickets): work the producer does
+    // for the item it enqueues (Enqueue's optional `prepare`) while the committer works through the
+    // queue, before the push. When Enqueue finds at least `pre` items queued and the producer does
+    // not hold GuestMemory::GpuMutex, it drops the pipeline mutex, runs `run` inside a
+    // GuestMemory::PrepareScope (the queue may only shrink meanwhile), takes the mutex
+    // again, rethrows a committer failure and re-checks closing (an inline commit then), and only
+    // then waits for room and pushes as before; otherwise it calls `skipped` (under the pipeline
+    // mutex, to count) and enqueues at once. The push under the mutex publishes what `run` wrote
+    // into the item to the committer, which takes the front under the same mutex.
+    struct PrepareBudget {
+        const DrawPipeline* pipeline = nullptr;
+        // Items queued when Enqueue looked, and whether that was a full pipeline.
+        std::size_t depth = 0;
+        bool full = false;
+        std::size_t bail = 0;
+        // Whether to stop between parts: the committer is close to running dry.
+        bool Stop() const { return pipeline->Outstanding() <= bail; }
+    };
+    enum class PrepareSkip : std::uint8_t { Shallow, Locked };
+    struct Prepare {
+        void* self = nullptr;
+        void (*run)(void* self, const PrepareBudget& budget) = nullptr;
+        void (*skipped)(void* self, PrepareSkip why) = nullptr;
+        std::size_t pre = 0;
+        std::size_t bail = 0;
+    };
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -72,6 +98,23 @@ public:
     // registered: the caller then enqueues the label as an item of its own. Like Enqueue, it first
     // rethrows the failure of an earlier commit.
     bool AppendLabel(LabelPart& label);
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): what queue 0's enqueues found, for the [q0prep] line:
+    // the queue depth each draw was enqueued behind (index = depth, the last bucket holds deeper
+    // ones), the draws enqueued at full depth (PrepareBudget::full's own test, counted apart since
+    // Depth() may exceed the last bucket), and the time draws and labels waited for room.
+    // TakePrepStats returns the counts since the last call and resets them.
+    static constexpr std::size_t PrepDepthBuckets = 10;
+    struct PrepStats {
+        std::array<std::uint64_t, PrepDepthBuckets> drawDepths{};
+        std::uint64_t draws = 0;
+        std::uint64_t fullDraws = 0;
+        std::uint64_t drawWaits = 0;
+        std::uint64_t drawWaitNs = 0;
+        std::uint64_t labels = 0;
+        std::uint64_t labelWaits = 0;
+        std::uint64_t labelWaitNs = 0;
+    };
+    PrepStats TakePrepStats();
 
 private:
     struct Item {
@@ -83,6 +126,10 @@ private:
         // Appended labels, in the order they were queued; only the producer adds them, under the
         // mutex and only while the item is not the front, so the committer reads them unlocked.
         std::vector<LabelPart> labels;
+        // The queue depth the item was enqueued behind, and whether that was a full pipeline
+        // (APS5_DEBUG_Q0_PREP_STATS attribution).
+        std::uint32_t enqueueDepth = 0;
+        bool full = false;
     };
     struct CommitRun;
     DrawPipeline() = default;
@@ -128,6 +175,7 @@ private:
     std::uint64_t runCommits = 0;
     std::atomic<LabelCommit> labelCommit{nullptr};
     std::uint64_t labelsAppended = 0;
+    PrepStats prepStats;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

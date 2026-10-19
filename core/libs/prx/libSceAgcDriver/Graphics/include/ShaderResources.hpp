@@ -9,6 +9,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -207,7 +208,45 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3, COMMITTER-SPLIT-PLAN S0): what a draw's ticket
+    // offers PrepareDrawBindings' small-slice path: the ranges queue 0 collected (in a full
+    // pipeline wait, with the generation each collect returned) and the pending, allocation and
+    // forget serials it read after them. The slice path only counts how often a re-check of them
+    // would have passed (TicketEvent); it changes nothing.
+    struct TicketSlice {
+        std::uint64_t begin = 0;
+        std::size_t bytes = 0;
+        std::uint64_t generation = 0;
+    };
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS, COMMITTER-SPLIT-PLAN Q2b): a moved
+    // data-word buffer queue 0 made for a draw ticket on the ticket's template: the words of the
+    // stage binding it was made from (`words`, the closure-owned binding's own data, so equal
+    // pointers mean equal words) with that template's data patches. A shadow ticket carries the
+    // bytes only (no buffer).
+    struct TicketWordBuffer {
+        std::size_t allocation = 0;
+        const std::uint32_t* words = nullptr;
+        std::size_t size = 0;
+        std::shared_ptr<Buffer> buffer;
+        std::vector<std::byte> bytes;
+    };
+    struct TicketBindings {
+        // Whether `slices` and the serials are a byte shadow (an empty list then means nothing
+        // was predicted).
+        bool byteShadow = false;
+        std::span<const TicketSlice> slices;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t allocations = 0;
+        std::uint64_t forgetSerial = 0;
+        // Offered only when the draw binds the ticket's template. PrepareDrawBindings binds an entry
+        // whose allocation, word pointer and size equal the moved buffer's instead of making or
+        // reusing one; `verifyWords` also compares its bytes with today's (a difference aborts),
+        // `shadowWords` runs today's path and only compares.
+        std::span<const TicketWordBuffer> words;
+        bool verifyWords = false;
+        bool shadowWords = false;
+    };
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const TicketBindings* ticket = nullptr) const;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_REPLAY_INPUTS, COMMITTER-PLAN S6): what the checks of
     // MovedReadOnlyBuffers that depend only on the shader words and this object made of the words
     // of one caller's last call (a draw recipe's replays): the words, in the order the checks read
@@ -231,10 +270,34 @@ public:
         std::vector<std::uint32_t> words;
         bool refused = false;
         std::vector<Candidate> candidates;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): a memo PlanMovedWords built for these
+        // exact stages (a draw ticket's, made by queue 0 from the stages its draw's closure owns):
+        // a call with the same stages (pointer and count) skips the word compare, since the words
+        // are those very objects. A rebuild clears it.
+        const CompiledShader* builtFor = nullptr;
+        std::size_t builtCount = 0;
     };
-    // With `memo` (a recipe's, see DrawReplayInputs) the word compares are taken from it when the
-    // words repeat; the answer is the same as without it.
+    // With `memo` (a recipe's, see DrawReplayInputs, or a draw ticket's) the word compares are
+    // taken from it when the words repeat; the answer is the same as without it.
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, MovedWordsMemo* memo = nullptr) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): fills `memo` as MovedReadOnlyBuffers' rebuild
+    // does (the checks that depend only on the shader words and this object's build-fixed data),
+    // without the checks against memory and recorded work, and ties it to `shaders`. Queue 0 calls
+    // it off the GPU mutex on a cached draw template: it reads nothing a draw changes after the build.
+    void PlanMovedWords(std::span<const CompiledShader> shaders, MovedWordsMemo& memo) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): the bytes PrepareDrawBindings writes into
+    // a moved data-word buffer of `allocation`: the words, then this object's data patches.
+    void MovedWordBytes(std::size_t allocation, std::span<const std::uint32_t> words, std::size_t size, std::span<std::byte> out) const;
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the small-slice ranges a draw binding this object
+    // could read through PrepareDrawBindings' slice path, from build-fixed data and the memo's
+    // moved candidates only (no check against memory or recorded work, so a superset), for
+    // queue 0's byte shadow.
+    void PredictDrawSlices(const MovedWordsMemo& memo, std::vector<std::pair<std::uint64_t, std::size_t>>& ranges) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): whether the resource cache dropped this object
+    // from its index (replaced, evicted, removed, cleared); set under the cache's mutex and never
+    // cleared, since a dropped object is never inserted again (both insert sites take fresh builds).
+    // While false, the cache still maps the key this object was found under to it.
+    bool Uncached() const { return uncached.load(std::memory_order_acquire); }
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
@@ -367,6 +430,8 @@ public:
 
 private:
     friend class AgcDriver::VulkanDevice;
+    friend class ResourceCache;
+    void markUncached() { uncached.store(true, std::memory_order_release); }
     // MovedReadOnlyBuffers' walk: the checks that depend only on the shader words and this object,
     // with every element to move handed to `accept` in order (false refuses the whole move, as a
     // failed check against memory does). False when a check refused.
@@ -707,6 +772,8 @@ private:
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool completed = false;
+    // See Uncached().
+    std::atomic<bool> uncached{false};
     std::chrono::steady_clock::time_point phaseStart;
 };
 
@@ -729,6 +796,13 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): queue 0's template hint for a draw ticket. A
+    // hit does exactly what Find does (LRU, use and Find statistics), so the committer, which then
+    // takes the hint without a Find, leaves them as one lookup per draw; a miss changes nothing (the
+    // committer's own Find counts it). Probe looks up without touching the LRU or any statistic
+    // (shadow tickets, verification).
+    std::shared_ptr<ShaderResources> FindHint(const Key& key);
+    std::shared_ptr<ShaderResources> Probe(const Key& key) const;
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

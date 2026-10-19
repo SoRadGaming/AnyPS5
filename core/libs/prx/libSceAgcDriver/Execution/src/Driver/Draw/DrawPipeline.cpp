@@ -156,7 +156,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_REPORT") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -164,6 +164,43 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         lock.unlock();
         commit();
         return;
+    }
+    // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the depth this item is enqueued behind and its room
+    // wait, for the [q0prep] line; the depth also rides with the item for the committer's walks.
+    // Full depth is its own count (and the budget's flag), as Depth() may exceed the last bucket.
+    const auto enqueueDepth = items.size();
+    const bool full = enqueueDepth >= Depth();
+    const bool prepStatsOn = GuestMemory::Q0PrepStats() != 0;
+    if (prepStatsOn && kind == ItemKind::Draw) {
+        ++prepStats.draws;
+        ++prepStats.drawDepths[std::min(enqueueDepth, PrepDepthBuckets - 1)];
+        if (full) ++prepStats.fullDraws;
+    } else if (prepStatsOn && kind == ItemKind::Label) {
+        ++prepStats.labels;
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): the producer's preparation (see Prepare), only
+    // when the queue is deep enough for the committer to stay busy meanwhile and never while the
+    // producer holds the GPU mutex.
+    if (prepare != nullptr && prepare->run != nullptr) {
+        if (enqueueDepth < prepare->pre) {
+            if (prepare->skipped != nullptr) prepare->skipped(prepare->self, PrepareSkip::Shallow);
+        } else if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            if (prepare->skipped != nullptr) prepare->skipped(prepare->self, PrepareSkip::Locked);
+        } else {
+            const PrepareBudget budget{this, enqueueDepth, full, prepare->bail};
+            lock.unlock();
+            {
+                const GuestMemory::PrepareScope scope;
+                prepare->run(prepare->self, budget);
+            }
+            lock.lock();
+            rethrowFailure();
+            if (closing) {
+                lock.unlock();
+                commit();
+                return;
+            }
+        }
     }
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
@@ -183,12 +220,20 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             room.wait(lock, [&] { return items.size() < Depth(); });
             --roomWaiters;
         }
-        fullWaitNs += elapsedNs(start);
+        const auto waitedNs = elapsedNs(start);
+        fullWaitNs += waitedNs;
+        if (prepStatsOn && kind == ItemKind::Draw) {
+            ++prepStats.drawWaits;
+            prepStats.drawWaitNs += waitedNs;
+        } else if (prepStatsOn && kind == ItemKind::Label) {
+            ++prepStats.labelWaits;
+            prepStats.labelWaitNs += waitedNs;
+        }
         rethrowFailure();
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -237,6 +282,11 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     drainWaitNs = {};
 }
 
+DrawPipeline::PrepStats DrawPipeline::TakePrepStats() {
+    std::lock_guard lock(mutex);
+    return std::exchange(prepStats, PrepStats{});
+}
+
 void DrawPipeline::run() {
     StartCommitterSampler();
     PerformanceTrace::BindThread("draw committer");
@@ -264,6 +314,17 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
     auto outcome = guarded([&] {
         if (front == nullptr) return;
         PerformanceTimer itemTiming("Committer.Item");
+        // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the committer's walks inside a draw's commit are
+        // filed under the depth the draw was enqueued behind.
+        struct ItemDepth {
+            bool set;
+            explicit ItemDepth(const Item& item) : set(GuestMemory::Q0PrepStats() != 0 && item.kind == ItemKind::Draw) {
+                if (set) GuestMemory::SetWalkItemDepth(item.enqueueDepth + 1, item.full);
+            }
+            ~ItemDepth() {
+                if (set) GuestMemory::SetWalkItemDepth(0);
+            }
+        } itemDepth{*front};
         if (front->labels.empty()) {
             front->commit();
             return;

@@ -15,6 +15,7 @@
 namespace AgcDriver::Graphics {
 
 struct HostImport;
+struct DrawTicket;
 
 struct PreparedDraw {
     std::shared_ptr<const VertexInputLayout> vertexInput;
@@ -29,8 +30,18 @@ std::shared_ptr<const PreparedDraw> PrepareDraw(const Context& context, const St
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
-// APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const PreparedDraw* prepared = nullptr);
+// APS5_NO_DRAW_RECIPE=1). `ticket` (LOCAL EXPERIMENT, APS5_EXPERIMENT_Q0_TICKET, see DrawTicket.hpp):
+// what queue 0 prepared for this pipelined draw; null runs today's code.
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const PreparedDraw* prepared = nullptr, DrawTicket* ticket = nullptr);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): queue 0's Q1 parts of a direct, non-empty draw's
+// ticket, from the draw's closure objects and a context without a recorder: the stencil-replay,
+// parameter and alias checks Draw would run (each part only when all its checks passed) and the
+// color targets' layouts and resident surfaces.
+void FillDrawTicketChecks(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): queue 0's Q2 parts: the content key, the
+// template hint (FindHint, or Probe for a shadow ticket) and, with a hint, its moved-candidate
+// memo, the push block and the store's pipeline (CachedPipelineIfPresent, lookup only).
+void FillDrawTicketTemplate(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const PreparedDraw* prepared);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 
