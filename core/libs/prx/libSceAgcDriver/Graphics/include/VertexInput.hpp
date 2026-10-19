@@ -290,6 +290,12 @@ struct VertexCopyPlan {
     std::vector<std::size_t> copyOf;
     std::vector<std::uint64_t> offsets;
     std::vector<std::uint32_t> alignments;
+    // Per copy, how far its buffer must reach so that every binding into it covers whole strides:
+    // under robustBufferAccess a vertex whose attribute ends past the binding's range rounded down to
+    // the stride reads zeros, and a copy that ends at its last attribute's last byte cuts the last
+    // vertex off for every binding at a nonzero offset (or whose format is narrower than the stride).
+    // Bytes past the copy's end are zero, not read from guest memory.
+    std::vector<std::uint64_t> paddedEnds;
 };
 
 // The part of a draw's vertex input that only depends on its attributes, its vertex and instance
@@ -332,10 +338,14 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
             lead = i;
             plan.copies.emplace_back(fetch.begin, fetch.end);
             plan.alignments.push_back(fetch.alignment);
+            plan.paddedEnds.push_back(fetch.end);
         }
         plan.alignments.back() = std::max(plan.alignments.back(), fetch.alignment);
         auto& copy = plan.copies.back();
         copy.second = std::max(copy.second, fetch.end);
+        const auto span = fetch.end - fetch.begin;
+        const auto whole = fetch.stride == 0 ? span : (span + fetch.stride - 1) / fetch.stride * fetch.stride;
+        plan.paddedEnds.back() = std::max({plan.paddedEnds.back(), copy.second, fetch.begin + whole});
         plan.copyOf[i] = plan.copies.size() - 1;
         plan.offsets[i] = fetch.begin - copy.first;
     }

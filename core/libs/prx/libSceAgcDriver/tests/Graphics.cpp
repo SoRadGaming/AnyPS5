@@ -9077,7 +9077,7 @@ void vertexOverhangTests() {
     {
         const auto copy = CopyZeroPaddedDrawInput(rebarMockContext(), address, readable + overhang, readable + overhang, stride);
         const auto bytes = copy.buffer->Bytes();
-        Require(bytes.size() == readable + overhang, "an overhanging vertex fetch changed its size");
+        Require(bytes.size() == (readable + overhang + stride - 1) / stride * stride, "an overhanging vertex fetch is not padded to whole strides");
         Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(readable), [](std::byte value) { return value == std::byte{0x7a}; }), "an overhanging vertex fetch did not copy the readable bytes");
         Require(std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(readable), bytes.end(), [](std::byte value) { return value == std::byte{0}; }), "an overhanging vertex fetch did not zero its last record");
     }
@@ -9096,6 +9096,15 @@ void vertexZeroFillMergeTests() {
     using AgcDriver::Graphics::VertexFetch;
     const std::vector<VertexFetch> fetches{{0x1000u, 0x1000u + 88u, 24u, 0u, 4u}, {0x1010u, 0x1010u + 80u, 24u, 0u, 4u}};
     Require(PlanVertexCopies(fetches).copies.size() == 1, "interleaved attributes share one vertex copy");
+    {
+        // Two interleaved attributes (position at 0, 8 bytes; UV at 8, 8 bytes; stride 16) of a
+        // three-vertex draw: the copy holds 48 guest bytes, and its buffer must reach 56 bytes so
+        // the UV binding at offset 8 still covers three whole strides under robustBufferAccess.
+        const std::vector<AgcDriver::Graphics::VertexFetch> interleaved{{0x1000, 0x1000 + 2 * 16 + 8, 16, 0, 4}, {0x1008, 0x1008 + 2 * 16 + 8, 16, 0, 4}};
+        const auto plan = PlanVertexCopies(interleaved);
+        Require(plan.copies.size() == 1 && plan.copies[0].second - plan.copies[0].first == 48, "interleaved attributes do not share one 48-byte copy");
+        Require(plan.paddedEnds.size() == 1 && plan.paddedEnds[0] - plan.copies[0].first == 56 && plan.paddedEnds[0] - 0x1008 >= 3 * 16 && plan.paddedEnds[0] - 0x1000 >= 3 * 16, "a vertex copy is not padded to whole strides for every binding");
+    }
     Require(SoloZeroPaddedFetchIndices(fetches, {88u, 80u}).empty(), "fully valid fetches share the straight copy");
     const auto solo = SoloZeroPaddedFetchIndices(fetches, {88u, 72u});
     Require(solo.size() == 1 && solo[0] == 1, "a fetch past the records is copied alone");

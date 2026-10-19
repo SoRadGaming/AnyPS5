@@ -36,12 +36,16 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
+    // The guest bytes the copy holds (its buffer can be larger, zero-padded); 0 = the buffer's size.
+    std::size_t bytes = 0;
     bool reused = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
 };
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
+// `bufferBytes` (when larger than `bytes`) sizes the buffer for whole-stride vertex bindings: the bytes
+// past `bytes` are zero, not read from guest memory.
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t bufferBytes = 0);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr);
