@@ -1164,14 +1164,18 @@ void NoteBufferHeapSpill(const Context& context, VkMemoryPropertyFlags propertie
     if (count <= 5 || (count & (count - 1)) == 0) AgcDriver::ProfilePrint_nid_no_patch("[draw-inputs] budget spill: a buffer asking for properties 0x%x (%llu bytes) got memory type %u on heap %u%s, its first heap being over its VK_EXT_memory_budget budget; %llu such buffers, %.1f MiB\n", static_cast<unsigned>(properties), static_cast<unsigned long long>(bytes), type, typeHeap(context, type), deviceLocalType(context, type) ? " (device-local)" : "", static_cast<unsigned long long>(count), static_cast<double>(total) / 1048576.0);
 }
 
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t bufferBytes) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
+    const auto allocated = std::max(bytes, bufferBytes);
     DrawInputCopy copy;
+    copy.bytes = bytes;
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        // A kept copy made for narrower bindings lacks the padding this draw needs.
+        if (copy.buffer != nullptr && copy.buffer->Bytes().size() < allocated) copy.buffer.reset();
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
@@ -1179,9 +1183,11 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     }
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): the copy is made in ReBAR VRAM; the CPU
     // only writes it (the reads of an index copy go to the guest range, see prepareDrawInputs).
-    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, DrawInputCopyProperties());
-    if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, use == Recorder::SnapshotUse::Vertex ? DrawInputSite::VertexCopy : DrawInputSite::IndexCopy, *copy.buffer, bytes);
-    GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    copy.buffer = std::make_shared<Buffer>(context, allocated, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, DrawInputCopyProperties());
+    if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, use == Recorder::SnapshotUse::Vertex ? DrawInputSite::VertexCopy : DrawInputSite::IndexCopy, *copy.buffer, allocated);
+    const auto span = copy.buffer->Bytes();
+    GuestMemory::Read(address, span.subspan(0, bytes), alignment);
+    std::fill(span.begin() + static_cast<std::ptrdiff_t>(bytes), span.end(), std::byte{0});
     return copy;
 }
 
@@ -1189,9 +1195,12 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
     GuestMemory::FlushGpuWrites(address, bytes);
     DrawInputCopy copy;
+    // Bound at offset 0: the buffer covers whole strides, so the last vertex is in range under
+    // robustBufferAccess (see VertexCopyPlan::paddedEnds); the padding reads as zeros.
+    const auto allocated = stride == 0 ? bytes : (bytes + stride - 1) / stride * stride;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1): in ReBAR VRAM; the CPU only writes it.
-    copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, DrawInputCopyProperties());
-    if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, DrawInputSite::SoloCopy, *copy.buffer, bytes);
+    copy.buffer = std::make_shared<Buffer>(context, allocated, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, DrawInputCopyProperties());
+    if (DebugDrawInputBytes()) NoteDrawInputBuffer(context, DrawInputSite::SoloCopy, *copy.buffer, allocated);
     const auto span = copy.buffer->Bytes();
     auto readable = validBytes;
     if (stride != 0 && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), validBytes)) {
@@ -1206,7 +1215,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
 
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
     if (recorder == nullptr || copy.reused || copy.generation == 0 || copy.buffer == nullptr) return;
-    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
+    recorder->KeepDrawSnapshot(address, copy.bytes != 0 ? copy.bytes : copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
@@ -1431,7 +1440,7 @@ bool sameFetches(std::span<const VertexFetch> first, std::span<const VertexFetch
 }
 
 bool sameFetchPlan(const VertexFetchPlan& first, const VertexFetchPlan& second) {
-    return first.zero == second.zero && first.zeroBytes == second.zeroBytes && first.fetchOf == second.fetchOf && sameFetches(first.fetches, second.fetches) && first.fetchValid == second.fetchValid && first.soloFetches == second.soloFetches && first.isSolo == second.isSolo && sameFetches(first.plannedFetches, second.plannedFetches) && first.plannedOf == second.plannedOf && first.copies.copies == second.copies.copies && first.copies.copyOf == second.copies.copyOf && first.copies.offsets == second.copies.offsets && first.copies.alignments == second.copies.alignments;
+    return first.zero == second.zero && first.zeroBytes == second.zeroBytes && first.fetchOf == second.fetchOf && sameFetches(first.fetches, second.fetches) && first.fetchValid == second.fetchValid && first.soloFetches == second.soloFetches && first.isSolo == second.isSolo && sameFetches(first.plannedFetches, second.plannedFetches) && first.plannedOf == second.plannedOf && first.copies.copies == second.copies.copies && first.copies.copyOf == second.copies.copyOf && first.copies.offsets == second.copies.offsets && first.copies.alignments == second.copies.alignments && first.copies.paddedEnds == second.copies.paddedEnds;
 }
 
 // A zero vertex buffer of `bytes` for a replay: the recipe's while a batch still keeps it, else a
@@ -1686,7 +1695,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, static_cast<std::size_t>(plan.paddedEnds[range] - begin));
         if (DebugDrawInputBytes()) CountDrawInputBytes(copy.reused ? DrawInputBytes::VertexReused : DrawInputBytes::VertexCopied, bytes);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());
