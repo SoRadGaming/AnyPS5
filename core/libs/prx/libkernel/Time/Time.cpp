@@ -97,7 +97,9 @@ static const std::uint64_t g_processStart = GetStartNanos();
 // GPU driver's poll sleeps) rounds up to the scheduler tick, 15.6 ms by default; a console game and
 // its driver hand labels between queues dozens of times per frame, so the tick is raised to 0.5 ms at
 // load, and Windows 11 is told not to drop it while the window is unfocused. APS5_NO_TIMER_RESOLUTION=1
-// keeps the default for comparison.
+// keeps the default for comparison. Windows 11 also runs an unfocused or occluded window's process at
+// efficiency QoS (EcoQoS), which is opted out of as well;
+// APS5_ALLOW_POWER_THROTTLING=1 leaves it to Windows.
 static const bool g_timerResolutionRaised = [] {
     if (std::getenv("APS5_NO_TIMER_RESOLUTION") != nullptr) return false;
     using NtSetTimerResolutionFn = LONG(WINAPI*)(ULONG, BOOLEAN, PULONG);
@@ -108,6 +110,7 @@ static const bool g_timerResolutionRaised = [] {
     PROCESS_POWER_THROTTLING_STATE throttling{};
     throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
     throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    if (std::getenv("APS5_ALLOW_POWER_THROTTLING") == nullptr) throttling.ControlMask |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
     throttling.StateMask = 0;
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
     using NtQueryTimerResolutionFn = LONG(WINAPI*)(PULONG, PULONG, PULONG);
