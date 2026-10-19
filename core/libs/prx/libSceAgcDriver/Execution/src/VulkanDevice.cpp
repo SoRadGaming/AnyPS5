@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LoadingSplash.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationPass.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -416,6 +417,16 @@ struct VulkanDevice::State {
     std::unique_ptr<PresentationScaler> scaler;
     std::unique_ptr<PresentationPass> presentation;
     std::unique_ptr<PerformanceOverlay> overlay;
+    // APS5_LOADING_SPLASH (LoadingSplash.hpp): the picture's scaler (its source image holds the
+    // picture once uploaded), the upload buffer and the panel. They are released once every slot
+    // that could still read them retired (`splashIdle` counts the presents since the splash last
+    // drew). `swapchainReadable`: the swapchain images were made with TRANSFER_SRC for the probe.
+    std::unique_ptr<PresentationScaler> splashScaler;
+    std::unique_ptr<Graphics::Buffer> splashUpload;
+    std::unique_ptr<PerformanceOverlay> splashPanel;
+    bool splashUploaded = false;
+    bool swapchainReadable = false;
+    std::size_t splashIdle = 0;
     VkFormat surfaceFormat = VK_FORMAT_B8G8R8A8_UNORM;
     VkColorSpaceKHR surfaceColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     bool swapchainColorSpaces = false;
@@ -444,6 +455,10 @@ struct VulkanDevice::State {
         std::uint32_t dumpScale = 1;
         bool dumpRecorded = false;
         int dumpIndex = 0;
+        // APS5_LOADING_SPLASH: the probe texels of the presented frame, classified when the slot retires.
+        std::unique_ptr<Graphics::Buffer> probeBuffer;
+        VkFormat probeFormat = VK_FORMAT_UNDEFINED;
+        bool probeRecorded = false;
         std::uint32_t imageIndex = 0;
         bool inFlight = false;
         // The blit reads the single scaler source, staging or upload objects (not a direct blit
@@ -614,6 +629,11 @@ struct VulkanDevice::State {
             slot.dumpRecorded = false;
             WriteFrameDump(slot);
         }
+        if (slot.probeRecorded) {
+            slot.probeRecorded = false;
+            LoadingSplash::NoteProbe(slot.probeBuffer->Bytes(), slot.probeFormat);
+        }
+        if (slot.probeBuffer != nullptr && !LoadingSplash::Showing()) slot.probeBuffer.reset();
         if (slot.queries != VK_NULL_HANDLE) {
             std::uint64_t stamps[2] = {};
             if (DeviceFunction<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(device, slot.queries, 0, 2, sizeof(stamps), stamps, sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0]) {
@@ -1986,6 +2006,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         swapchain.imageExtent = state->extent;
         swapchain.imageArrayLayers = 1;
         swapchain.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        state->swapchainReadable = LoadingSplash::Showing() && (surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0 && LoadingSplash::ProbeTexelBytes(state->surfaceFormat) != 0;
+        if (state->swapchainReadable) swapchain.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2760,6 +2782,8 @@ void VulkanDevice::recreateSwapchain(std::uint32_t width, std::uint32_t height, 
     create.imageExtent = {width, height};
     create.imageArrayLayers = 1;
     create.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    const bool readable = LoadingSplash::Showing() && (surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0 && LoadingSplash::ProbeTexelBytes(state->surfaceFormat) != 0;
+    if (readable) create.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2768,6 +2792,7 @@ void VulkanDevice::recreateSwapchain(std::uint32_t width, std::uint32_t height, 
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
     VkSwapchainKHR replacement = VK_NULL_HANDLE;
     check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &create, nullptr, &replacement), "vkCreateSwapchainKHR resize");
+    state->swapchainReadable = readable;
     state->retiredSwapchains.push_back({state->swapchain, std::move(state->rendered)});
     state->swapchain = replacement;
     state->extent = create.imageExtent;
@@ -3215,6 +3240,18 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     auto& slot = state->presentSlots[state->presentCursor];
     require(!slot.inFlight, "presentation slot is still in flight");
     const bool overlay = PerformanceOverlay::Visible();
+    // APS5_LOADING_SPLASH: a game frame is covered only when it can be probed (the probe is what ends
+    // the splash). Once it ended, its objects go when the last slot that drew it was reused.
+    bool splashing = LoadingSplash::Showing();
+    if (splashing && !clearOnly && !state->swapchainReadable) {
+        LoadingSplash::Finish("the swapchain images cannot be read back");
+        splashing = false;
+    }
+    if (!splashing && (state->splashScaler != nullptr || state->splashPanel != nullptr) && ++state->splashIdle >= state->presentSlots.size()) {
+        state->splashScaler.reset();
+        state->splashUpload.reset();
+        state->splashPanel.reset();
+    }
     if (display != nullptr && resident == nullptr) {
         static_cast<void>(DisplayBufferSize(*display));
         state->colorTransfer->Upload(display->address, width, height, Graphics::ColorTileMode::RenderTarget, DisplayTexelBytes(display->pixelFormat));
@@ -3306,7 +3343,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         }
         if (drawn) {
             state->presentation->Bind(slotIndex, resident->Image(), width, height, display->pixelFormat, whiteNits, residentLayer);
-            state->presentation->RecordPresent(commands, slotIndex, barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, overlay ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+            state->presentation->RecordPresent(commands, slotIndex, barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, overlay || splashing ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         } else {
             scaler->RecordLetterbox(commands, width, height, barrier.image, state->extent.width, state->extent.height);
             if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height, residentLayer);
@@ -3344,11 +3381,73 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
         }
     }
+    // APS5_LOADING_SPLASH (LoadingSplash.hpp): the game's frame is sampled for the probe, then covered
+    // with the title's picture and the loading panel. The cover is decided before this frame's probe
+    // is read back, so the first frame with content can be covered once.
+    bool probed = false;
+    if (splashing) {
+        const auto slotIndex = static_cast<std::size_t>(&slot - state->presentSlots.data());
+        VkImageMemoryBarrier toTransfer = barrier;
+        VkPipelineStageFlags written = drawn ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+        toTransfer.srcAccessMask = drawn ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+        toTransfer.oldLayout = drawn ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        if (!clearOnly) {
+            const auto texelBytes = LoadingSplash::ProbeTexelBytes(state->surfaceFormat);
+            const auto probeBytes = static_cast<std::size_t>(LoadingSplash::ProbeSamples) * texelBytes;
+            if (!slot.probeBuffer || slot.probeBuffer->Bytes().size() != probeBytes) slot.probeBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), probeBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            pipelineBarrier(commands, written, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+            std::array<VkBufferImageCopy, LoadingSplash::ProbeSamples> regions{};
+            for (std::uint32_t i = 0; i < LoadingSplash::ProbeSamples; ++i) {
+                regions[i].bufferOffset = static_cast<VkDeviceSize>(i) * texelBytes;
+                regions[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                regions[i].imageOffset = LoadingSplash::ProbeOffset(i, state->extent);
+                regions[i].imageExtent = {1u, 1u, 1u};
+            }
+            state->DeviceFunction<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, barrier.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.probeBuffer->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+            Graphics::RecordMemoryBarrier(graphicsContext(), commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            probed = true;
+            written = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            toTransfer.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toTransfer.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        }
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        pipelineBarrier(commands, written, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+        Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
+        // The picture is in sRGB: an sRGB swapchain gets an sRGB source so the blit keeps its values.
+        // An HDR10 swapchain shows the panel alone.
+        const auto picture = passthrough ? LoadingSplash::Picture{} : LoadingSplash::CurrentPicture();
+        if (picture.rgba != nullptr && state->splashScaler == nullptr) {
+            const bool srgb = state->surfaceFormat == VK_FORMAT_B8G8R8A8_SRGB || state->surfaceFormat == VK_FORMAT_R8G8B8A8_SRGB || state->surfaceFormat == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+            state->splashScaler = std::make_unique<PresentationScaler>(graphicsContext(), srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, state->surfaceFormat);
+            state->splashScaler->EnsureSourceImage(picture.width, picture.height);
+            state->splashUpload = std::make_unique<Graphics::Buffer>(graphicsContext(), picture.rgba->size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            std::memcpy(state->splashUpload->Bytes().data(), picture.rgba->data(), picture.rgba->size());
+            state->splashUploaded = false;
+        }
+        if (state->splashScaler != nullptr && !passthrough) {
+            if (!state->splashUploaded) {
+                state->splashScaler->RecordUpload(commands, state->splashUpload->Handle());
+                state->splashUploaded = true;
+            }
+            state->splashScaler->RecordLetterbox(commands, state->splashScaler->SourceWidth(), state->splashScaler->SourceHeight(), barrier.image, state->extent.width, state->extent.height);
+            state->splashScaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
+        } else {
+            VkClearColorValue black{};
+            black.float32[3] = 1.0f;
+            state->DeviceFunction<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, barrier.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &barrier.subresourceRange);
+        }
+        if (!state->splashPanel) state->splashPanel = std::make_unique<PerformanceOverlay>(graphicsContext(), state->presentSlots.size());
+        state->splashPanel->Record(commands, slotIndex, barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, overlay ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, LoadingSplash::Content(std::chrono::steady_clock::now()), OverlayCorner::BottomRight);
+        state->splashIdle = 0;
+    }
     if (overlay) {
         if (!state->overlay) state->overlay = std::make_unique<PerformanceOverlay>(graphicsContext(), state->presentSlots.size());
         state->overlay->NotePresent(std::chrono::steady_clock::now(), clearOnly ? VkExtent2D{} : VkExtent2D{width, height});
-        state->overlay->Record(commands, static_cast<std::size_t>(&slot - state->presentSlots.data()), barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, drawn ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    } else if (!drawn) {
+        state->overlay->Record(commands, static_cast<std::size_t>(&slot - state->presentSlots.data()), barrier.image, state->surfaceFormat, state->surfaceColorSpace, state->extent, splashing || !drawn ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    } else if (!drawn && !splashing) {
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = 0;
         barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -3382,6 +3481,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         // Only a submitted readback is written after the fence (a failed submit tears the device down).
         slot.dumpRecorded = dumpFrame;
         slot.dumpIndex = state->nextDumpIndex;
+        slot.probeRecorded = probed;
+        slot.probeFormat = state->surfaceFormat;
         slot.recorderSerial = batchesAtBlit;
         slot.previousSerial = state->lastPresentSerial;
         slot.submittedAt = submittedAt;

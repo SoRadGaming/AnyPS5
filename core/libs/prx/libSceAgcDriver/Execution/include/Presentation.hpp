@@ -3,6 +3,7 @@
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <span>
@@ -30,6 +31,10 @@ extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationW
 extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, void (*gpuReady)(void*), void* context);
 extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window);
 extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix();
+// APS5_LOADING_SPLASH (LoadingSplash.hpp): whether the loading splash still covers black frames, and
+// its picture (RGBA8 rows, copied).
+extern "C" bool AgcDriverLoadingSplashShowing_nid_postfix();
+extern "C" void AgcDriverSetLoadingSplashPicture_nid_postfix(std::uint32_t width, std::uint32_t height, const std::uint8_t* rgba, std::size_t bytes);
 extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error);
 
 #endif
