@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -132,7 +133,13 @@ ComparePool* sharedPool() {
 }
 
 unsigned CompareHelpers() {
-    static const unsigned helpers = std::clamp(std::thread::hardware_concurrency() / 8u, 1u, 4u);
+    // LOCAL EXPERIMENT (APS5_COMPARE_HELPERS=N, PARALLEL-COMMIT-PLAN B3a): the pool size, 1-15. The
+    // hub's large snapshot compares (17+ spans of 64 KiB blocks, >= 1 MiB) run on the pool while the
+    // committer drains its share and waits, ~3.4% of the committer at 2 helpers (16 logical processors / 8).
+    static const unsigned helpers = [] {
+        if (const char* text = std::getenv("APS5_COMPARE_HELPERS"); text != nullptr && text[0] != '\0') return std::clamp(static_cast<unsigned>(std::strtoul(text, nullptr, 10)), 1u, 15u);
+        return std::clamp(std::thread::hardware_concurrency() / 8u, 1u, 4u);
+    }();
     return helpers;
 }
 
