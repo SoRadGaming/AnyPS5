@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
 #include <functional>
@@ -247,6 +248,10 @@ void Driver::execute(const Submission& submission) {
             }
         }
         if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): with nothing queued, a packet that would drain a
+        // queued A1 dispatch item (a wait such as 0x3c, a GPU-path 0x16, a flip) cuts the open
+        // eligible drain episode (DrawPipeline::NoteWouldDrain).
+        if (pipelined && Stream::On() && DrawPipeline::Queue0().StreamCuttable() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().NoteWouldDrain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
@@ -374,7 +379,14 @@ void Driver::execute(const Submission& submission) {
             if (gateOpened()) {
                 gateOpened() = false;
                 if (!pipelineDispatch() || submission.queue != 0) {
-                    if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                    if (pipelined && DrawPipeline::Queue0().Busy()) {
+                        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): A1 skips this drain for queue 0, so the
+                        // episode it opens is named by the dispatch after it, and the writes it commits
+                        // are kept for that dispatch's reads test (it would face them). A 0x16 packet
+                        // drained at its own packet test above already, which A1 keeps.
+                        if (opcode == 0x15 && Stream::On()) DrawPipeline::Queue0().NoteGateDrain();
+                        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                    }
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
             }

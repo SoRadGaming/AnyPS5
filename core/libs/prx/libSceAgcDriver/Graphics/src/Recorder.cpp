@@ -3967,7 +3967,11 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        {
+            // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the wait on the thread's [stream] GPU-wait clock.
+            const Stream::GpuWaitScope streamWait;
+            result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        }
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -4108,6 +4112,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the same span on the thread's [stream] GPU-wait
+        // clock (Stream::ThreadGpuWait), which the drain episodes read on queue 0.
+        const Stream::GpuWaitScope streamWait;
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {

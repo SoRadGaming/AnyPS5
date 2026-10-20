@@ -9,6 +9,7 @@
 #endif
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -237,9 +238,22 @@ void ThreadSlots() {
 // must abort with a "[lock] ASSERT: ... inside a PrepareScope" line under APS5_ASSERT_GPU_LOCK=1
 // (ctest matches the line); without the switch both return and the run reports that, failing when
 // the switch was set. HostImportFor gets an empty context (no import support): past the assertion
-// it returns nullptr at once.
+// it returns nullptr at once. The abort must end the process with a plain exit code, or ctest calls
+// the run an exception and fails it without reading its output: on Windows the UCRT's report-fault
+// path is turned off (libc.prx's SIGABRT handler returns, and abort() would then fast-fail with
+// 0xc0000409 instead of exiting with 3), elsewhere a SIGABRT handler exits with 3.
+[[maybe_unused]] void ExitOnAbort(int) {
+    std::_Exit(3);
+}
+
 int PrepareScopeDeath(const char* mode) {
     const bool asserted = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#else
+    std::signal(SIGABRT, ExitOnAbort);
+#endif
     {
         const AgcDriver::GuestMemory::PrepareScope scope;
         if (std::strcmp(mode, "--prepare-scope-try-lock") == 0) {

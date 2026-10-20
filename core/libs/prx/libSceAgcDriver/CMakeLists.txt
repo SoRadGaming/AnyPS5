@@ -2458,8 +2458,11 @@ if(BUILD_TESTING)
             "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the
             # committed flag against std::uncaught_exceptions, including the failure run's throw;
-            # the scratch unsaved-layer list; a template's kept DeviceReads list against the walk).
-            "local_cuts|APS5_EXPERIMENT_LOCAL_CUTS=2")
+            # the scratch unsaved-layer list; a template's kept DeviceReads list against the walk),
+            # and used as the play build uses them (=2 computes each cut but runs today's answer, so
+            # only =1 runs the flag's return, the scratch list and the kept-list copy).
+            "local_cuts|APS5_EXPERIMENT_LOCAL_CUTS=2"
+            "local_cuts_on|APS5_EXPERIMENT_LOCAL_CUTS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
@@ -2509,8 +2512,10 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     # LOCAL DEBUG (APS5_ASSERT_GPU_LOCK, PARALLEL-COMMIT-PLAN S0): death tests. Inside a
-    # GuestMemory::PrepareScope a GpuMutex try_lock and a HostImportFor call abort with a [lock] line
-    # (matched; the exit code is ignored). The _unasserted runs check that both return without it.
+    # GuestMemory::PrepareScope a GpuMutex try_lock and a HostImportFor call abort with a [lock] line,
+    # which is matched. A nonzero exit code is then ignored, but only a plain one: ctest fails a run
+    # that ends in an exception (0xc0000409, a signal) without reading its output, so the test turns
+    # abort() into exit code 3 (PrepareScopeDeath). The _unasserted runs check that both return.
     set(prepareScopeTests)
     foreach(prepareScopeCase IN ITEMS try_lock host_import)
         string(REPLACE "_" "-" prepareScopeArgument "${prepareScopeCase}")

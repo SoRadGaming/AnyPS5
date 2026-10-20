@@ -60,19 +60,25 @@ void ReportDispatchItems(bool profile) {
 // With APS5_PIPELINE_DISPATCH off, every queue-0 dispatch (not a dispatch-ahead resolution) is
 // classified the way A1 would treat it (Stream::DispatchClass; the classes and their order are
 // documented there), once, and the drain episode its own drain opened is named after the class,
-// so the [stream] line gives each class the committer idle its drains caused. The reads-overlap
-// test runs against the queued writes copied before the drain (SnapshotWriters). Nothing changes
+// so the [stream] line gives each class the committer idle its drains caused; a later dispatch of
+// a class A1 drains for cuts an eligible episode there. The reads-overlap test runs against the
+// queued writes copied before the drain (SnapshotWriters, or before the gate drain when one came
+// first). The shadow's own work after the drain is timed (`workNs`, filed beside the idle it
+// lengthens), and a miss keeps the point A1 would drain at, before the lookup. Nothing changes
 // what the dispatch does.
 struct StreamShadow {
     bool on = false;
     bool classified = false;
     std::uint64_t episode = 0;
+    std::uint64_t workNs = 0;
+    DrawPipeline::StreamPoint drain;
 
     void Classify(Stream::DispatchClass value) {
         if (!on || classified) return;
         classified = true;
         Stream::Add(Stream::counters.dispatches[static_cast<std::size_t>(value)]);
-        DrawPipeline::Queue0().NoteDrainClass(episode, static_cast<std::uint8_t>(value));
+        if (workNs != 0) Stream::Add(Stream::counters.shadowNs, workNs);
+        DrawPipeline::Queue0().NoteDrainClass(episode, static_cast<std::uint8_t>(value), workNs, drain);
     }
 };
 
@@ -99,12 +105,14 @@ private:
 
 struct ShadowWritersTag {};
 
-// The first unbounded role found, in the order Gds, Fault, Pagetable, Bda, Image.
+// By what the shader can write, the widest first: Gds, Pagetable (stores through guest addresses;
+// a page table always comes with a fault buffer), FaultOnly (a fault buffer alone: rect-list
+// validation), Image. The Bda bit only repeats the fault buffer's (ShaderAddressResources'
+// contract), so it is a cross-check, not a class.
 Stream::DispatchClass unboundedClass(std::uint32_t roles) {
     if ((roles & DispatchUnbounded::Gds) != 0) return Stream::DispatchClass::UnboundedGds;
-    if ((roles & DispatchUnbounded::Fault) != 0) return Stream::DispatchClass::UnboundedFault;
     if ((roles & DispatchUnbounded::Pagetable) != 0) return Stream::DispatchClass::UnboundedPagetable;
-    if ((roles & DispatchUnbounded::Bda) != 0) return Stream::DispatchClass::UnboundedBda;
+    if ((roles & DispatchUnbounded::Fault) != 0) return Stream::DispatchClass::UnboundedFaultOnly;
     return Stream::DispatchClass::UnboundedImage;
 }
 
@@ -211,7 +219,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             else if (!deferredLabels().labels.empty()) shadowRefused = Stream::DispatchClass::Labels;
             else if (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) shadowRefused = Stream::DispatchClass::Copy;
             shadowCandidate = !shadowRefused.has_value();
-            if (shadowCandidate) shadowQueued = DrawPipeline::Queue0().SnapshotWriters(ThreadScratch<std::vector<DrawPipeline::QueuedWriter>, ShadowWritersTag>());
+            if (shadowCandidate) shadowQueued = DrawPipeline::Queue0().SnapshotWriters(ThreadScratch<std::vector<DrawPipeline::QueuedWriter>, ShadowWritersTag>(), shadow.episode);
         }
         if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         if (shadowRefused.has_value()) shadow.Classify(*shadowRefused);
@@ -354,23 +362,27 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
     // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the shadow of A1's cache and reads tests below (the
-    // same entry regions, against the writes queued before the drain): a miss, or the items queued
-    // behind the newest writer the reads overlap.
+    // same entry regions, against the writes queued before the drain): a miss (A1 drains it here,
+    // before its lookup), or the items queued behind the newest writer the reads overlap. The
+    // entry's regions are collected only when writes were queued.
     bool shadowMiss = false;
     std::optional<std::size_t> shadowBehind;
     if (shadowCandidate) {
+        const auto shadowStartNs = Stream::NowNs();
+        const auto& writers = ThreadScratch<std::vector<DrawPipeline::QueuedWriter>, ShadowWritersTag>();
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
         {
             std::lock_guard cacheLock(dispatchCacheMutex);
             if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
                 entryFound = true;
-                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+                if (!writers.empty()) {
+                    for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+                }
             }
         }
         shadowMiss = !entryFound || noDispatchCache || stampValidate() || verifyDataHits();
         if (!shadowMiss) {
-            const auto& writers = ThreadScratch<std::vector<DrawPipeline::QueuedWriter>, ShadowWritersTag>();
             std::optional<std::uint32_t> newest;
             for (const auto& region : reads) {
                 const auto end = region.guestAddress + region.bytes.size();
@@ -380,6 +392,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
             if (newest.has_value() && *newest < shadowQueued) shadowBehind = shadowQueued - 1 - *newest;
         }
+        const auto shadowEndNs = Stream::NowNs();
+        shadow.workNs += shadowEndNs - shadowStartNs;
+        if (shadowMiss) shadow.drain = {shadowEndNs, Stream::ThreadGpuWait::Get()};
     }
     bool readsClear = false;
     if (pipelineCandidate) {
@@ -425,23 +440,27 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     timing.Mark("lookup_cache");
     // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the candidate's class, in A1's order: a miss drains,
     // an unbounded hit drains, a bounded hit whose reads overlap drains through the newest writer,
-    // a bounded clear hit is an item with or without a recipe.
+    // a bounded clear hit is an item with or without a recipe. A miss found after the lookup, and an
+    // unbounded hit, drain here (StreamShadow::drain stays unset).
     if (shadowCandidate) {
-        if (shadowMiss || !cached || keepVariant == nullptr || compiledResult == nullptr) {
-            shadow.Classify(Stream::DispatchClass::Miss);
-        } else {
+        const auto classifyStartNs = Stream::NowNs();
+        auto shadowClass = Stream::DispatchClass::Miss;
+        if (!shadowMiss && cached && keepVariant != nullptr && compiledResult != nullptr) {
             bool bounded = false;
             std::uint32_t roles = 0;
             static_cast<void>(DispatchWriteRanges(*compiledResult, bounded, &roles));
+            if (((roles & DispatchUnbounded::Bda) != 0) != ((roles & DispatchUnbounded::Fault) != 0)) Stream::Add(Stream::counters.bdaRoleMismatches);
             if (!bounded) {
-                shadow.Classify(unboundedClass(roles));
+                shadowClass = unboundedClass(roles);
             } else if (shadowBehind.has_value()) {
                 Stream::Add(Stream::counters.readsBehind[Stream::BehindBucket(*shadowBehind)]);
-                shadow.Classify(Stream::DispatchClass::Reads);
+                shadowClass = Stream::DispatchClass::Reads;
             } else {
-                shadow.Classify(keepVariant->recipe.load(std::memory_order_acquire) != nullptr ? Stream::DispatchClass::Item : Stream::DispatchClass::NoRecipe);
+                shadowClass = keepVariant->recipe.load(std::memory_order_acquire) != nullptr ? Stream::DispatchClass::Item : Stream::DispatchClass::NoRecipe;
             }
         }
+        shadow.workNs += Stream::NowNs() - classifyStartNs;
+        shadow.Classify(shadowClass);
     }
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;

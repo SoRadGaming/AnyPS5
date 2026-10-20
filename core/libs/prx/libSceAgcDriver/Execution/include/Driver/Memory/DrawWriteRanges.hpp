@@ -13,7 +13,8 @@ namespace AgcDriver::DriverDetail {
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact);
 // `bounded` is false when the shader may write outside the returned ranges. LOCAL DEBUG
 // (APS5_DEBUG_STREAM_STATS, the [stream] dispatch classes): `unboundedRoles`, when given, receives
-// the DispatchUnbounded bits of every reason it found.
+// the DispatchUnbounded bits of every reason it found. Bda (a nonzero bdaAbiVersion) comes exactly
+// with Fault (a FaultBuffer binding), and Pagetable always with both (ShaderAddressResources).
 namespace DispatchUnbounded {
 constexpr std::uint32_t Gds = 1u;
 constexpr std::uint32_t Fault = 2u;

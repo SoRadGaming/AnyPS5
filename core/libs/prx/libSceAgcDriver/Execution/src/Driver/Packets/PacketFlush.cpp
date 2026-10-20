@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -54,6 +55,10 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     if (DrawPipeline::Active() && (submit || record || capped || recordAtLock)) {
         static const bool committerSubmits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
         if (committerSubmits && !record && !recordAtLock && DrawPipeline::Queue0().Busy()) return;
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): a flush that would drain a queued A1 dispatch item
+        // (one the committer's submit does not cover) cuts the open eligible drain episode; Drain
+        // leaves flushes to this call, as it cannot tell the two kinds apart.
+        if (Stream::On() && !(committerSubmits && !record && !recordAtLock)) DrawPipeline::Queue0().NoteWouldDrain(DrawPipeline::DrainReason::Flush, 0x100);
         DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Flush);
     }
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
