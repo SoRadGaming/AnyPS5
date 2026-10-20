@@ -928,6 +928,9 @@ private:
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_POOLS=1): resolved when the recorder makes its first
+    // batch pool (ensureOpen), never off the switch: the constructor resolves exactly today's entry
+    // points, which the mock device tables of the unit tests list.
     PFN_vkResetCommandPool resetCommandPool = nullptr;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {

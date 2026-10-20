@@ -208,13 +208,17 @@ bool QueueGate::onSubmitter() const {
 }
 
 void QueueGate::Seal(const Sealed& sealed) {
-    rethrowStored();
     if (sealed.serial <= sealedSerial.load(std::memory_order_relaxed)) violation(orderingViolations, "seal whose serial is not above the previous one's", Queue::Graphics, "Seal");
-    sealCount.fetch_add(1, std::memory_order_relaxed);
+    bool refused = false;
     bool issueHere = false;
     {
         std::lock_guard lock(fifoMutex);
-        if (!submitter.joinable()) {
+        // A stored failure refuses the seal. Checked under the FIFO's mutex, not before it: fail()
+        // clears the FIFO and sets `failed` under it, so a seal checked first could still be pushed
+        // behind that clear, then issued after the batches the failure dropped (moving the submitted
+        // serial past them) or, at =2, discarded by its sealer's throw while still queued.
+        refused = failed.load(std::memory_order_acquire);
+        if (!refused && !submitter.joinable()) {
             try {
                 submitter = std::thread([this] { runSubmitter(); });
                 // Counted here, not by the thread, so it holds once Seal returned.
@@ -224,7 +228,9 @@ void QueueGate::Seal(const Sealed& sealed) {
                 if (!reported.exchange(true)) std::fprintf(stderr, "[queue] the submit thread could not be started (%s); batches are submitted by their sealer\n", error.what());
             }
         }
-        if (submitter.joinable()) {
+        if (refused) {
+            // Nothing pushed, the sealed serial unchanged (the sealer discards the batch).
+        } else if (submitter.joinable()) {
             fifo.push_back(sealed);
             sealedSerial.store(sealed.serial, std::memory_order_release);
             if (sleeping) work.notify_one();
@@ -233,6 +239,8 @@ void QueueGate::Seal(const Sealed& sealed) {
             issueHere = true;
         }
     }
+    if (refused) throwStored();
+    sealCount.fetch_add(1, std::memory_order_relaxed);
     if (issueHere) {
         issue(sealed);
         rethrowStored();
@@ -246,6 +254,16 @@ void QueueGate::AwaitSubmitted(std::uint64_t serial) {
     if (!Threaded()) return;
     const auto target = std::min(serial, SealedSerial());
     if (!awaitSerial(target, false)) rethrowStored();
+}
+
+void QueueGate::AwaitIssued(const std::atomic<bool>& issued, std::uint64_t serial) {
+    if (!Threaded()) return;
+    AwaitSubmitted(serial);
+    // The flag is set before the submitted serial is (issue), so a serial seen reached shows it.
+    if (issued.load(std::memory_order_acquire)) return;
+    rethrowStored();
+    violation(orderingViolations, "batch awaited past its serial but never issued", Queue::Graphics, "AwaitSubmitted");
+    throw std::runtime_error("AGC graphics: vkQueueSubmit recorder: the awaited batch was never issued");
 }
 
 void QueueGate::Drain() {
@@ -279,7 +297,10 @@ bool QueueGate::awaitSerial(std::uint64_t target, bool drain) {
 }
 
 void QueueGate::rethrowStored() {
-    if (!failed.load(std::memory_order_acquire)) return;
+    if (failed.load(std::memory_order_acquire)) throwStored();
+}
+
+void QueueGate::throwStored() {
     std::exception_ptr error;
     {
         std::lock_guard lock(fifoMutex);
@@ -315,6 +336,9 @@ void QueueGate::runSubmitter() {
     submitterToken.store(CurrentThreadToken(), std::memory_order_release);
     std::unique_lock lock(fifoMutex);
     for (;;) {
+        // Nothing is issued after a failed submit: fail() cleared the FIFO and Seal pushes nothing
+        // once `failed` is set (both under this mutex); a batch that got in anyway is dropped.
+        if (failed.load(std::memory_order_acquire)) fifo.clear();
         if (fifo.empty() || paused) {
             if (stopping && fifo.empty()) break;
             // A seal usually follows within the spin window (the committer seals about every 0.8 ms

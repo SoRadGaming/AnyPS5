@@ -1109,7 +1109,6 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         cmdBindPipeline = context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
         cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
         cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
-        resetCommandPool = context.Function<PFN_vkResetCommandPool>("vkResetCommandPool");
     }
     if (!timelineSemaphores) return;
     // The timeline starts at 0 and every Submit signals its serial (1, 2, ...): a value that only
@@ -1635,6 +1634,8 @@ void Recorder::ensureOpen() {
                 // the batch's own, so the submitter never submits from a pool that a GpuMutex holder
                 // records into (defect #10: legal, but amdvlk-dependent).
                 if (auto* gate = submitGate(); gate != nullptr && gate->OwnPools()) {
+                    // The pools' reset at release, resolved here once (APS5_NO_PROC_TABLE=1: per call).
+                    if (resetCommandPool == nullptr && ProcTable()) resetCommandPool = context.Function<PFN_vkResetCommandPool>("vkResetCommandPool");
                     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
                     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
                     poolInfo.queueFamilyIndex = context.queueFamily;
@@ -3174,7 +3175,9 @@ void Recorder::awaitIssued(const Batch& batch) {
     if (gate == nullptr || batch.gpuSubmitted.load(std::memory_order_acquire)) return;
     // =2: Seal returned once its batch was issued, so a wait finding one unissued is a violation.
     if (gate->Mode().submitThread == 2) static_cast<void>(gate->PollIssued(batch.gpuSubmitted, "fence wait"));
-    gate->AwaitSubmitted(batch.serial);
+    // Awaits the serial, then checks the batch's own flag: a batch a failed submit dropped is never
+    // issued, so its fence is not waited for (it would time out forever); the failure is thrown.
+    gate->AwaitIssued(batch.gpuSubmitted, batch.serial);
 }
 
 bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) const {

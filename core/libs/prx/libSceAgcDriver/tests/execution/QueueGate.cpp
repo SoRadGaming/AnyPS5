@@ -316,7 +316,8 @@ struct EmptyBatch {
         AgcDriver::Graphics::Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &info, nullptr, &fence), "vkCreateFence");
     }
     ~EmptyBatch() {
-        context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 5'000'000'000ull);
+        // A batch never issued (dropped or refused after a failed submit) has nothing to wait for.
+        if (issued.load()) context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 5'000'000'000ull);
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
         context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
     }
@@ -362,6 +363,52 @@ void SubmitterBasics(RawDevice& raw) {
     gate.AwaitSubmitted(3);
     Check(third.issued.load() && gate.SubmittedSerial() == 3, "a seal after StopSubmitter was not issued");
     gate.StopSubmitter();
+}
+
+std::string ThrownBy(const std::function<void()>& call) {
+    try {
+        call();
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    return {};
+}
+
+// A failed submit ends the FIFO: the batch behind it is dropped (never issued), a seal after it is
+// refused (its failure thrown, nothing pushed, the sealed serial unchanged; checked under the FIFO's
+// mutex, where fail() clears it), and the submitter issues nothing more. The await rule on a
+// batch's own flag throws the failure for a dropped batch, and never passes a flag left unissued
+// behind a reached serial (counted and thrown; only without APS5_ASSERT_GPU_LOCK, which aborts on
+// it). The failure is injected and not a device loss: no Vulkan call, no device-wide wait.
+void SealAfterFailure(RawDevice& raw) {
+    QueueGate gate(SubmitModes(1, false));
+    raw.Attach(gate);
+    EmptyBatch first(raw.GetContext()), second(raw.GetContext()), third(raw.GetContext());
+    gate.PauseSubmitter(true);
+    gate.Seal(first.Seal(1));
+    gate.Seal(second.Seal(2));
+    gate.InjectSubmitFailure(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    gate.PauseSubmitter(false);
+    gate.Drain();
+    Check(!first.issued.load() && !second.issued.load() && gate.SubmittedSerial() == 0, "a batch behind a failed submit was issued");
+    const auto refused = ThrownBy([&] { gate.Seal(third.Seal(3)); });
+    Check(refused.find("vkQueueSubmit recorder") != std::string::npos && refused.find("injected") != std::string::npos, "a seal after a failed submit was not refused with its failure");
+    Check(gate.SealedSerial() == 2, "a refused seal moved the sealed serial");
+    Check(!ThrownBy([&] { gate.AwaitIssued(second.issued, 2); }).empty(), "the await rule passed a batch a failed submit dropped");
+    gate.StopSubmitter();
+    Check(!third.issued.load() && gate.SubmittedSerial() == 0, "a refused seal was issued");
+    if (Asserted()) return;
+    QueueGate healthy(SubmitModes(1, false));
+    raw.Attach(healthy);
+    EmptyBatch batch(raw.GetContext());
+    healthy.Seal(batch.Seal(1));
+    healthy.AwaitIssued(batch.issued, 1);
+    Check(batch.issued.load(), "the await rule returned before the batch was issued");
+    const auto before = QueueGate::CountsSoFar();
+    const std::atomic<bool> never{false};
+    Check(!ThrownBy([&] { healthy.AwaitIssued(never, 1); }).empty(), "the await rule passed a flag never issued behind a reached serial");
+    Check(QueueGate::CountsSoFar().ordering == before.ordering + 1, "a flag never issued behind a reached serial was not counted");
+    healthy.StopSubmitter();
 }
 
 // U1, the fence: a fence no submission ever signaled, polled and waited (zero and 2 ms) on this
@@ -486,7 +533,10 @@ int main(int argc, char** argv) {
     DeviceWideWaitExcludesQueues();
     OutOfDateTakenOnce();
     LockOrderAndCounts();
-    if (const auto raw = OpenRawDevice()) SubmitterBasics(*raw);
+    if (const auto raw = OpenRawDevice()) {
+        SubmitterBasics(*raw);
+        SealAfterFailure(*raw);
+    }
     DeviceWaitIdle();
     if (failures != 0) {
         std::fprintf(stderr, "%d queue gate check(s) failed\n", failures);

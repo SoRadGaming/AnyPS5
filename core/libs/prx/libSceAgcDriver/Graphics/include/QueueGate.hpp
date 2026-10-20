@@ -49,11 +49,11 @@ namespace AgcDriver::Graphics {
 // sparse bind on it) drains the FIFO first, then takes the graphics mutex (LockForeign); its callers
 // hold GpuMutex, so no seal slips in between. A device-wide wait drains the FIFO before AllQueues
 // (the submitter's own device-lost wait takes every mutex without draining). A failed submit is
-// stored: the FIFO behind it is dropped, and the error is rethrown at the next seal or await on the
-// caller. =2 makes the hand-off synchronous (the sealer waits until its batch is issued, today's
-// latency) and checks every ordering invariant (serials strictly increasing, no fence polled or
-// waited before its submit, every foreign submit finds the FIFO issued, one submit per fence before
-// its reset); the first violation is fatal. The serials are the recorder's (Recorder::Submissions):
+// stored: the FIFO behind it is dropped, nothing is sealed or issued after it, and the error is
+// rethrown at the next seal or await on the caller. =2 makes the hand-off synchronous (the sealer
+// waits until its batch is issued, today's latency) and checks every ordering invariant (serials
+// strictly increasing, no fence polled or waited before its submit, every foreign submit finds the
+// FIFO issued, one submit per fence before its reset); the first violation is fatal. The serials are the recorder's (Recorder::Submissions):
 // one recorder seals through a gate.
 class QueueGate {
 public:
@@ -173,11 +173,19 @@ public:
     // Under GpuMutex: rethrows a stored failure, then hands the batch to the submitter (started at
     // the first seal, and again at a seal after StopSubmitter). =1 returns at once, =2 once the batch
     // was issued (its own failure thrown). Without a submitter thread (it could not be started) the
-    // batch is issued here.
+    // batch is issued here. The failure is checked under the FIFO's mutex, where fail() stores it
+    // and clears the FIFO, so no batch is pushed behind that clear (it would be issued after the
+    // batches the failure dropped, or, at =2, discarded by its sealer while still queued).
     void Seal(const Sealed& sealed);
     // The await rule: returns once the batch of `serial` was issued (at once for a serial never
     // sealed); throws the stored failure when the FIFO stopped before it.
     void AwaitSubmitted(std::uint64_t serial);
+    // The await rule for a sealed batch (Recorder::finish): AwaitSubmitted, then its own flag
+    // (`issued`, its Sealed::issued) must read issued, or the stored failure is thrown: the
+    // submitted serial alone passes a batch only while every seal was issued in serial order, which
+    // a failure ends (the batches it dropped never are). A batch found unissued without a failure is
+    // an ordering violation, thrown rather than waited for (its fence was never submitted).
+    void AwaitIssued(const std::atomic<bool>& issued, std::uint64_t serial);
     // Every sealed batch issued (or dropped by a failure); never throws. A no-op on the submitter.
     void Drain();
     // The poll rule for a sealed batch's flag (Recorder): false reads as unsignaled. At =2 every seal
@@ -232,7 +240,10 @@ private:
     void issue(const Sealed& sealed);
     void fail(VkResult result, bool injected);
     bool awaitSerial(std::uint64_t target, bool drain);
+    // Throws the stored failure when a submit failed (`failed` is never cleared); throwStored
+    // always throws (the stored failure, else a generic one).
     void rethrowStored();
+    [[noreturn]] void throwStored();
     bool onSubmitter() const;
 
     Modes modes;
