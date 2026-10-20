@@ -837,6 +837,9 @@ struct VulkanDevice::State {
             if (uploadBuffer) reinterpret_cast<PFN_vkDestroyBuffer>(deviceProc(device, "vkDestroyBuffer"))(device, uploadBuffer, nullptr);
             if (uploadMemory) reinterpret_cast<PFN_vkFreeMemory>(deviceProc(device, "vkFreeMemory"))(device, uploadMemory, nullptr);
             if (swapchain) reinterpret_cast<PFN_vkDestroySwapchainKHR>(deviceProc(device, "vkDestroySwapchainKHR"))(device, swapchain, nullptr);
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD): the recorder's teardown joined the
+            // submitter; joined again (a no-op then) before the pool and the device go.
+            gate.StopSubmitter();
             const auto destroyPool = reinterpret_cast<PFN_vkDestroyCommandPool>(deviceProc(device, "vkDestroyCommandPool"));
             const auto destroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"));
             if (pool != VK_NULL_HANDLE) {
@@ -1991,6 +1994,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->gate.SetPresentQueue(state->presentQueue);
     }
     if (Graphics::QueueGate::PresentQueueMode() != 0) std::fprintf(stderr, "[present] APS5_EXPERIMENT_PRESENT_QUEUE=%d: %s\n", Graphics::QueueGate::PresentQueueMode(), presentIndex != 0 ? (Graphics::QueueGate::PresentQueueMode() == 1 ? "presents on their own queue of the graphics family, after the presenter's hold" : "presents on their own queue of the graphics family, inside the presenter's hold") : "the graphics family has no free queue; presents stay on the graphics queue, inside the presenter's hold");
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): what the gate's
+    // submitter issues the recorder's batches with (it starts at the first seal).
+    state->gate.Attach(state->device, state->queue, state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit"), state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle"));
+    if (state->gate.Threaded()) std::fprintf(stderr, "[queue] APS5_EXPERIMENT_SUBMIT_THREAD=%d: recorder batches are sealed under GpuMutex and submitted by the agcsubmit thread%s%s\n", state->gate.Mode().submitThread, state->gate.Mode().submitThread == 2 ? " (synchronous hand-off, ordering checks)" : "", state->gate.OwnPools() ? "; each batch records into its own command pool (APS5_EXPERIMENT_SUBMIT_POOLS=1)" : "");
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
@@ -2190,6 +2197,9 @@ void VulkanDevice::PrepareForReplacement() {
     Graphics::FlushCachedTextures(state->device);
     Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): WaitIdle drained the
+    // FIFO; the submitter is joined (a later seal of this device's recorder starts it again).
+    state->gate.StopSubmitter();
     Graphics::DestroyShadows(state->device);
     // The replacement's draws never find this device's pipelines (the store keys on the device), and
     // the device lives on until the driver stops: destroy them now rather than then.
@@ -3550,8 +3560,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
     {
-        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate).
-        const auto queueHold = state->gate.Lock(Graphics::QueueGate::Queue::Graphics);
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): a foreign submit: the submitter's FIFO
+        // drained (the frame's batches, sealed by SubmitRecorded above, go first), then the graphics
+        // queue's mutex (QueueGate).
+        const auto queueHold = state->gate.LockForeign("vkQueueSubmit presentation blit");
         state->gate.CheckOp(Graphics::QueueGate::Queue::Graphics, "vkQueueSubmit presentation blit");
         check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
     }
@@ -3729,7 +3741,8 @@ void VulkanDevice::IssuePresent(const PresentTicket& ticket) {
     const auto queue = own ? Graphics::QueueGate::Queue::Present : Graphics::QueueGate::Queue::Graphics;
     VkResult presented = VK_SUCCESS;
     {
-        const auto queueHold = state->gate.Lock(queue);
+        // On the graphics queue a foreign operation (A4: the submitter's FIFO drained first).
+        const auto queueHold = own ? state->gate.Lock(queue) : state->gate.LockForeign("vkQueuePresentKHR");
         state->gate.CheckOp(queue, "vkQueuePresentKHR");
         presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(own ? state->presentQueue : state->queue, &present);
     }

@@ -366,8 +366,9 @@ void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
         if (result == VK_NOT_READY) {
-            // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate).
-            const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+            // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): the graphics queue's mutex (QueueGate),
+            // after the submitter issued every earlier seal.
+            const auto queueHold = LockForeignQueue(context, "vkQueueWaitIdle command batch");
             CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueWaitIdle command batch");
             result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
         }
@@ -395,8 +396,10 @@ void CommandBatch::Submit() {
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
     {
-        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate).
-        const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): a foreign submit: the submitter's FIFO
+        // drained first (the constructor sealed the recorder's open batch, which must go first),
+        // then the graphics queue's mutex (QueueGate).
+        const auto queueHold = LockForeignQueue(context, "vkQueueSubmit command batch");
         CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueSubmit command batch");
         Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
     }

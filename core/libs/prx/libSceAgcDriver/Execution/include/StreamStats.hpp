@@ -107,8 +107,20 @@ struct Counters {
     // the present queue after the hold (their PreparePresent counts as the hold's QueuePresent).
     Counter issuedPresents{};
     Counter issuePresentNs{};
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the submitter's
+    // vkQueueSubmit calls; the awaits (blocking fence or timeline waits) and drains (foreign submits,
+    // device-wide waits) that had to wait for it, and their time; polls that found a sealed batch not
+    // yet issued (unsignaled by the poll rule).
+    Counter submitterSubmits{};
+    Counter submitterSubmitNs{};
+    Counter waitedAwaits{};
+    Counter awaitNs{};
+    Counter waitedDrains{};
+    Counter drainNs{};
+    Counter unissuedPolls{};
     // Recorder::Submit with an open batch, by the submitting thread's role and the site tagged for
-    // its hold: the whole call, vkEndCommandBuffer and vkQueueSubmit.
+    // its hold: the whole call, vkEndCommandBuffer and vkQueueSubmit (under
+    // APS5_EXPERIMENT_SUBMIT_THREAD, its seal: the hand-off to the submitter).
     std::array<std::array<Counter, Sites>, Roles> submits{};
     std::array<std::array<Counter, Sites>, Roles> submitNs{};
     std::array<std::array<Counter, Sites>, Roles> endNs{};

@@ -736,10 +736,11 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
     VkResult bound = VK_SUCCESS;
     VkResult waited = VK_SUCCESS;
     {
-        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue's mutex from the context's gate (the
-        // sparse queue's, held across the wait as before; the graphics queue's, under the switches,
-        // only around the bind, so the fence wait holds no queue).
-        auto queueLock = LockQueue(context, ownQueue ? QueueGate::Queue::Sparse : QueueGate::Queue::Graphics);
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): the queue's mutex from the context's gate
+        // (the sparse queue's, held across the wait as before; the graphics queue's, under the
+        // switches, only around the bind, so the fence wait holds no queue, and a foreign operation
+        // there: the submitter's FIFO drained first).
+        auto queueLock = ownQueue ? LockQueue(context, QueueGate::Queue::Sparse) : LockForeignQueue(context, "vkQueueBindSparse");
         CheckQueueOp(context, ownQueue ? QueueGate::Queue::Sparse : QueueGate::Queue::Graphics, "vkQueueBindSparse");
         bound = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
         if (!ownQueue) queueLock = QueueGate::Hold();
@@ -2818,9 +2819,9 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &buffer;
             {
-                // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate),
-                // around the submit only.
-                const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+                // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): a foreign submit: the submitter's
+                // FIFO drained, then the graphics queue's mutex (QueueGate), around the submit only.
+                const auto queueHold = LockForeignQueue(context, "vkQueueSubmit import probe");
                 CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueSubmit import probe");
                 if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
             }
@@ -2841,8 +2842,8 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
     };
     probe.failure = run();
     if (submitted) {
-        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate).
-        const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): as the probe's submit.
+        const auto queueHold = LockForeignQueue(context, "vkQueueWaitIdle import probe");
         CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueWaitIdle import probe");
         context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
     }

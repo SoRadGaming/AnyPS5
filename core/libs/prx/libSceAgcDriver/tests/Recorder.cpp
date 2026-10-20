@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
@@ -174,7 +175,9 @@ void deviceSelectionTests() {
 // them, as the driver creates its own; the recorder's batches need a real queue and real fences.
 class Device {
 public:
-    explicit Device(bool settleOnOtherFamily = false) {
+    // `timeline`: VK_KHR_timeline_semaphore enabled when the device has it (the submit thread tests'
+    // recorders wait on their timeline; Timeline() says whether it was).
+    explicit Device(bool settleOnOtherFamily = false, bool timeline = false) {
 #ifdef _WIN32
         library = SDL_LoadObject("vulkan-1.dll");
 #else
@@ -350,6 +353,19 @@ public:
                 robustness.pNext = address.pNext;
                 address.pNext = &robustness;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (timeline && hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timelineEnabled = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timelineEnabled) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             const std::array<VkDeviceQueueCreateInfo, 2> queueInfos{queue, settle};
             device.queueCreateInfoCount = settleFamily != noSettleFamily && settleFamily != family ? 2 : 1;
@@ -391,6 +407,7 @@ public:
 
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
+    bool Timeline() const { return timelineEnabled; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
     bool Timestamps() const {
@@ -436,6 +453,7 @@ private:
     bool graphics = false;
     std::mutex settleMutex;
     bool nullDescriptors = false;
+    bool timelineEnabled = false;
 };
 
 using Kind = Recorder::ReadKind;
@@ -9528,6 +9546,196 @@ void Run(Context context) {
 }
 #endif
 
+namespace {
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the recorder's batches
+// sealed and issued by a gate's submitter (a gate of each test's own, with the mode `mode` and own
+// pools or not, whatever the switches say). A held submitter (PauseSubmitter) keeps a sealed batch
+// unissued until a helper thread releases it.
+struct SubmitThreadCase {
+    explicit SubmitThreadCase(const Device& device, int mode, bool pools) : gate(Modes(mode, pools)), context(device.GetContext()) {
+        gate.Attach(context.device, context.queue, context.Function<PFN_vkQueueSubmit>("vkQueueSubmit"), context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle"));
+        context.queueGate = &gate;
+    }
+    static QueueGate::Modes Modes(int mode, bool pools) {
+        QueueGate::Modes modes;
+        modes.submitThread = mode;
+        modes.submitPools = pools;
+        return modes;
+    }
+    QueueGate gate;
+    Context context;
+};
+
+// Releases a held submitter after `delay` on its own thread (joined by the destructor).
+class DelayedRelease {
+public:
+    DelayedRelease(QueueGate& gate, std::chrono::milliseconds delay) : thread([&gate, delay, this] {
+        std::this_thread::sleep_for(delay);
+        released.store(true, std::memory_order_release);
+        gate.PauseSubmitter(false);
+    }) {}
+    ~DelayedRelease() { thread.join(); }
+    bool Released() const { return released.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<bool> released{false};
+    std::thread thread;
+};
+
+void recordFill(const Context& context, VkCommandBuffer commands, VkBuffer buffer, std::uint32_t value) {
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, buffer, 0, 16, value);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+}
+
+// A poll before the submit reads unsignaled (Reap keeps the batch, its completion has not run);
+// finish (Sync) awaits the submission before its fence wait.
+void sealedPollAndFinishTest(const Device& device, int mode, bool pools) {
+    SubmitThreadCase test(device, mode, pools);
+    Recorder recorder(test.context, true);
+    recorder.Activate();
+    int ran = 0;
+    Buffer target(test.context, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (mode == 1) test.gate.PauseSubmitter(true);
+    recordFill(test.context, recorder.Commands(), target.Handle(), 0x11111111u);
+    recorder.OnComplete([&] { ++ran; });
+    recorder.Submit();
+    if (mode == 1) {
+        Require(!recorder.Reap() && ran == 0, "a sealed batch the submitter has not issued was reaped");
+        Require(recorder.UnsignaledBatches() == 1, "a sealed batch the submitter has not issued polled signaled");
+        DelayedRelease release(test.gate, std::chrono::milliseconds(50));
+        recorder.Sync();
+        Require(release.Released(), "finish returned before the batch was issued");
+    } else {
+        // =2: Seal returned once the batch was issued.
+        Require(test.gate.SubmittedSerial() == recorder.Submissions(), "a synchronous seal returned before its batch was issued");
+        recorder.Sync();
+    }
+    std::uint32_t value = 0;
+    std::memcpy(&value, target.Bytes().data(), sizeof(value));
+    Require(ran == 1 && recorder.Idle() && value == 0x11111111u, "the issued batch's work and completion did not run");
+}
+
+// WaitSerial (the unlocked drain's wait) awaits the submission before the timeline wait.
+void waitSerialTest(const Device& device, int mode, bool pools) {
+    SubmitThreadCase test(device, mode, pools);
+    Recorder recorder(test.context, true);
+    recorder.Activate();
+    Require(recorder.HasTimeline(), "the submit thread recorder has no timeline");
+    if (mode == 1) test.gate.PauseSubmitter(true);
+    recorder.OnComplete([] {});
+    const auto serial = recorder.SubmitAndEpoch();
+    Require(serial != 0, "SubmitAndEpoch sealed nothing");
+    if (mode == 1) {
+        DelayedRelease release(test.gate, std::chrono::milliseconds(50));
+        recorder.WaitSerial(serial);
+        Require(release.Released() && test.gate.SubmittedSerial() >= serial, "WaitSerial returned before the batch was issued");
+    } else {
+        recorder.WaitSerial(serial);
+    }
+    recorder.FinishUpTo(serial);
+    Require(recorder.Idle(), "FinishUpTo left the waited batch in flight");
+}
+
+// A device lost by a submit (injected: no Vulkan call) is stored and rethrown at the next seal (=1),
+// or thrown by its own seal (=2); its batch never reads signaled.
+void submitFailureTest(const Device& device, int mode, bool pools) {
+    SubmitThreadCase test(device, mode, pools);
+    Recorder recorder(test.context, true);
+    recorder.Activate();
+    test.gate.InjectSubmitFailure(VK_ERROR_DEVICE_LOST);
+    recorder.OnComplete([] {});
+    const auto thrownBy = [&] {
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    if (mode == 1) {
+        Require(thrownBy().empty(), "a seal waited for its own submit");
+        test.gate.Drain();
+        Require(!recorder.Reap(), "the batch whose submit failed was reaped");
+        recorder.OnComplete([] {});
+    }
+    const auto error = thrownBy();
+    Require(error.find("vkQueueSubmit recorder") != std::string::npos && error.find("-4") != std::string::npos, "the injected device loss was not rethrown at the next seal: " + error);
+    Require(QueueGate::CountsSoFar().submitFailures != 0, "the failed submit was not counted");
+    // The recorder's teardown: its Sync throws the stored failure (reported, not escaping), and the
+    // submitter is joined.
+}
+
+// A recorder torn down with seals in flight: its Sync awaits and completes them, then the submitter
+// is joined before the batches' objects go.
+void teardownInFlightTest(const Device& device, int mode, bool pools) {
+    SubmitThreadCase test(device, mode, pools);
+    int ran = 0;
+    const auto running = QueueGate::RunningSubmitters();
+    {
+        // Declared first, so the recorder is destroyed while the release may still be pending.
+        std::optional<DelayedRelease> release;
+        Recorder recorder(test.context, true);
+        recorder.Activate();
+        if (mode == 1) test.gate.PauseSubmitter(true);
+        for (int batch = 0; batch < 3; ++batch) {
+            recorder.OnComplete([&] { ++ran; });
+            recorder.Submit();
+        }
+        if (mode == 1) release.emplace(test.gate, std::chrono::milliseconds(30));
+    }
+    Require(ran == 3, "a recorder torn down with seals in flight dropped their completions");
+    Require(QueueGate::RunningSubmitters() == running, "the recorder's teardown left its submitter running");
+    Require(test.gate.SubmittedSerial() == 3, "the torn down recorder's seals were not all issued");
+}
+
+// A foreign submit (a command batch) lands after the seals before it: it drains the FIFO first. The
+// sealed batch fills 0x11, the foreign one 0x22 after a full barrier: 0x22 must remain.
+void foreignAfterSealsTest(const Device& device, int mode, bool pools) {
+    SubmitThreadCase test(device, mode, pools);
+    Recorder recorder(test.context, true);
+    recorder.Activate();
+    Buffer target(test.context, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (mode == 1) test.gate.PauseSubmitter(true);
+    recordFill(test.context, recorder.Commands(), target.Handle(), 0x11111111u);
+    recorder.Submit();
+    const auto sealed = recorder.Submissions();
+    {
+        std::optional<DelayedRelease> release;
+        if (mode == 1) release.emplace(test.gate, std::chrono::milliseconds(50));
+        CommandBatch batch(test.context);
+        recordFill(test.context, batch.Handle(), target.Handle(), 0x22222222u);
+        batch.SubmitAndWait();
+        Require(test.gate.SubmittedSerial() >= sealed, "a foreign submit was issued before the seals ahead of it");
+    }
+    recorder.Sync();
+    std::uint32_t value = 0;
+    std::memcpy(&value, target.Bytes().data(), sizeof(value));
+    Require(value == 0x22222222u, "the foreign submit ran before the batch sealed ahead of it");
+}
+
+int submitThreadTests(const Device& device, int mode) {
+    if (!device.Timeline()) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "the submit thread tests need timeline semaphores");
+        std::cout << "skipped, the device has no timeline semaphores\n";
+        return 77;
+    }
+    for (const bool pools : {false, true}) {
+        sealedPollAndFinishTest(device, mode, pools);
+        waitSerialTest(device, mode, pools);
+        submitFailureTest(device, mode, pools);
+        teardownInFlightTest(device, mode, pools);
+        foreignAfterSealsTest(device, mode, pools);
+    }
+    const auto counts = QueueGate::CountsSoFar();
+    Require(counts.unheld == 0 && counts.overlapped == 0 && counts.misordered == 0 && counts.ordering == 0, "the submit thread tests counted a gate violation");
+    std::cout << "submit thread tests passed (APS5_EXPERIMENT_SUBMIT_THREAD=" << mode << " semantics, shared and own pools)\n";
+    return 0;
+}
+
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--device-selection-only") {
@@ -9542,7 +9750,8 @@ int main(int argc, char** argv) {
         }
         std::unique_ptr<Device> created;
         try {
-            created = std::make_unique<Device>(argc == 2 && (std::string_view(argv[1]) == "--import-watch-other-family-only" || std::string_view(argv[1]) == "--deferred-settle-other-family-only"));
+            const bool submitThread = argc == 2 && std::string_view(argv[1]).starts_with("--submit-thread");
+            created = std::make_unique<Device>(argc == 2 && (std::string_view(argv[1]) == "--import-watch-other-family-only" || std::string_view(argv[1]) == "--deferred-settle-other-family-only"), submitThread);
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::cout << "skipped, no usable Vulkan device: " << error.what() << '\n';
@@ -9620,6 +9829,9 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::unique_lock gpu(GpuMutex());
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4).
+        if (argc == 2 && std::string_view(argv[1]) == "--submit-thread-only") return submitThreadTests(device, 1);
+        if (argc == 2 && std::string_view(argv[1]) == "--submit-thread-verify-only") return submitThreadTests(device, 2);
 #ifdef _WIN32
         if (argc == 2 && std::string_view(argv[1]) == "--storage-cpu-snapshot-only") {
             if (device.GetContext().hostImportAlignment == 0) {

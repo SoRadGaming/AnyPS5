@@ -1200,6 +1200,18 @@ configure_windows_unwind(agc_driver_recorder_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_driver_recorder_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_recorder_device_selection COMMAND agc_driver_recorder_tests --device-selection-only)
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the recorder's
+    # batches through a gate's submitter (=1, and =2 with every ordering check fatal; each with the
+    # shared pool and a pool per batch): polls before the submit, finish and WaitSerial awaiting it,
+    # an injected device loss rethrown at the next seal, teardown with seals in flight, a command
+    # batch landing after the seals ahead of it.
+    add_test(NAME agc_recorder_submit_thread COMMAND agc_driver_recorder_tests --submit-thread-only)
+    add_test(NAME agc_recorder_submit_thread_verify COMMAND agc_driver_recorder_tests --submit-thread-verify-only)
+    set_tests_properties(agc_recorder_submit_thread agc_recorder_submit_thread_verify PROPERTIES ENVIRONMENT "APS5_ASSERT_GPU_LOCK=1" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_recorder_submit_thread agc_recorder_submit_thread_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_gpu_timing_complete COMMAND agc_driver_recorder_tests --gpu-timing-complete-only)
     add_test(NAME agc_gpu_timing_incomplete COMMAND agc_driver_recorder_tests --gpu-timing-incomplete-only)
     set_tests_properties(agc_gpu_timing_complete agc_gpu_timing_incomplete PROPERTIES
@@ -2468,7 +2480,15 @@ if(BUILD_TESTING)
             # every queue operation checked (its queue's mutex held, no device-wide wait overlapping;
             # =2 aborts on the first violation, the assertion switch does at =1 too).
             "present_queue|APS5_EXPERIMENT_PRESENT_QUEUE=2,APS5_ASSERT_GPU_LOCK=1"
-            "present_queue_on|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_ASSERT_GPU_LOCK=1")
+            "present_queue_on|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_ASSERT_GPU_LOCK=1"
+            # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A4): the submit thread, verified (=2: the
+            # synchronous hand-off with every ordering check fatal), on, on with a pool per batch, and
+            # with the present queue as the play build would run them; the submitter's own thread
+            # runs inside a PrepareScope, so the assertion switch catches a GpuMutex there.
+            "submit_thread|APS5_EXPERIMENT_SUBMIT_THREAD=2,APS5_ASSERT_GPU_LOCK=1"
+            "submit_thread_on|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_ASSERT_GPU_LOCK=1"
+            "submit_pools|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1,APS5_ASSERT_GPU_LOCK=1"
+            "present_submit|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1,APS5_ASSERT_GPU_LOCK=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
@@ -2543,7 +2563,9 @@ if(BUILD_TESTING)
     # the fixed order abort under APS5_ASSERT_GPU_LOCK=1, an operation without its queue's mutex at
     # =2 (matched as the PrepareScope death tests above are).
     set(queueGateTests)
-    foreach(queueGateCase IN ITEMS "present_queue|APS5_EXPERIMENT_PRESENT_QUEUE=1" "present_queue_verify|APS5_EXPERIMENT_PRESENT_QUEUE=2")
+    foreach(queueGateCase IN ITEMS "present_queue|APS5_EXPERIMENT_PRESENT_QUEUE=1" "present_queue_verify|APS5_EXPERIMENT_PRESENT_QUEUE=2"
+            "submit_thread|APS5_EXPERIMENT_SUBMIT_THREAD=1" "submit_thread_verify|APS5_EXPERIMENT_SUBMIT_THREAD=2"
+            "submit_pools|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1")
         string(REPLACE "|" ";" queueGateCase "${queueGateCase}")
         list(GET queueGateCase 0 queueGateName)
         list(GET queueGateCase 1 queueGateEnvironment)
@@ -2562,6 +2584,14 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_queue_gate_death_unheld_verify PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PRESENT_QUEUE=2"
         PASS_REGULAR_EXPRESSION "\\[queue\\] ASSERT: queue operation without its queue's mutex")
     list(APPEND queueGateTests agc_driver_queue_gate_death_lock_order agc_driver_queue_gate_death_misordered agc_driver_queue_gate_death_unheld_verify)
+    # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A4, section 5 U1): a never-submitted fence on this
+    # driver, and the pool stress (one recording thread against the submitter) with the recorder's
+    # shared pool and with a pool per batch; the plan's full run is --pool-stress=1000000.
+    add_test(NAME agc_driver_queue_gate_u1_fence COMMAND agc_driver_queue_gate_tests --never-submitted-fence)
+    add_test(NAME agc_driver_queue_gate_u1_pool_stress COMMAND agc_driver_queue_gate_tests --pool-stress=100000)
+    add_test(NAME agc_driver_queue_gate_u1_pool_stress_own_pools COMMAND agc_driver_queue_gate_tests --pool-stress-own-pools=100000)
+    set_tests_properties(agc_driver_queue_gate_u1_fence agc_driver_queue_gate_u1_pool_stress agc_driver_queue_gate_u1_pool_stress_own_pools PROPERTIES ENVIRONMENT "APS5_ASSERT_GPU_LOCK=1")
+    list(APPEND queueGateTests agc_driver_queue_gate_u1_fence agc_driver_queue_gate_u1_pool_stress agc_driver_queue_gate_u1_pool_stress_own_pools)
     # The present queue's own suites, with it on and verified.
     foreach(queueGateMode IN ITEMS 1 2)
         set(queueGateSuffix present_queue)
@@ -2575,6 +2605,7 @@ if(BUILD_TESTING)
         list(APPEND queueGateTests agc_driver_presentation_pass_${queueGateSuffix} agc_loading_splash_${queueGateSuffix})
     endforeach()
     set_tests_properties(${queueGateTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    set_tests_properties(agc_driver_queue_gate_u1_pool_stress agc_driver_queue_gate_u1_pool_stress_own_pools PROPERTIES TIMEOUT 300)
     if(WIN32)
         set_tests_properties(${queueGateTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
