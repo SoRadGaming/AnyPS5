@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <cstdlib>
@@ -105,18 +106,45 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("acquire_image");
         }
         if (presentable) {
+            // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): the second hold's lock
+            // wait, PresentDisplayBuffer (or PresentClear), the in-hold QueuePresent and the whole
+            // hold. The record is declared after the guard, so it is destroyed first: the hold is
+            // timed up to the release, without the unlock hook that runs after it.
+            struct StreamHold {
+                bool on = Stream::On();
+                std::uint64_t requestedNs = 0;
+                std::uint64_t heldNs = on ? Stream::NowNs() : 0;
+                std::uint64_t bufferNs = 0;
+                std::uint64_t queuePresentNs = 0;
+                ~StreamHold() {
+                    if (!on) return;
+                    auto& counters = Stream::counters;
+                    Stream::Add(counters.presents);
+                    Stream::Add(counters.holdLockWaitNs, heldNs - requestedNs);
+                    Stream::Add(counters.holdNs, Stream::NowNs() - heldNs);
+                    Stream::Add(counters.presentBufferNs, bufferNs);
+                    Stream::Add(counters.queuePresentNs, queuePresentNs);
+                }
+            };
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+            const auto streamRequestedNs = Stream::On() ? Stream::NowNs() : 0;
             std::lock_guard lock(GuestMemory::GpuMutex());
             timing.Mark("gpu_mutex_wait");
+            StreamHold streamHold;
+            streamHold.requestedNs = streamRequestedNs;
             if (buffer != nullptr) {
                 if (syncFlip) {
                     presenting->WaitIdle();
                     timing.Mark("device_idle_wait");
                 }
+                const auto bufferStartNs = streamHold.on ? Stream::NowNs() : 0;
                 submitted = presenting->PresentDisplayBuffer(*buffer);
+                if (streamHold.on) streamHold.bufferNs = Stream::NowNs() - bufferStartNs;
                 timing.Mark("present_display_buffer");
             } else {
+                const auto bufferStartNs = streamHold.on ? Stream::NowNs() : 0;
                 submitted = presenting->PresentClear(window.width, window.height, opaque);
+                if (streamHold.on) streamHold.bufferNs = Stream::NowNs() - bufferStartNs;
                 timing.Mark("present_clear");
             }
             if (submitted && syncFlip) {
@@ -125,7 +153,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             }
             if (submitted && (syncFlip || inFlight != 0)) {
 
+                const auto queueStartNs = streamHold.on ? Stream::NowNs() : 0;
                 presenting->QueuePresent();
+                if (streamHold.on) streamHold.queuePresentNs = Stream::NowNs() - queueStartNs;
                 timing.Mark("queue_present");
                 trailing = !syncFlip;
                 submitted = false;
@@ -141,7 +171,13 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
 
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
             std::lock_guard lock(GuestMemory::GpuMutex());
+            // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the third hold's QueuePresent, apart.
+            const auto queueStartNs = Stream::On() ? Stream::NowNs() : 0;
             presenting->QueuePresent();
+            if (Stream::On()) {
+                Stream::Add(Stream::counters.latePresents);
+                Stream::Add(Stream::counters.lateQueuePresentNs, Stream::NowNs() - queueStartNs);
+            }
             timing.Mark("queue_present");
         }
         gpuReady(context);

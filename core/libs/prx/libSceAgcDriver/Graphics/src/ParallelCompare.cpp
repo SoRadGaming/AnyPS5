@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -135,13 +136,41 @@ unsigned CompareHelpers() {
     return helpers;
 }
 
+namespace {
+
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): one CompareSpansFrom call in the
+// [stream] compare histogram (Stream::Counters): its span count and total bytes, how it ran, its
+// time, and that time again when the committer made the call.
+void noteStreamCompare(std::size_t spans, std::size_t total, std::size_t mode, std::uint64_t startNs) {
+    const auto ns = Stream::NowNs() - startNs;
+    const std::size_t spanBucket = spans <= 1 ? 0 : spans <= 16 ? 1 : 2;
+    const std::size_t byteBucket = total < (std::size_t{256} << 10u) ? 0 : total < (std::size_t{1} << 20u) ? 1 : 2;
+    auto& counters = Stream::counters;
+    Stream::Add(counters.compares[spanBucket][byteBucket]);
+    Stream::Add(counters.compareNs[spanBucket][byteBucket], ns);
+    if (GuestMemory::CurrentStreamRole() == GuestMemory::StreamRole::Committer) Stream::Add(counters.compareCommitterNs[spanBucket][byteBucket], ns);
+    Stream::Add(counters.compareModes[mode]);
+    Stream::Add(counters.compareModeNs[mode], ns);
+}
+
+}
+
 void CompareSpansFrom(std::span<const CompareSpan> spans, std::span<std::uint8_t> equal, std::size_t parallelBytes) {
+    const bool stream = Stream::On();
+    const auto startNs = stream ? Stream::NowNs() : 0;
     std::size_t total = 0;
     for (const auto& span : spans) total += span.bytes;
+    // The [stream] mode: 0 on the pool, 1 the pool was busy, 2 serial.
+    std::size_t mode = 2;
     if (spans.size() > 1 && total >= parallelBytes) {
-        if (sharedPool()->Run(spans, equal)) return;
+        if (sharedPool()->Run(spans, equal)) {
+            if (stream) noteStreamCompare(spans.size(), total, 0, startNs);
+            return;
+        }
+        mode = 1;
     }
     for (std::size_t index = 0; index < spans.size(); ++index) equal[index] = std::memcmp(spans[index].first, spans[index].second, spans[index].bytes) == 0 ? 1 : 0;
+    if (stream) noteStreamCompare(spans.size(), total, mode, startNs);
 }
 
 void StopCompareHelpers() {

@@ -12,6 +12,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <thread>
 #include <utility>
@@ -63,7 +64,8 @@ public:
         std::size_t bail = 0;
     };
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
-    void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    // `site` names the caller for the [stream] drain sites (APS5_DEBUG_STREAM_STATS); unused otherwise.
+    void Drain(DrainReason reason, std::uint32_t opcode = 0x100, std::source_location site = std::source_location::current());
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
@@ -115,6 +117,28 @@ public:
         std::uint64_t labelWaitNs = 0;
     };
     PrepStats TakePrepStats();
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS=1, PARALLEL-COMMIT-PLAN S0): the committer's idle
+    // attribution. A Drain that finds items queued opens a drain episode (its reason, opcode and
+    // call site), which lasts until the next Enqueue: the committer's idle inside it (from the later
+    // of the episode's start and the committer running dry, to the push) is filed under the drain,
+    // and queue 0's time from the drain's return to that push is the episode's serial phase; idle
+    // outside every episode is "producer slow". The shadow dispatch classifier (Dispatch.cpp) reads
+    // DrainEpisode() before its drain and names the episode its drain opened with NoteDrainClass
+    // (a Stream::DispatchClass), or an episode no dispatch named yet whose drain was made for a
+    // dispatch packet (opcode 0x15 or 0x16: the gate drain queue 0 makes before a dispatch that
+    // follows a wait); it also marks whether every dispatch classified inside the episode would
+    // have been an A1 item. SnapshotWriters copies the queued items' writes (writes
+    // and appended labels, with the item's position from the front, 0 first) for its reads-overlap
+    // test before the drain empties the queue, and returns how many items were queued. Each takes
+    // the pipeline mutex. The [stream] line is printed by Enqueue every 10 s.
+    struct QueuedWriter {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::uint32_t position;
+    };
+    std::size_t SnapshotWriters(std::vector<QueuedWriter>& writers);
+    std::uint64_t DrainEpisode();
+    void NoteDrainClass(std::uint64_t before, std::uint8_t dispatchClass);
 
 private:
     struct Item {
@@ -130,6 +154,8 @@ private:
         // (APS5_DEBUG_Q0_PREP_STATS attribution).
         std::uint32_t enqueueDepth = 0;
         bool full = false;
+        // The push time (Stream::NowNs) under APS5_DEBUG_STREAM_STATS, 0 otherwise: a draw's lead.
+        std::uint64_t enqueuedAtNs = 0;
     };
     struct CommitRun;
     DrawPipeline() = default;
@@ -140,6 +166,11 @@ private:
     void reap();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): see SnapshotWriters. Under the pipeline mutex, except
+    // reportStream, which releases it before it prints.
+    void openStreamEpisode(std::uint64_t startNs, DrainReason reason, std::uint32_t opcode, const std::source_location& site);
+    void closeStreamEpisode(std::uint64_t nowNs);
+    void reportStream(std::unique_lock<std::mutex>& lock);
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -177,6 +208,68 @@ private:
     std::uint64_t labelsAppended = 0;
     PrepStats prepStats;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the [stream] line's pipeline counts, under the mutex.
+    // Busy is timed by the committer's loop around each front (a run under its front's kind),
+    // idle from the loop's top to the item it then takes; `commitNs` is the [draw] pipelined
+    // commit time over the same window. Drain sites are kept by call site, reason and opcode in
+    // StreamSiteSlots slots (the last one takes the rest). Draw leads (push to commit start) by
+    // LeadBuckets (< 5, 10, 20, 50, 100, 200, 500 us, more) and by the depth pushed behind.
+    static constexpr std::size_t StreamSiteSlots = 32;
+    static constexpr std::size_t StreamClassSlots = 16;
+    static constexpr std::size_t LeadBuckets = 8;
+    static constexpr std::size_t LeadDepthBuckets = 10;
+    struct StreamSite {
+        const char* file = nullptr;
+        std::uint32_t line = 0;
+        std::uint32_t opcode = 0;
+        DrainReason reason = DrainReason::Packet;
+        std::uint64_t episodes = 0;
+        std::uint64_t waitNs = 0;
+        std::uint64_t idleNs = 0;
+        std::uint64_t serialNs = 0;
+    };
+    // An open episode keeps its drain's site and wait; all of it is counted when it closes, in the
+    // window of its close.
+    struct StreamEpisode {
+        std::uint64_t serial = 0;
+        std::uint64_t startNs = 0;
+        std::uint64_t returnNs = 0;
+        std::uint64_t waitNs = 0;
+        const char* file = nullptr;
+        std::uint32_t line = 0;
+        std::uint32_t opcode = 0;
+        DrainReason reason = DrainReason::Packet;
+        std::uint8_t dispatchClass = 0;
+        std::uint32_t dispatches = 0;
+        bool eligible = true;
+    };
+    struct StreamCounts {
+        std::array<std::uint64_t, 3> busyNs{};
+        std::uint64_t idleNs = 0;
+        std::uint64_t idleWaits = 0;
+        std::uint64_t commits = 0;
+        std::uint64_t commitNs = 0;
+        std::array<StreamSite, StreamSiteSlots> sites{};
+        std::uint64_t episodes = 0;
+        std::uint64_t drainIdleNs = 0;
+        std::uint64_t serialNs = 0;
+        std::array<std::uint64_t, StreamClassSlots> classEpisodes{};
+        std::array<std::uint64_t, StreamClassSlots> classIdleNs{};
+        std::uint64_t dispatchIdleNs = 0;
+        std::uint64_t eligibleIdleNs = 0;
+        std::uint64_t leadDraws = 0;
+        std::uint64_t leadAtLeast20 = 0;
+        std::array<std::uint64_t, LeadBuckets> leads{};
+        std::array<std::uint64_t, LeadDepthBuckets> leadDepths{};
+        std::array<std::uint64_t, LeadDepthBuckets> leadDepthNs{};
+    };
+    StreamCounts streamCounts;
+    StreamEpisode streamEpisode;
+    std::uint64_t streamEpisodes = 0;
+    std::chrono::steady_clock::time_point streamLastReport{};
+    // When the committer's loop last went looking for work (0 while it commits); read by the push
+    // that closes a drain episode.
+    std::atomic<std::uint64_t> streamIdleSinceNs{0};
 };
 
 }

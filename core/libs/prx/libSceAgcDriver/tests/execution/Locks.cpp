@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #ifdef _WIN32
 #include <windows.h>
@@ -10,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -229,9 +232,35 @@ void ThreadSlots() {
     AgcDriver::GuestMemory::SetReadSite(previous);
 }
 
+// LOCAL DEBUG (APS5_ASSERT_GPU_LOCK, PARALLEL-COMMIT-PLAN S0): death tests, one per argument. Inside
+// a GuestMemory::PrepareScope, a GpuMutex try_lock (GpuMutexType::tryEnter) and a HostImportFor call
+// must abort with a "[lock] ASSERT: ... inside a PrepareScope" line under APS5_ASSERT_GPU_LOCK=1
+// (ctest matches the line); without the switch both return and the run reports that, failing when
+// the switch was set. HostImportFor gets an empty context (no import support): past the assertion
+// it returns nullptr at once.
+int PrepareScopeDeath(const char* mode) {
+    const bool asserted = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
+    {
+        const AgcDriver::GuestMemory::PrepareScope scope;
+        if (std::strcmp(mode, "--prepare-scope-try-lock") == 0) {
+            auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+            if (mutex.try_lock()) mutex.unlock();
+        } else if (std::strcmp(mode, "--prepare-scope-host-import") == 0) {
+            const AgcDriver::Graphics::Context context{};
+            if (AgcDriver::Graphics::HostImportFor(context, 0x10000, 16) != nullptr) std::fprintf(stderr, "FAIL: an empty context imported\n");
+        } else {
+            std::fprintf(stderr, "unknown argument %s\n", mode);
+            return 2;
+        }
+    }
+    std::printf("%s: the call returned (APS5_ASSERT_GPU_LOCK %s)\n", mode, asserted ? "set: the assertion did not fire" : "unset");
+    return asserted ? 1 : 0;
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) return PrepareScopeDeath(argv[1]);
     MutexCounts(8, 100000, 0);
     MutexCounts(4, 2000, 20000);
     MutexTryLock();

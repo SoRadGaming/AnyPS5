@@ -9,10 +9,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
@@ -52,6 +56,58 @@ void ReportDispatchItems(bool profile) {
     std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
 }
 
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS=1, PARALLEL-COMMIT-PLAN S0): the shadow dispatch classifier.
+// With APS5_PIPELINE_DISPATCH off, every queue-0 dispatch (not a dispatch-ahead resolution) is
+// classified the way A1 would treat it (Stream::DispatchClass; the classes and their order are
+// documented there), once, and the drain episode its own drain opened is named after the class,
+// so the [stream] line gives each class the committer idle its drains caused. The reads-overlap
+// test runs against the queued writes copied before the drain (SnapshotWriters). Nothing changes
+// what the dispatch does.
+struct StreamShadow {
+    bool on = false;
+    bool classified = false;
+    std::uint64_t episode = 0;
+
+    void Classify(Stream::DispatchClass value) {
+        if (!on || classified) return;
+        classified = true;
+        Stream::Add(Stream::counters.dispatches[static_cast<std::size_t>(value)]);
+        DrawPipeline::Queue0().NoteDrainClass(episode, static_cast<std::uint8_t>(value));
+    }
+};
+
+// Set while a dispatch repeats itself (dispatch() calls itself after recording queued labels, or
+// after a dispatch-ahead adoption failed), so the repeat is not classified a second time.
+struct ShadowRepeatTag {};
+using ShadowRepeat = HostThreadSlot<bool, ShadowRepeatTag>;
+
+class ShadowRepeatScope {
+public:
+    explicit ShadowRepeatScope(bool active) : active(active), previous(active && ShadowRepeat::Get()) {
+        if (active) ShadowRepeat::Set(true);
+    }
+    ~ShadowRepeatScope() {
+        if (active) ShadowRepeat::Set(previous);
+    }
+    ShadowRepeatScope(const ShadowRepeatScope&) = delete;
+    ShadowRepeatScope& operator=(const ShadowRepeatScope&) = delete;
+
+private:
+    bool active;
+    bool previous;
+};
+
+struct ShadowWritersTag {};
+
+// The first unbounded role found, in the order Gds, Fault, Pagetable, Bda, Image.
+Stream::DispatchClass unboundedClass(std::uint32_t roles) {
+    if ((roles & DispatchUnbounded::Gds) != 0) return Stream::DispatchClass::UnboundedGds;
+    if ((roles & DispatchUnbounded::Fault) != 0) return Stream::DispatchClass::UnboundedFault;
+    if ((roles & DispatchUnbounded::Pagetable) != 0) return Stream::DispatchClass::UnboundedPagetable;
+    if ((roles & DispatchUnbounded::Bda) != 0) return Stream::DispatchClass::UnboundedBda;
+    return Stream::DispatchClass::UnboundedImage;
+}
+
 }
 
 bool Driver::pipelineDispatch() {
@@ -73,6 +129,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the shadow classifier (StreamShadow), from the drain
+    // episode open before this dispatch drained anything.
+    StreamShadow shadow;
+    if (Stream::On() && !resolving && DrawPipeline::Active() && !ShadowRepeat::Get()) {
+        if (DispatchItemsEnabled()) {
+            Stream::Add(Stream::counters.unshadowed);
+        } else {
+            shadow.on = true;
+            shadow.episode = DrawPipeline::Queue0().DrainEpisode();
+        }
+    }
     std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
     if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
 
@@ -117,6 +184,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): whether the shadow treats this dispatch as A1's
+    // candidate (pipelineCandidate without the switch), and how many items were queued when its
+    // queued writes were copied.
+    bool shadowCandidate = false;
+    std::size_t shadowQueued = 0;
     if (resolving) {
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
@@ -126,9 +198,23 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
+            shadow.Classify(Stream::DispatchClass::Fill);
             return;
         }
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the classes A1's candidate test refuses are known
+        // here and named after the drain below (so its episode takes the class); a candidate's
+        // queued writes are copied before that drain empties the queue.
+        std::optional<Stream::DispatchClass> shadowRefused;
+        if (shadow.on) {
+            if (fromAhead) shadowRefused = Stream::DispatchClass::Ahead;
+            else if (indirectArguments != 0) shadowRefused = Stream::DispatchClass::Indirect;
+            else if (!deferredLabels().labels.empty()) shadowRefused = Stream::DispatchClass::Labels;
+            else if (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) shadowRefused = Stream::DispatchClass::Copy;
+            shadowCandidate = !shadowRefused.has_value();
+            if (shadowCandidate) shadowQueued = DrawPipeline::Queue0().SnapshotWriters(ThreadScratch<std::vector<DrawPipeline::QueuedWriter>, ShadowWritersTag>());
+        }
         if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (shadowRefused.has_value()) shadow.Classify(*shadowRefused);
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
@@ -267,6 +353,34 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the shadow of A1's cache and reads tests below (the
+    // same entry regions, against the writes queued before the drain): a miss, or the items queued
+    // behind the newest writer the reads overlap.
+    bool shadowMiss = false;
+    std::optional<std::size_t> shadowBehind;
+    if (shadowCandidate) {
+        std::vector<ShaderRecompiler::MemoryRegion> reads;
+        bool entryFound = false;
+        {
+            std::lock_guard cacheLock(dispatchCacheMutex);
+            if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
+                entryFound = true;
+                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+            }
+        }
+        shadowMiss = !entryFound || noDispatchCache || stampValidate() || verifyDataHits();
+        if (!shadowMiss) {
+            const auto& writers = ThreadScratch<std::vector<DrawPipeline::QueuedWriter>, ShadowWritersTag>();
+            std::optional<std::uint32_t> newest;
+            for (const auto& region : reads) {
+                const auto end = region.guestAddress + region.bytes.size();
+                for (const auto& writer : writers) {
+                    if (region.guestAddress < writer.end && writer.begin < end && (!newest.has_value() || writer.position > *newest)) newest = writer.position;
+                }
+            }
+            if (newest.has_value() && *newest < shadowQueued) shadowBehind = shadowQueued - 1 - *newest;
+        }
+    }
     bool readsClear = false;
     if (pipelineCandidate) {
         std::vector<ShaderRecompiler::MemoryRegion> reads;
@@ -309,6 +423,26 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the candidate's class, in A1's order: a miss drains,
+    // an unbounded hit drains, a bounded hit whose reads overlap drains through the newest writer,
+    // a bounded clear hit is an item with or without a recipe.
+    if (shadowCandidate) {
+        if (shadowMiss || !cached || keepVariant == nullptr || compiledResult == nullptr) {
+            shadow.Classify(Stream::DispatchClass::Miss);
+        } else {
+            bool bounded = false;
+            std::uint32_t roles = 0;
+            static_cast<void>(DispatchWriteRanges(*compiledResult, bounded, &roles));
+            if (!bounded) {
+                shadow.Classify(unboundedClass(roles));
+            } else if (shadowBehind.has_value()) {
+                Stream::Add(Stream::counters.readsBehind[Stream::BehindBucket(*shadowBehind)]);
+                shadow.Classify(Stream::DispatchClass::Reads);
+            } else {
+                shadow.Classify(keepVariant->recipe.load(std::memory_order_acquire) != nullptr ? Stream::DispatchClass::Item : Stream::DispatchClass::NoRecipe);
+            }
+        }
+    }
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     if (readsClear) {
@@ -397,6 +531,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
+        const ShadowRepeatScope repeat(Stream::On());
         dispatch(queue, packet, submission, indirectArguments);
         return;
     }
@@ -430,6 +565,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto rethrow = [&](const std::exception& error) {
         if (fromAhead) {
             ++groupStats.deviceRejects;
+            const ShadowRepeatScope repeat(Stream::On());
             dispatch(queue, packet, submission, indirectArguments);
             return true;
         }

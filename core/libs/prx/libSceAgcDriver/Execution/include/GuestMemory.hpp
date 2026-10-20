@@ -188,7 +188,9 @@ void AssertGpuLockHeld(const char* where);
 // inside DrawPipeline::Enqueue without GpuMutex, and must never take it there (a committer that
 // waits for queue 0 while queue 0 waits for the mutex would deadlock, and nothing it prepares may
 // record). The scope marks the calling thread for its lifetime; under APS5_ASSERT_GPU_LOCK=1 a
-// lock() of GpuMutex inside it aborts with a [lock] line.
+// lock() of GpuMutex inside it aborts with a [lock] line. LOCAL DEBUG (PARALLEL-COMMIT-PLAN S0): so
+// does a try_lock() (GpuMutexType::tryEnter) and a HostImportFor call (AssertOutsidePrepareScope),
+// which only GpuMutex holders may make (COMMITTER-MAP 3.3).
 class PrepareScope {
 public:
     PrepareScope();
@@ -199,6 +201,20 @@ public:
 private:
     bool previous;
 };
+// LOCAL DEBUG (APS5_ASSERT_GPU_LOCK=1, PARALLEL-COMMIT-PLAN S0): aborts with a [lock] line naming
+// `where` when the calling thread is inside a PrepareScope (a thread that must never take GpuMutex
+// nor do what only its holders do). Off, one predictable branch.
+void AssertOutsidePrepareScope(const char* where);
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS=1, PARALLEL-COMMIT-PLAN S0): the switch of the [stream] line
+// (DrawPipeline prints it every 10 s; counters in StreamStats.hpp), read once: 0 when unset. With
+// it on, threads carry a role for the per-role counters (the tracker lock, GpuMutex waits, submits):
+// the draw committer (DrawPipeline::run), queue 0 and the compute queues (TagGpuLockThread), the
+// presenter (MarkPresenterThread) and the prep helpers (B0). Unset roles are Other. Set only while
+// the switch is on; read back as Other otherwise.
+int StreamStats();
+enum class StreamRole : std::uint8_t { Other, Committer, Queue0, Compute, Presenter, Helper, Count };
+void SetStreamRole(StreamRole role);
+StreamRole CurrentStreamRole();
 // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=1|2|3): the level of the switch (0 when unset), read once.
 // 1 counts what queue 0 finds at its draw enqueues and the committer's write-watch walks by draw
 // step and enqueue depth; 2 also shadows tickets (built, compared at commit, never used); 3 also
@@ -342,6 +358,11 @@ std::uint32_t GpuLockThreadTag();
 // the line shows who holds the mutex, not only who waits for it.
 enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
 void TagGpuLockSite(GpuLockSite site);
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the site tagged for the calling thread's outermost GpuMutex
+// hold (Try for an untagged try_lock, Other when untagged or the switch is off), for the [stream]
+// submit split; GpuLockSiteName names it.
+GpuLockSite CurrentGpuHoldSite();
+const char* GpuLockSiteName(GpuLockSite site);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
 void NoteLockedGpuWait(double ms);

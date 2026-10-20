@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
@@ -3584,6 +3585,13 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): the submit split, by the
+    // submitting thread's role and its hold's site: the whole call from here, vkEndCommandBuffer and
+    // vkQueueSubmit (a throw records nothing).
+    const bool stream = Stream::On();
+    const auto streamStartNs = stream ? Stream::NowNs() : 0;
+    std::uint64_t streamEndNs = 0;
+    std::uint64_t streamQueueSubmitNs = 0;
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
@@ -3615,7 +3623,9 @@ void Recorder::Submit() {
             if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
         }
     } discardUnsubmitted{*this, batch};
+    const auto endStartNs = stream ? Stream::NowNs() : 0;
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    if (stream) streamEndNs = Stream::NowNs() - endStartNs;
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &batch->commands;
@@ -3631,7 +3641,9 @@ void Recorder::Submit() {
         submission.pSignalSemaphores = &timeline;
     }
     const auto submitStart = std::chrono::steady_clock::now();
+    const auto queueSubmitStartNs = stream ? Stream::NowNs() : 0;
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    if (stream) streamQueueSubmitNs = Stream::NowNs() - queueSubmitStartNs;
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
@@ -3655,6 +3667,15 @@ void Recorder::Submit() {
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (stream) {
+        const auto role = static_cast<std::size_t>(GuestMemory::CurrentStreamRole());
+        const auto site = static_cast<std::size_t>(GuestMemory::CurrentGpuHoldSite());
+        auto& counters = Stream::counters;
+        Stream::Add(counters.submits[role][site]);
+        Stream::Add(counters.submitNs[role][site], Stream::NowNs() - streamStartNs);
+        Stream::Add(counters.endNs[role][site], streamEndNs);
+        Stream::Add(counters.queueSubmitNs[role][site], streamQueueSubmitNs);
+    }
 }
 
 std::uint64_t Recorder::SubmitAndEpoch() {
