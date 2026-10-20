@@ -1563,8 +1563,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
-        else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        if (import == nullptr) {
+            // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the copy's collect is an input walk.
+            const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Inputs);
+            copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        } else {
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        }
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
             auto* replay = replayInputs(recipe);
@@ -1710,6 +1715,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
+        // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the copy's collect is an input walk (nothing below
+        // in this iteration collects).
+        const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Inputs);
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, static_cast<std::size_t>(plan.paddedEnds[range] - begin));
         if (DebugDrawInputBytes()) CountDrawInputBytes(copy.reused ? DrawInputBytes::VertexReused : DrawInputBytes::VertexCopied, bytes);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);

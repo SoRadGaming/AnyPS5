@@ -1,11 +1,13 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAWTICKET_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAWTICKET_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -13,6 +15,7 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -155,14 +158,32 @@ bool Q0ByteShadow();
 // PrepareDrawBindings takes (`copied`: today's path copied it, what Q4 would save).
 void NoteTicketIndex(const DrawTicket& ticket, std::uint64_t address, std::uint64_t bytes);
 void NoteTicketSlice(const ShaderResources::TicketBindings& ticket, std::uint64_t begin, std::size_t bytes, bool copied);
-// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_PREP_DEPTH=<pre>:<bail>, a comma also separates): queue 0 prepares a ticket
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_PREP_DEPTH=<pre>:<bail>[:<post>], a comma also separates): queue 0 prepares a ticket
 // only when it finds at least `pre` items queued (default 3), and stops between parts once
-// `bail` or fewer are left (default 2). 0:0 prepares every draw (tests).
+// `bail` or fewer are left (default 2). 0:0 prepares every draw (tests). `post`
+// (APS5_EXPERIMENT_Q0_RECEIPTS): after the push queue 0 walks the draw's remaining receipt ranges
+// while more than `post` items are queued (default 1, or `bail` when that is lower).
 struct Q0PrepDepth {
     std::size_t pre = 3;
     std::size_t bail = 2;
+    std::size_t post = 1;
 };
 const Q0PrepDepth& Q0PrepDepths();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): the guest ranges whose
+// first-in-token write-watch walks the committer would make for this draw, from the draw's closure
+// objects and the ticket's parts only (no guest byte is read), appended as [begin, end):
+// - the template hint's described surfaces and their DCC keys (Revalidate's collects) and its
+//   predicted small slices (PrepareDrawBindings'), when the ticket has the hint and its memo;
+// - each single-sample color target's resident surface, DCC keys and CMASK (Refresh and the
+//   CMASK proof), from the ticket's Targets part;
+// - the depth and stencil planes and HTILE of a single-sample depth target (DepthSurfaceView);
+// - the index range: CopyDrawInput's collect under APS5_EXPERIMENT_DRAW_INPUTS_VRAM, else
+//   InPlaceIndexRange's from Recorder::KeptIndexRangeIndices indices on;
+// - under APS5_EXPERIMENT_DRAW_INPUTS_VRAM, the vertex ranges CopyDrawInput collects: exact for a
+//   non-indexed draw, each descriptor's whole extent for an indexed one (its highest index is in
+//   guest bytes, so the extent is the superset; a draw reading past its records walks itself).
+// A range queue 0 predicts wrong only costs its walk: the committer then walks as today.
+void PlanDrawTicketWalks(const DrawTicket& ticket, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 
 // The ticket when it was built for this context's device and buffer pool, else null (the whole
 // ticket is refused, counted under APS5_DEBUG_Q0_PREP_STATS).

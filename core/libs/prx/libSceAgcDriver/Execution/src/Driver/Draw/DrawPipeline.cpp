@@ -59,6 +59,12 @@ constexpr std::chrono::microseconds CommitRunWindow{150};
 
 struct CurrentRunTag {};
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): set on the committer thread (run), the only thread
+// that follows tokens as a receipt follower; a closing Enqueue's inline commit on queue 0 follows
+// the token without taking that role (its bump only ends queue 0's owner epoch).
+struct CommitterThreadTag {};
+using CommitterThread = HostThreadSlot<bool, CommitterThreadTag>;
+
 // How a commit ended: `failed` for an exception (a failed commit in the report), `shutdown` for
 // the process shutting down, which is not reported to the driver.
 struct CommitOutcome {
@@ -144,6 +150,9 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     if (Followed::Get() == token) return;
     Followed::Set(token);
     GuestMemory::BumpCollectEpoch();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): the committer follows
+    // the token in the epoch it just took; receipts of that token serve it while that epoch lasts.
+    if (GuestMemory::Q0Receipts() != 0 && CommitterThread::Get()) GuestMemory::SetReceiptFollower(token);
 }
 
 unsigned DrawPipeline::Committers() {
@@ -290,6 +299,7 @@ DrawPipeline::PrepStats DrawPipeline::TakePrepStats() {
 void DrawPipeline::run() {
     StartCommitterSampler();
     PerformanceTrace::BindThread("draw committer");
+    if (GuestMemory::Q0Receipts() != 0) CommitterThread::Set(true);
     for (;;) {
         Item* front = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });

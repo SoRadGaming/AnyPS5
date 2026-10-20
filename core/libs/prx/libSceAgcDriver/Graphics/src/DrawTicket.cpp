@@ -1,14 +1,19 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 
 namespace AgcDriver::Graphics {
@@ -282,6 +287,76 @@ void NoteTicketSlice(const ShaderResources::TicketBindings& ticket, std::uint64_
     if (copied) NoteTicketEvent(TicketEvent::SliceCopied);
 }
 
+void PlanDrawTicketWalks(const DrawTicket& ticket, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    const auto add = [&](std::uint64_t address, std::uint64_t bytes) {
+        if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+        ranges.emplace_back(address, address + bytes);
+    };
+    // Each group stands alone: a descriptor that does not describe throws, and only its own ranges
+    // are left out.
+    if (ticket.resources != nullptr) {
+        try {
+            ticket.resources->AppendDescribedRanges(ranges);
+            if (ticket.Has(DrawTicket::Moved) && ticket.memo.owner == ticket.resources.get()) {
+                struct SlicesTag {};
+                auto& slices = ThreadScratch<std::vector<std::pair<std::uint64_t, std::size_t>>, SlicesTag>();
+                slices.clear();
+                ticket.resources->PredictDrawSlices(ticket.memo, slices);
+                for (const auto& [begin, bytes] : slices) add(begin, bytes);
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    if (ticket.Has(DrawTicket::Targets) && ticket.targets.size() == state.colors.size()) {
+        for (std::size_t index = 0; index < state.colors.size(); ++index) {
+            const auto& target = ticket.targets[index];
+            const auto& color = state.colors[index];
+            if (target.multisampled) continue;
+            try {
+                const auto guestBytes = DescribeSurface(target.surface).guestBytes;
+                add(target.surface.baseAddress, guestBytes);
+                // StorageTexture::refreshProved's key collect: one key byte per 256 surface bytes.
+                if (target.surface.dccAddress != 0) add(target.surface.dccAddress, guestBytes / 256);
+            } catch (const std::exception&) {
+            }
+            if (color.cmaskAddress != 0) add(color.cmaskAddress, color.cmaskBytes);
+        }
+    }
+    if (state.depth && state.depth->samples == 1) {
+        const auto& depth = *state.depth;
+        try {
+            const bool d16 = depth.format == VK_FORMAT_D16_UNORM || depth.format == VK_FORMAT_D16_UNORM_S8_UINT;
+            add(depth.address, DepthSliceBytes(depth.extent, d16 ? 2u : 4u));
+            if (depth.stencilAddress != 0) add(depth.stencilAddress, DepthSliceBytes(depth.extent, 1u));
+            if (depth.htileAddress != 0) add(depth.htileAddress, HtileMetadataBytes(depth.extent));
+        } catch (const std::exception&) {
+        }
+    }
+    const bool inputCopies = DrawInputsVram() != 0;
+    if (draw.indexed && draw.indexCount != 0 && (inputCopies || draw.indexCount >= Recorder::KeptIndexRangeIndices)) add(draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize);
+    if (!inputCopies || shaders.empty() || shaders.front().program == nullptr || draw.indexCount == 0 || draw.instanceCount == 0) return;
+    // The vertex fetches as planVertexFetches makes them (from each descriptor's base), with the
+    // extent of a vertex-rate fetch in place of the highest index an indexed draw scans for, merged
+    // as PlanVertexCopies merges them.
+    try {
+        if (!draw.indexed && draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return;
+        const auto maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
+        struct FetchesTag {};
+        auto& fetches = ThreadScratch<std::vector<VertexFetch>, FetchesTag>();
+        fetches.clear();
+        for (const auto& attribute : shaders.front().program->vertexAttributes) {
+            if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) continue;
+            const auto& fields = attribute.resource.fields;
+            const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+            const auto stride = (fields[1] >> 16u) & 0x3fffu;
+            const auto bytes = draw.indexed && attribute.fetchIndex == 0 ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, maxIndex, draw.instanceCount, draw.firstInstance);
+            fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
+        }
+        for (const auto& [begin, end] : PlanVertexCopies(fetches).copies) add(begin, end - begin);
+    } catch (const std::exception&) {
+    }
+}
+
 bool Q0TemplateParts() {
     // Used tickets with the switch, and the shadow tickets of APS5_DEBUG_Q0_PREP_STATS=2.
     static const bool parts = Q0Template() != 0 || (Q0Ticket() == 0 && GuestMemory::Q0PrepStats() >= 2);
@@ -295,8 +370,11 @@ const Q0PrepDepth& Q0PrepDepths() {
         if (text == nullptr) return parsed;
         char* end = nullptr;
         parsed.pre = static_cast<std::size_t>(std::strtoull(text, &end, 10));
-        if (end != nullptr && (*end == ':' || *end == ',')) parsed.bail = static_cast<std::size_t>(std::strtoull(end + 1, nullptr, 10));
+        if (end != nullptr && (*end == ':' || *end == ',')) parsed.bail = static_cast<std::size_t>(std::strtoull(end + 1, &end, 10));
         else parsed.bail = parsed.pre == 0 ? 0 : parsed.pre - 1;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): the post-push walks' stop depth.
+        if (end != nullptr && (*end == ':' || *end == ',')) parsed.post = static_cast<std::size_t>(std::strtoull(end + 1, nullptr, 10));
+        else parsed.post = std::min<std::size_t>(parsed.post, parsed.bail);
         return parsed;
     }();
     return depths;

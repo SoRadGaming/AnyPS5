@@ -102,6 +102,14 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // A thread that never bumps (the presenter, game threads inside the flush hook) gets a fresh epoch
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3) amends "one worker's walk
+// never satisfies another's check" for exactly one pair of threads: a walk that queue 0 (the owner
+// of DrawPipeline's EpochToken, SetReceiptOwner) or the draw committer (its follower,
+// SetReceiptFollower) completed under (EpochToken T, the walker's epoch for T, UnwatchSerial S)
+// satisfies the committer's collects while it follows T in the epoch it took for T and S still
+// holds. Only queue 0 advances T, in the same call as its epoch, so such a walk followed T's
+// ordering point. Queue 0 never consults these receipts for its own collects; draw-ahead and
+// speculative walks and threads without a role never publish one.
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t CollectEpoch();
@@ -202,8 +210,9 @@ int Q0PrepStats();
 // (SetWalkItemDepth, set by the committer around a draw's commit: depth + 1, 0 outside one).
 // Walks outside a committed draw are not counted. The time of walks in draws enqueued at full
 // depth (DrawPipeline's PrepareBudget::full test, passed as `full`) is also summed apart, since
-// DrawPipeline::Depth() may exceed the last depth bucket.
-enum class WalkCaller : std::uint8_t { Other, Revalidate, Index, Target, Depth, Bindings, Count };
+// DrawPipeline::Depth() may exceed the last depth bucket. Inputs: the collects of CopyDrawInput's
+// index and vertex copies (most draw inputs under APS5_EXPERIMENT_DRAW_INPUTS_VRAM).
+enum class WalkCaller : std::uint8_t { Other, Revalidate, Index, Target, Depth, Bindings, Inputs, Count };
 constexpr std::size_t WalkDepthBuckets = 10;
 class WalkCallerScope {
 public:
@@ -225,6 +234,89 @@ struct WalkStats {
 };
 // The counts since the last call (reset by it).
 WalkStats TakeWalkStats();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): first-in-token walk
+// receipts (the amended contract above BumpCollectEpoch). 0 (unset or 0) off, today's code exactly.
+// 1: queue 0 walks the ranges the committer would walk first for a draw (WalkReceipts, from its
+// ticket preparation) and publishes every completed chunk into a ring of 4 token slots (merged
+// ranges per token and UnwatchSerial, a slot reset only by a newer token); the committer publishes
+// its own completed memoized walks there too (APS5_EXPERIMENT_Q0_RECEIPT_PUBLISH, default on, 0
+// off), so queue 0 skips them; and a committer collect that missed its own memos is served from
+// the ring when the slot of the token it follows covers the range under the current UnwatchSerial
+// and its epoch is still the one it took for that token: the range joins its epoch coverage and
+// the current generation is returned with an acquire load, as a memo hit returns it, so every
+// later stamp check still runs. The ring is only try_locked by the committer (a busy ring walks)
+// and is never taken under the tracker lock. 2 counts only: the committer counts the hits it would
+// have served (and how many of those walks then stamped a CPU write) and still walks. Needs
+// APS5_EXPERIMENT_Q0_TICKET, APS5_DEBUG_COVERAGE=1 (a hit joins the epoch coverage) and
+// APS5_EXPERIMENT_LAZY_GENERATION=1 (queue 0's clean walks must not move the tracker generation and
+// retire the committer's slice memos); without one of them it stays off (said once). Read once.
+// LOCAL DEBUG (APS5_DEBUG_Q0_VERIFY_WALKS=1, Windows): at each served hit the committer peeks the
+// range's write watch without resetting it and counts the dirty pages the receipt hid (writes made
+// after the receipt's walk, which this token does not see; expect a small racy count).
+int Q0Receipts();
+// Queue 0, right after its bump made `token` (Driver::bumpEpoch): it owns that token in the epoch it
+// now has. No-op while receipts are off.
+void SetReceiptOwner(std::uint64_t token);
+// The draw committer, right after DrawPipeline::FollowEpoch bumped its epoch for `token`.
+void SetReceiptFollower(std::uint64_t token);
+// The ranges queue 0 walks for one draw's receipts: page-rounded [begin, end), sorted and disjoint
+// (PlanReceiptWalks), the range being walked (`next`), where in it (`cursor`, 0 at its start) and
+// the bytes walked so far (the per-draw budget).
+struct ReceiptWalks {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::size_t next = 0;
+    std::uint64_t cursor = 0;
+    std::uint64_t walked = 0;
+    bool Done() const { return next >= ranges.size(); }
+};
+// Replaces `walks` with `planned` (address ranges [begin, end)) rounded out to whole pages, sorted
+// and merged, so a page two ranges share is walked once.
+void PlanReceiptWalks(std::span<const std::pair<std::uint64_t, std::uint64_t>> planned, ReceiptWalks& walks);
+// Queue 0, owner of `token` in the epoch it took for it (otherwise it drops the list and walks
+// nothing): walks the rest of `walks` in chunks of APS5_EXPERIMENT_Q0_RECEIPT_CHUNK_KIB (default
+// 1024, chunk-aligned), each under one tracker hold of its own (collectWrites' initialize, covers
+// and walkWrites), so the committer never waits for more than one chunk. A chunk the ring already
+// covers is skipped; one its own epoch coverage covers (walked by this thread in this epoch) is
+// published without a walk. A completed chunk joins its epoch coverage, as any completed collect,
+// and the ring. `stop` is asked before each chunk and the draw stops at `budget` bytes walked;
+// returns false when it stopped with ranges left. `afterPush` only attributes the time ([q0prep]).
+bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget, bool (*stop)(const void* context), const void* context, bool afterPush);
+// LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS with APS5_EXPERIMENT_Q0_RECEIPTS): the [q0prep] receipt
+// counts since the last call (reset by it). Queue 0: draws and ranges planned (and the planning
+// time), chunks walked
+// (bytes and ns: the walk time moved to it, before and after the push), skipped because the ring
+// or its own coverage held them, not watched or failed, published, draws it could not publish for
+// (no owner role for the draw's token) or left unfinished. Committer: chunks of its own walks
+// published, hits served (bytes, by draw step), would-be hits under =2 and how many of those walks
+// stamped, misses by reason, dirty pages a hit hid (APS5_DEBUG_Q0_VERIFY_WALKS).
+enum class ReceiptMiss : std::uint8_t { Token, Epoch, Serial, Uncovered, Busy, Count };
+struct ReceiptStats {
+    std::uint64_t draws = 0;
+    std::uint64_t ranges = 0;
+    std::uint64_t rangeBytes = 0;
+    std::uint64_t planNs = 0;
+    std::uint64_t chunks = 0;
+    std::uint64_t walkedBytes = 0;
+    std::array<std::uint64_t, 2> walkNs{};
+    std::array<std::uint64_t, 2> spentNs{};
+    std::uint64_t ringCovered = 0;
+    std::uint64_t ownCovered = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t published = 0;
+    std::uint64_t notOwner = 0;
+    std::uint64_t unfinished = 0;
+    std::uint64_t committerPublished = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t hitBytes = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(WalkCaller::Count)> hitsByCaller{};
+    std::uint64_t wouldHits = 0;
+    std::uint64_t wouldHitsStamped = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ReceiptMiss::Count)> misses{};
+    std::uint64_t hiddenPages = 0;
+};
+void NoteReceiptPlan(std::size_t ranges, std::uint64_t bytes, std::uint64_t ns);
+ReceiptStats TakeReceiptStats();
 void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.

@@ -293,6 +293,10 @@ public:
     // moved candidates only (no check against memory or recorded work, so a superset), for
     // queue 0's byte shadow.
     void PredictDrawSlices(const MovedWordsMemo& memo, std::vector<std::pair<std::uint64_t, std::size_t>>& ranges) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): the surfaces Revalidate collects for this
+    // object, from the build-fixed described ranges ([begin, end) of each surface, and of its DCC
+    // keys as the key proofs collect them), for queue 0's walk receipts.
+    void AppendDescribedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): whether the resource cache dropped this object
     // from its index (replaced, evicted, removed, cleared); set under the cache's mutex and never
     // cleared, since a dropped object is never inserted again (both insert sites take fresh builds).
