@@ -2265,6 +2265,11 @@ bool StorageTexture::Refresh() {
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
     }
     if (anyStored) {
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): the guard's lease wait, which this
+        // write-back never had (see awaitLeaseWriters). The decisions above were taken before it: a
+        // unit whose blocks the lease's marks stamp meanwhile is left to the CPU there by
+        // writeBackLayers' own keep rule, keeps its generation and re-uploads at its next refresh.
+        if (NarrowFlushSync() != 0) awaitLeaseWriters();
         const auto previous = std::exchange(flushReason, "refresh");
         writeBackLayers(stored);
         flushReason = previous;
@@ -3789,37 +3794,82 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, FlushGuard.hpp): the wait below, classified by
             // F1's predicate over the ranges F1 scans, with how its batch matched, and timed (wall,
             // and the thread's GPU wait; queue 0's apart).
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1; FlushGuard.hpp): the same
+            // predicate decides the wait. =1 skips it where the class is Stamped (the write-back is
+            // recorded behind the unfinished writers; a skip watch counts the completion stores
+            // registered before it that land after it); =2 waits as today and checks the skip: no
+            // completion store over the ranges during the wait, and every flushed image's keep
+            // decision the same before and after it.
+            const int narrow = writer != 0 ? NarrowFlushSync() : 0;
             const bool counted = writer != 0 && Stream::On();
             const std::size_t kind = writer == recorder->OpenSerial() ? 0 : 1;
             auto waitClass = FlushWaitClass::Stamped;
-            std::uint64_t startNs = 0, gpuBefore = 0;
-            if (counted) {
-                std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+            if (counted || narrow != 0) {
                 std::uint32_t conditions = 0;
                 waitClass = guardWaitClass(*recorder, address, bytes, flush, reason, scope, ranges, conditions);
-                const auto match = recorder->DescribeFlushWriter(address, bytes);
-                auto& counts = flushGuardCounts;
-                counts.matches[kind][match.written && match.lease ? 2 : match.lease ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
-                for (std::size_t index = 0; index < FlushWaitClasses; ++index) {
-                    if ((index == 0 && conditions == 0) || (conditions & (1u << index)) != 0) counts.conditions[index].fetch_add(1, std::memory_order_relaxed);
+                if (counted) {
+                    const auto match = recorder->DescribeFlushWriter(address, bytes);
+                    auto& counts = flushGuardCounts;
+                    counts.matches[kind][match.written && match.lease ? 2 : match.lease ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+                    for (std::size_t index = 0; index < FlushWaitClasses; ++index) {
+                        if ((index == 0 && conditions == 0) || (conditions & (1u << index)) != 0) counts.conditions[index].fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
-                startNs = Stream::NowNs();
-                gpuBefore = Stream::ThreadGpuWait::Get();
             }
-            if (writer == recorder->OpenSerial()) {
-                Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
-                recorder->Sync();
+            const bool skippable = narrow != 0 && waitClass == FlushWaitClass::Stamped;
+            if (skippable && narrow == 1) {
+                narrowFlushCounts.skipped.fetch_add(1, std::memory_order_relaxed);
+                static_cast<void>(recorder->WatchCompletionStores(ranges, true));
             } else if (writer != 0) {
-                recorder->FinishUpTo(writer);
-            }
-            if (counted) {
-                const auto index = static_cast<std::size_t>(waitClass);
-                const auto gpuNs = Stream::ThreadGpuWait::Get() - gpuBefore;
-                auto& counts = flushGuardCounts;
-                counts.waits[kind][index].fetch_add(1, std::memory_order_relaxed);
-                counts.wallNs[kind][index].fetch_add(Stream::NowNs() - startNs, std::memory_order_relaxed);
-                counts.gpuNs[kind][index].fetch_add(gpuNs, std::memory_order_relaxed);
-                if (GuestMemory::CurrentStreamRole() == GuestMemory::StreamRole::Queue0) counts.queue0GpuNs[kind][index].fetch_add(gpuNs, std::memory_order_relaxed);
+                std::vector<KeepCheck> before;
+                struct Watch {
+                    Recorder& recorder;
+                    std::uint64_t id;
+                    ~Watch() {
+                        if (id != 0) static_cast<void>(recorder.UnwatchCompletionStores(id));
+                    }
+                } watch{*recorder, 0};
+                if (skippable) {
+                    for (const auto& texture : flush) before.push_back(texture->keepCheck(address, bytes));
+                    watch.id = recorder->WatchCompletionStores(ranges, false);
+                }
+                const auto startNs = counted ? Stream::NowNs() : 0;
+                const auto gpuBefore = counted ? Stream::ThreadGpuWait::Get() : 0;
+                if (kind == 0) {
+                    Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
+                    recorder->Sync();
+                } else {
+                    recorder->FinishUpTo(writer);
+                }
+                if (counted) {
+                    const auto index = static_cast<std::size_t>(waitClass);
+                    const auto gpuNs = Stream::ThreadGpuWait::Get() - gpuBefore;
+                    auto& counts = flushGuardCounts;
+                    counts.waits[kind][index].fetch_add(1, std::memory_order_relaxed);
+                    counts.wallNs[kind][index].fetch_add(Stream::NowNs() - startNs, std::memory_order_relaxed);
+                    counts.gpuNs[kind][index].fetch_add(gpuNs, std::memory_order_relaxed);
+                    if (GuestMemory::CurrentStreamRole() == GuestMemory::StreamRole::Queue0) counts.queue0GpuNs[kind][index].fetch_add(gpuNs, std::memory_order_relaxed);
+                }
+                if (skippable) {
+                    if (const auto stores = recorder->UnwatchCompletionStores(std::exchange(watch.id, 0)); stores != 0) {
+                        narrowFlushCounts.storesDuringWait.fetch_add(stores, std::memory_order_relaxed);
+                        NarrowFlushDisagrees("had a completion store over its ranges during the wait (=1 would have recorded the write-back before it)", address, bytes, reason);
+                    }
+                    for (std::size_t index = 0; index < flush.size(); ++index) {
+                        const auto after = flush[index]->keepCheck(address, bytes);
+                        if (!before[index].tracked || !after.tracked || (before[index].keep == after.keep && before[index].skippedLayer == after.skippedLayer)) continue;
+                        if (before[index].cpu != after.cpu) {
+                            narrowFlushCounts.keepRaced.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        narrowFlushCounts.keepDiffered.fetch_add(1, std::memory_order_relaxed);
+                        char what[192];
+                        std::snprintf(what, sizeof(what), "changed the keep decision of image 0x%llx+0x%llx across the wait (%zu ranges stored before it, %zu after) with no CPU store collected in between", static_cast<unsigned long long>(flush[index]->descriptor.baseAddress), static_cast<unsigned long long>(flush[index]->guestBytes), before[index].keep.size(), after.keep.size());
+                        NarrowFlushDisagrees(what, address, bytes, reason);
+                    }
+                    narrowFlushCounts.verified.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
@@ -5105,6 +5155,101 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
     return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
 }
 
+void StorageTexture::planKeep(const std::vector<bool>& layers, bool tracked, const std::vector<bool>& compared, std::span<const std::uint8_t> changedBlocks, std::uint64_t spanBegin, KeepPlan& plan) const {
+    constexpr std::uint64_t block = 65536;
+    auto& keep = plan.keep;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layers[layer]) continue;
+        const auto begin = layerBegin(layer);
+        const auto end = begin + layerBytes(layer);
+        if (tracked ? layerGeneration[layer] == 0 : !compared[layer]) {
+            plan.unsavedOutsideWatch = plan.unsavedOutsideWatch || !tracked;
+            keep.emplace_back(begin, end);
+            continue;
+        }
+        for (auto at = begin & ~(block - 1); at < end; at += block) {
+            const auto from = std::max(at, begin);
+            const auto to = std::min(at + block, end);
+            if (from >= to) continue;
+            const bool edge = from != at || to != at + block;
+            if (keptAtUnwatchHolds(from, layer) || (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to))) {
+                plan.skippedAny = true;
+                plan.skippedLayer[layer] = true;
+                ++plan.skipped;
+                continue;
+            }
+            if (!keep.empty() && keep.back().second == from) keep.back().second = to;
+            else keep.emplace_back(from, to);
+        }
+    }
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC=2, F1): writeBack's selection (every pending
+// unit when its widening is on, APS5_BLOCK_WRITEBACK_WIDEN=1) and writeBackLayers' collect, stamps
+// and plan, for a tracked span; the untracked compare is not made (F1 waits for untracked images).
+StorageTexture::KeepCheck StorageTexture::keepCheck(std::uint64_t address, std::size_t bytes) const {
+    static const bool widen = std::getenv("APS5_BLOCK_WRITEBACK_EACH") == nullptr && std::getenv("APS5_BLOCK_WRITEBACK_WIDEN") != nullptr;
+    KeepCheck check;
+    std::vector<bool> layers(trackedLayers, false);
+    const bool whole = widen || (descriptor.dccAddress != 0 && uploadedKeys != DccKeys::Uncompressed);
+    std::uint64_t firstStored = descriptor.baseAddress + guestBytes;
+    std::uint64_t lastStored = descriptor.baseAddress;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layerPending[layer]) continue;
+        layers[layer] = whole || (address < layerBegin(layer) + layerBytes(layer) && layerBegin(layer) < address + bytes);
+        if (!layers[layer]) continue;
+        firstStored = std::min(firstStored, layerBegin(layer));
+        lastStored = std::max(lastStored, layerBegin(layer) + layerBytes(layer));
+    }
+    check.tracked = true;
+    if (lastStored <= firstStored) return check;
+    constexpr std::uint64_t block = 65536;
+    const auto spanBegin = firstStored & ~(block - 1);
+    const auto spanBlocks = static_cast<std::size_t>((lastStored - spanBegin + block - 1) / block);
+    GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+    std::vector<std::uint64_t> generations(spanBlocks, 0);
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layers[layer]) continue;
+        const auto end = layerBegin(layer) + layerBytes(layer);
+        for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) generations[static_cast<std::size_t>((at - spanBegin) / block)] = layerGeneration[layer];
+    }
+    std::vector<std::uint8_t> changedBlocks(spanBlocks);
+    check.cpu.assign(spanBlocks, 0);
+    check.tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks, check.cpu);
+    if (!check.tracked) return check;
+    KeepPlan plan;
+    plan.skippedLayer.assign(trackedLayers, false);
+    planKeep(layers, true, std::vector<bool>(trackedLayers, false), changedBlocks, spanBegin, plan);
+    check.keep = std::move(plan.keep);
+    check.skippedLayer = std::move(plan.skippedLayer);
+    return check;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): FlushPending's lease wait over this
+// image's surface and keys (finished batches reaped first; the open batch synced when it holds the
+// lease, the in-flight ones finished up to it otherwise). Not inside a completion action, as the
+// guard. Counted with its wall time.
+void StorageTexture::awaitLeaseWriters() {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || Recorder::InCompletion()) return;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> ranges{{{descriptor.baseAddress, descriptor.baseAddress + guestBytes}, {descriptor.dccAddress, descriptor.dccAddress + DccKeyBytes(guestBytes)}}};
+    const std::span<const std::pair<std::uint64_t, std::uint64_t>> scanned(ranges.data(), descriptor.dccAddress != 0 ? 2 : 1);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (recorder->LeaseWriterSerial(scanned) == 0) return;
+    const auto start = std::chrono::steady_clock::now();
+    recorder->Reap();
+    const auto writer = recorder->LeaseWriterSerial(scanned);
+    if (writer == 0) return;
+    if (writer == recorder->OpenSerial()) {
+        Recorder::CountSync(3);
+        recorder->Sync();
+    } else {
+        recorder->FinishUpTo(writer);
+    }
+    narrowFlushCounts.refreshLeaseWaits.fetch_add(1, std::memory_order_relaxed);
+    narrowFlushCounts.refreshLeaseNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -5171,31 +5316,15 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             cancelStoredSave(layer);
         }
     };
-    bool unsavedOutsideWatch = false;
-    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (!layers[layer]) continue;
-        const auto begin = layerBegin(layer);
-        const auto end = begin + layerBytes(layer);
-        if (tracked ? layerGeneration[layer] == 0 : !compared[layer]) {
-            unsavedOutsideWatch = unsavedOutsideWatch || !tracked;
-            keep.emplace_back(begin, end);
-            continue;
-        }
-        for (auto at = begin & ~(block - 1); at < end; at += block) {
-            const auto from = std::max(at, begin);
-            const auto to = std::min(at + block, end);
-            if (from >= to) continue;
-            const bool edge = from != at || to != at + block;
-            if (keptAtUnwatchHolds(from, layer) || (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to))) {
-                skippedAny = true;
-                skippedLayer[layer] = true;
-                ++skipped;
-                continue;
-            }
-            if (!keep.empty() && keep.back().second == from) keep.back().second = to;
-            else keep.emplace_back(from, to);
-        }
-    }
+    // The decision itself is planKeep's (shared with the F1 verify check, keepCheck).
+    KeepPlan plan;
+    plan.skippedLayer.assign(trackedLayers, false);
+    planKeep(layers, tracked, compared, changedBlocks, spanBegin, plan);
+    keep = std::move(plan.keep);
+    skippedLayer = std::move(plan.skippedLayer);
+    skippedAny = plan.skippedAny;
+    skipped = plan.skipped;
+    const bool unsavedOutsideWatch = plan.unsavedOutsideWatch;
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers[layer]) forgetKeptAtUnwatch(layer);
     }

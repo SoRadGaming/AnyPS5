@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS=1, PARALLEL-COMMIT-PLAN section 5, "Queue-0 GPU waits in
 // dispatch preparation"): the waits of StorageTexture::FlushPending's hand-over guard (9fffceaa9:
@@ -88,6 +90,75 @@ inline FlushGuardTotals TakeFlushGuardCounts() {
     }
     for (std::size_t index = 0; index < FlushWaitClasses; ++index) totals.conditions[index] = take(counts.conditions[index]);
     return totals;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, PARALLEL-COMMIT-PLAN section 5, F1): the guard
+// skips its wait when F1's predicate holds (class Stamped above) and stores at once: every unfinished
+// writer of the scanned ranges stamped its blocks when it was recorded, the GPU runs it before the
+// write-back recorded behind it, and no completion of those batches stores into the ranges on the
+// CPU. Otherwise it waits as today. Also, under the switch, Refresh's own write-back waits like the
+// guard for an unfinished address-based lease over the image (its keep decision would miss the
+// lease's marks, which land at completion), which nothing waits for today. 1 uses it, and counts
+// the completion stores over a skipped flush's ranges that were registered before its write-back
+// and land after it (must stay 0; a tagged line each, the first 8). 2 verifies it: the guard waits
+// as today wherever the predicate would skip, and aborts with a [narrow-flush] line when a
+// completion stored into the ranges during the wait, or when a flushed image's keep decision (its
+// write-back's 64 KiB blocks left to the CPU) differs before and after the wait without a CPU store
+// collected in between (one with a CPU store is counted apart: today's own race, not F1's).
+// Unset or 0: today's guard alone. The CPU round-trip write-back (no import) and the alias copy's
+// flush keep their wait (classes NoImport and AliasCopy).
+inline int NarrowFlushSync() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_NARROW_FLUSH_SYNC");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+// Relaxed, constant-initialized; the [stream] report takes them (TakeNarrowFlushCounts).
+struct NarrowFlushCounts {
+    // =1: guard waits skipped, and completion stores behind a skipped write-back (must stay 0).
+    FlushCounter skipped{};
+    FlushCounter storesBehindSkip{};
+    // =2: waits the predicate would skip, made and checked; completion stores over the ranges during
+    // them and keep decisions that differed without a CPU store (each aborts); keep decisions that
+    // differed with a CPU store collected during the wait.
+    FlushCounter verified{};
+    FlushCounter storesDuringWait{};
+    FlushCounter keepDiffered{};
+    FlushCounter keepRaced{};
+    // =1 and =2: Refresh's own write-back waiting for an address-based lease, and the wall time.
+    FlushCounter refreshLeaseWaits{};
+    FlushCounter refreshLeaseNs{};
+};
+
+inline constinit NarrowFlushCounts narrowFlushCounts;
+
+struct NarrowFlushTotals {
+    std::uint64_t skipped = 0, storesBehindSkip = 0, verified = 0, storesDuringWait = 0, keepDiffered = 0, keepRaced = 0, refreshLeaseWaits = 0, refreshLeaseNs = 0;
+};
+
+inline NarrowFlushTotals TakeNarrowFlushCounts() {
+    auto& counts = narrowFlushCounts;
+    const auto take = [](FlushCounter& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    NarrowFlushTotals totals;
+    totals.skipped = take(counts.skipped);
+    totals.storesBehindSkip = take(counts.storesBehindSkip);
+    totals.verified = take(counts.verified);
+    totals.storesDuringWait = take(counts.storesDuringWait);
+    totals.keepDiffered = take(counts.keepDiffered);
+    totals.keepRaced = take(counts.keepRaced);
+    totals.refreshLeaseWaits = take(counts.refreshLeaseWaits);
+    totals.refreshLeaseNs = take(counts.refreshLeaseNs);
+    return totals;
+}
+
+[[noreturn]] inline void NarrowFlushDisagrees(const char* what, unsigned long long address, unsigned long long bytes, const char* reason) {
+    std::fprintf(stderr, "[narrow-flush] APS5_EXPERIMENT_NARROW_FLUSH_SYNC=2: a guard wait F1 would skip (%s 0x%llx+0x%llx) %s\n", reason != nullptr ? reason : "?", address, bytes, what);
+    std::fflush(stderr);
+    std::abort();
 }
 
 }

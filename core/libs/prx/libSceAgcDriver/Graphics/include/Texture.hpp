@@ -547,6 +547,31 @@ private:
     // flushed image's surface and DCC keys), `conditions` a bit per condition that held (the import
     // is looked up only when no other condition held). Under GuestMemory::GpuMutex.
     static FlushWaitClass guardWaitClass(const Recorder& recorder, std::uint64_t address, std::size_t bytes, std::span<const std::shared_ptr<StorageTexture>> flush, const char* reason, PublishScope scope, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint32_t& conditions);
+    // writeBackLayers' keep decision over the selected `layers` (the stamps in `changedBlocks`, one per
+    // 64 KiB block from `spanBegin`; `compared`: the layers an untracked compare decided): the ranges
+    // to store, and the layers with blocks left to the CPU.
+    struct KeepPlan {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> keep;
+        std::vector<bool> skippedLayer;
+        bool skippedAny = false;
+        std::size_t skipped = 0;
+        bool unsavedOutsideWatch = false;
+    };
+    void planKeep(const std::vector<bool>& layers, bool tracked, const std::vector<bool>& compared, std::span<const std::uint8_t> changedBlocks, std::uint64_t spanBegin, KeepPlan& plan) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC=2, F1): the keep decision writeBack(address,
+    // bytes) would take now for a tracked image (every pending unit when the widening is on), after
+    // an uncached collect of its span, with the CPU stamps of the span's blocks; `tracked` false: the
+    // span is outside the write watch (nothing decided).
+    struct KeepCheck {
+        bool tracked = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> keep;
+        std::vector<bool> skippedLayer;
+        std::vector<std::uint8_t> cpu;
+    };
+    KeepCheck keepCheck(std::uint64_t address, std::size_t bytes) const;
+    // LOCAL EXPERIMENT (F1): under the switch, Refresh's own write-back first waits, as the guard
+    // does, for an unfinished batch holding an address-based lease over the surface or its keys.
+    void awaitLeaseWriters();
     VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format) const;
     bool singlePass();
     VkImageView elementLayerView(std::uint32_t level, std::uint32_t layer);

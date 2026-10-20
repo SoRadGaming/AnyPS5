@@ -6,6 +6,7 @@
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FlushGuard.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
@@ -3207,6 +3208,50 @@ Recorder::FlushWriter Recorder::DescribeFlushWriter(std::uint64_t address, std::
     return {};
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1; FlushGuard.hpp): see the declarations.
+std::uint64_t Recorder::LeaseWriterSerial(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+    const auto leased = [&](const Batch& batch) {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < range.second && readOverlap(batch, range.first, range.second, ReadKind::AddressBased).has_value(); });
+    };
+    if (open != nullptr && leased(*open)) return OpenSerial();
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (leased(**it)) return (*it)->serial;
+    }
+    return 0;
+}
+
+std::uint64_t Recorder::WatchCompletionStores(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool behindOpen) {
+    const auto id = ++completionWatchIds;
+    const auto serial = behindOpen ? OpenSerial() : std::numeric_limits<std::uint64_t>::max();
+    const auto actions = behindOpen ? (open != nullptr ? open->completions.size() : 0) : std::numeric_limits<std::size_t>::max();
+    completionWatches.push_back({id, {ranges.begin(), ranges.end()}, behindOpen, serial, actions, 0});
+    return id;
+}
+
+std::uint64_t Recorder::UnwatchCompletionStores(std::uint64_t id) {
+    const auto found = std::find_if(completionWatches.begin(), completionWatches.end(), [&](const CompletionWatch& watch) { return watch.id == id; });
+    if (found == completionWatches.end()) return 0;
+    const auto stores = found->stores;
+    completionWatches.erase(found);
+    return stores;
+}
+
+// A CPU store a completion action makes over [address, end): counted by the watches it concerns (a
+// skip watch only for the actions registered before its write-back: every action of an earlier
+// batch, the first `actions` of its own).
+void Recorder::noteCompletionStore(std::uint64_t address, std::uint64_t end) {
+    if (completionWatches.empty() || CompletionDepth::Get() == 0) return;
+    for (auto& watch : completionWatches) {
+        if (watch.behindOpen && !(completingSerial < watch.serial || (completingSerial == watch.serial && completingAction < watch.actions))) continue;
+        if (!std::any_of(watch.ranges.begin(), watch.ranges.end(), [&](const auto& range) { return address < range.second && range.first < end; })) continue;
+        ++watch.stores;
+        if (!watch.behindOpen) continue;
+        narrowFlushCounts.storesBehindSkip.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[narrow-flush] APS5_EXPERIMENT_NARROW_FLUSH_SYNC=1: a completion store over 0x%llx+0x%llx (batch %llu, action %zu) landed after a skipped hand-over write-back recorded behind it into batch %llu\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address), static_cast<unsigned long long>(completingSerial), completingAction, static_cast<unsigned long long>(watch.serial));
+    }
+}
+
 bool Recorder::signaled(const Batch& batch) const {
     return batch.submitted && issued(batch, "signaled") && fenceStatus(batch.fence) == VK_SUCCESS;
 }
@@ -3593,6 +3638,8 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
             return;
         }
         completionStoresRun.fetch_add(1, std::memory_order_relaxed);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): a completion store the watches see.
+        if (!completionWatches.empty()) noteCompletionStore(address, address + copy.size());
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
     });
@@ -3634,6 +3681,9 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
     if (recorder == nullptr || bytes == 0) return;
     GuestMemory::AssertGpuLockHeld("Recorder::NoteWrittenBack");
     const auto end = address + bytes;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): a completion store the watches see
+    // (only inside a completion action: a synchronous draw's write-back is none).
+    if (!recorder->completionWatches.empty()) recorder->noteCompletionStore(address, end);
     {
         std::lock_guard ringLock(recorder->writtenBackMutex);
         recorder->writtenBack.push_back({++recorder->writtenBackSequence, address, end});
@@ -4287,13 +4337,29 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             InCompletion() { CompletionDepth::Set(CompletionDepth::Get() + 1); }
             ~InCompletion() { CompletionDepth::Set(CompletionDepth::Get() - 1); }
         } inCompletion;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): which batch and action run, for
+        // the completion-store watches; restored on exit (a completion may finish batches itself).
+        struct Completing {
+            Recorder& recorder;
+            std::uint64_t serial;
+            std::size_t action;
+            ~Completing() {
+                recorder.completingSerial = serial;
+                recorder.completingAction = action;
+            }
+        } completing{*this, std::exchange(completingSerial, batch->serial), std::exchange(completingAction, 0)};
         for (auto& action : batch->completions) {
             try {
                 action();
             } catch (const std::exception& error) {
                 AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
+            ++completingAction;
         }
+    }
+    // LOCAL EXPERIMENT (F1): a skip watch ends with the batch its write-back went into.
+    if (!completionWatches.empty()) {
+        std::erase_if(completionWatches, [&](const CompletionWatch& watch) { return watch.behindOpen && watch.serial <= batch->serial; });
     }
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

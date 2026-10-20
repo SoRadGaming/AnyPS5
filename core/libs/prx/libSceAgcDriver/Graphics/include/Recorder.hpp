@@ -375,6 +375,20 @@ public:
         bool lease = false;
     };
     FlushWriter DescribeFlushWriter(std::uint64_t address, std::size_t bytes) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1; FlushGuard.hpp): the newest unfinished
+    // batch (the open one first, with the serial it will get) that reads one of the ranges through an
+    // address-based lease; 0: none. Under the mutex.
+    std::uint64_t LeaseWriterSerial(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    // LOCAL EXPERIMENT (F1): watches the CPU stores completion actions make over `ranges` (a copied
+    // writer's write-back, which NoteWrittenBack announces, and a completion label's store). A wait
+    // watch (`behindOpen` false) sees every completion store until UnwatchCompletionStores returns
+    // their count. A skip watch (`behindOpen` true) sees the actions registered before the call (all
+    // of the in-flight batches' and the open batch's so far), which a write-back recorded now into
+    // the open batch precedes on the GPU while they store on the CPU after it; each such store is
+    // counted into narrowFlushCounts.storesBehindSkip with a [narrow-flush] line (the first 8), and
+    // the watch ends once the open batch finished. Under the mutex.
+    std::uint64_t WatchCompletionStores(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool behindOpen);
+    std::uint64_t UnwatchCompletionStores(std::uint64_t id);
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
@@ -1045,6 +1059,23 @@ private:
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): the completion-store watches (see
+    // WatchCompletionStores; a skip watch's `serial` is the batch its write-back went into and
+    // `actions` that batch's completions registered before it, a wait watch has both at their
+    // maximum), and the batch and action whose completion finish() runs.
+    struct CompletionWatch {
+        std::uint64_t id;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        bool behindOpen;
+        std::uint64_t serial;
+        std::size_t actions;
+        std::uint64_t stores;
+    };
+    std::vector<CompletionWatch> completionWatches;
+    std::uint64_t completionWatchIds = 0;
+    std::uint64_t completingSerial = 0;
+    std::size_t completingAction = 0;
+    void noteCompletionStore(std::uint64_t address, std::uint64_t end);
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;

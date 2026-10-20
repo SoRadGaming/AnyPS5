@@ -948,6 +948,7 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         lock.unlock();
         static_cast<void>(takeStreamTotals());
         static_cast<void>(Graphics::TakeFlushGuardCounts());
+        static_cast<void>(Graphics::TakeNarrowFlushCounts());
         if (PrepHelpers::On()) static_cast<void>(PrepHelpers::TakeWindow(PrepHelpers::Report::Stream));
         return;
     }
@@ -1198,6 +1199,15 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         for (std::size_t index = 0; index < Graphics::FlushWaitClasses; ++index) {
             cell();
             appendStream(line, " %s %llu", index == 0 ? "none" : Graphics::FlushWaitClassNames[index], count(guard.conditions[index]));
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): the waits it skipped (=1; its
+        // would-skip above then counts no waits), the completion stores that landed behind a
+        // skipped write-back (must be 0), Refresh's lease waits, and =2's checks.
+        if (const int narrowMode = Graphics::NarrowFlushSync(); narrowMode != 0) {
+            const auto narrow = Graphics::TakeNarrowFlushCounts();
+            appendStream(line, "; F1 (APS5_EXPERIMENT_NARROW_FLUSH_SYNC=%d): skipped %llu, completion stores behind a skipped write-back %llu (must be 0)", narrowMode, count(narrow.skipped), count(narrow.storesBehindSkip));
+            appendStream(line, ", refresh lease waits %llu, %.1f ms", count(narrow.refreshLeaseWaits), streamMs(narrow.refreshLeaseNs));
+            if (narrowMode == 2) appendStream(line, ", verified %llu: completion stores during the wait %llu, keep decisions differed %llu, raced by a CPU store %llu", count(narrow.verified), count(narrow.storesDuringWait), count(narrow.keepDiffered), count(narrow.keepRaced));
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
