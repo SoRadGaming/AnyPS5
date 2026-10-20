@@ -33,9 +33,18 @@ struct TicketInputs {
     std::span<const Graphics::CompiledShader> stages;
     const Graphics::PreparedDraw* prepared = nullptr;
     std::uint64_t token = 0;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): set when queue 0 planned this draw's receipt
+    // walks (into its own thread's list, copied from the closure's objects while it built the
+    // ticket, so the walks after the push read nothing the closure owns).
+    bool receipts = false;
 };
 // The Prepare that builds the ticket of `inputs` (which must outlive the Enqueue call).
 DrawPipeline::Prepare DrawTicketPrepare(TicketInputs& inputs);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): on queue 0 right after the
+// draw's Enqueue returned: walks the receipt ranges its preparation left while more than the
+// post-push depth (APS5_EXPERIMENT_Q0_PREP_DEPTH's third field) of items are queued, never while
+// queue 0 holds GuestMemory::GpuMutex, inside a GuestMemory::PrepareScope.
+void WalkTicketReceipts(const TicketInputs& inputs);
 
 }
 

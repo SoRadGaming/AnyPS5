@@ -4134,7 +4134,14 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(context, vertices + 2, 256, 4) == nullptr, "a draw input misaligned for its format was bound in place");
     Require(freeRange(InPlaceDrawInput(context, vertices + 2, 256, 2)), refused ? "an aligned 16-bit draw input was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM" : "an aligned 16-bit draw input was not bound in place");
     recorder.NotePendingWrite(address + 8192, 16);
-    Require(freeRange(InPlaceDrawInput(context, address + 8192, 256, 4)) && !recorder.PendingWriteOverlaps(address + 8192, 256), refused ? "a draw input after a completed GPU write was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM, or the write was not completed" : "a draw input under a pending GPU write was bound before the write completed");
+    const auto* afterWrite = InPlaceDrawInput(context, address + 8192, 256, 4);
+    if (refused) {
+        // Under the switch an index range is refused before any check: the flush that completes the
+        // write is its copy's (CopyDrawInput runs the flush hook first), made here as the draw would.
+        Require(afterWrite == nullptr && recorder.PendingWriteOverlaps(address + 8192, 256), "an index range under APS5_EXPERIMENT_DRAW_INPUTS_VRAM was bound in place or ran the flush hook");
+        AgcDriver::GuestMemory::FlushGpuWrites(address + 8192, 256);
+    }
+    Require(freeRange(afterWrite) && !recorder.PendingWriteOverlaps(address + 8192, 256), refused ? "a draw input after a completed GPU write was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM, or the write was not completed" : "a draw input under a pending GPU write was bound before the write completed");
     bool behind = false;
     Require(freeRange(InPlaceDrawInput(context, address + 20480, 256, 4, &behind)) && !behind, refused ? "a vertex input free of pending GPU writes was bound in place under APS5_EXPERIMENT_DRAW_INPUTS_VRAM or marked as ordered behind one" : "a vertex input free of pending GPU writes was marked as ordered behind one");
     recorder.NotePendingWrite(address + 20480, 16);

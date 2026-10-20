@@ -33,7 +33,12 @@ std::chrono::steady_clock::time_point& Driver::lastEpochBump() {
 void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     lastEpochBump() = std::chrono::steady_clock::now();
     GuestMemory::BumpCollectEpoch();
-    if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
+    if (DrawPipeline::Active()) {
+        const auto token = DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed) + 1;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): queue 0 owns the
+        // token it just made, in the epoch it just took (its walk receipts are published for it).
+        if (GuestMemory::Q0Receipts() != 0) GuestMemory::SetReceiptOwner(token);
+    }
     ++(epochBumps().*counter);
 }
 

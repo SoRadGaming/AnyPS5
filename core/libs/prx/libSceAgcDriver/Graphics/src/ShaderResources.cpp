@@ -4250,6 +4250,16 @@ void ShaderResources::PrecollectSurfaces() const {
     for (const auto& range : describedRanges) GuestMemory::CollectWrites(range.address, static_cast<std::size_t>(range.bytes));
 }
 
+void ShaderResources::AppendDescribedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+    // Fixed once the build completed (see Revalidate), so queue 0 reads them without the GPU mutex.
+    for (const auto& range : describedRanges) {
+        if (range.address == 0 || range.bytes == 0 || range.bytes > std::numeric_limits<std::uint64_t>::max() - range.address) continue;
+        ranges.emplace_back(range.address, range.address + range.bytes);
+        // ProvedClearKeys' collect: one key byte per 256 surface bytes.
+        if (range.dccAddress != 0 && range.bytes >= 256) ranges.emplace_back(range.dccAddress, range.dccAddress + range.bytes / 256);
+    }
+}
+
 void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags) {
     Require(binding.count != 0, "empty descriptor binding");
     const auto heap = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));

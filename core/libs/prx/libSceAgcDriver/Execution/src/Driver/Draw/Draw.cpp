@@ -697,6 +697,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             prepare = DrawTicketPrepare(ticketInputs);
         }
         DrawPipeline::Queue0().Enqueue([held] { held->commit(held->ticket.get()); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw, ticketed ? &prepare : nullptr);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): the receipt walks the preparation left, from
+        // queue 0's own list (the committer may already be committing the closure).
+        if (ticketed) WalkTicketReceipts(ticketInputs);
         if (GuestMemory::Q0PrepStats() != 0) reportQ0Prep();
         if (exactBatchCap()) drawCountedAtCommit() = true;
         phaseTiming.Phase(DrawRowLockWait);

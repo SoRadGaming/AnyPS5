@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
@@ -15,6 +16,8 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -75,6 +78,47 @@ void fillByteShadow(Graphics::DrawTicket& ticket, const TicketInputs& inputs, co
     ticket.parts |= Graphics::DrawTicket::ByteShadow;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): queue 0's receipt walks for
+// the draw it is enqueuing, in its own thread's list (one draw at a time: planned by prepareTicket,
+// walked on by WalkTicketReceipts after the push, dropped by the next plan), at most 64 MiB walked
+// per draw.
+constexpr std::uint64_t ReceiptBudgetBytes = std::uint64_t{64} << 20;
+
+GuestMemory::ReceiptWalks& receiptWalks() {
+    struct Tag {};
+    return ThreadScratch<GuestMemory::ReceiptWalks, Tag>();
+}
+
+bool prepareStops(const void* budget) {
+    return static_cast<const DrawPipeline::PrepareBudget*>(budget)->Stop();
+}
+
+bool postPushStops(const void* post) {
+    return DrawPipeline::Queue0().Outstanding() <= *static_cast<const std::size_t*>(post);
+}
+
+// Plans the ranges from the closure's objects and the ticket (Graphics::PlanDrawTicketWalks) into
+// queue 0's list; walks them now only inside a full pipeline wait (every draw with a 0 pre depth,
+// the tests' setting), stopping at the ticket's bail depth: collects first and only, no result
+// derived from guest bytes, so nothing here needs a re-check at the commit beyond the receipt's own.
+void planReceipts(const Graphics::DrawTicket& ticket, TicketInputs& inputs, const DrawPipeline::PrepareBudget& budget) {
+    const bool timed = GuestMemory::Q0PrepStats() != 0;
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct PlannedTag {};
+    auto& planned = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, PlannedTag>();
+    planned.clear();
+    Graphics::PlanDrawTicketWalks(ticket, *inputs.state, inputs.parameters, inputs.stages, planned);
+    auto& walks = receiptWalks();
+    GuestMemory::PlanReceiptWalks(planned, walks);
+    if (timed) {
+        std::uint64_t bytes = 0;
+        for (const auto& [begin, end] : walks.ranges) bytes += end - begin;
+        GuestMemory::NoteReceiptPlan(walks.ranges.size(), bytes, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
+    inputs.receipts = !walks.Done();
+    if (inputs.receipts && (budget.full || Graphics::Q0PrepDepths().pre == 0) && !budget.Stop()) GuestMemory::WalkReceipts(inputs.token, walks, ReceiptBudgetBytes, &prepareStops, &budget, false);
+}
+
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, COMMITTER-SPLIT-PLAN Q1): queue 0 builds the draw's
 // ticket inside Enqueue, in a GuestMemory::PrepareScope and without GpuMutex. The context is the
 // device's without a recorder or copied writers, so any recorder use on this path faults at once;
@@ -111,6 +155,16 @@ void prepareTicket(void* self, const DrawPipeline::PrepareBudget& budget) {
         if (Graphics::Q0WordParts() && !budget.Stop()) Graphics::FillDrawTicketWords(*ticket, context, inputs.stages);
         // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, in full pipeline waits only.
         if (Graphics::Q0ByteShadow() && budget.full && !budget.Stop()) fillByteShadow(*ticket, inputs, budget);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): the draw's
+        // first-in-token walks, after the cheap parts (the rest after the push); a failure here
+        // costs the receipts only, never the ticket.
+        if (GuestMemory::Q0Receipts() != 0) {
+            try {
+                planReceipts(*ticket, inputs, budget);
+            } catch (const std::exception&) {
+                inputs.receipts = false;
+            }
+        }
         Graphics::NoteTicketBuilt(*ticket);
         *inputs.slot = std::move(ticket);
     } catch (const std::exception&) {
@@ -135,6 +189,20 @@ DrawPipeline::Prepare DrawTicketPrepare(TicketInputs& inputs) {
     return prepare;
 }
 
+void WalkTicketReceipts(const TicketInputs& inputs) {
+    if (!inputs.receipts) return;
+    auto& walks = receiptWalks();
+    if (walks.Done() || GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const auto post = Graphics::Q0PrepDepths().post;
+    const GuestMemory::PrepareScope scope;
+    try {
+        GuestMemory::WalkReceipts(inputs.token, walks, ReceiptBudgetBytes, &postPushStops, &post, true);
+    } catch (const std::exception&) {
+        // Only the receipts are lost: the committer walks as today.
+        walks.next = walks.ranges.size();
+    }
+}
+
 void Driver::noteQ0PrepCommit() {
     committedDraws.fetch_add(1, std::memory_order_relaxed);
 }
@@ -152,6 +220,7 @@ void Driver::reportQ0Prep() {
         DrawPipeline::Queue0().TakePrepStats();
         GuestMemory::TakeWalkStats();
         Graphics::TakeTicketCounts();
+        if (GuestMemory::Q0Receipts() != 0) GuestMemory::TakeReceiptStats();
         committedDraws.store(0, std::memory_order_relaxed);
         return;
     }
@@ -181,7 +250,7 @@ void Driver::reportQ0Prep() {
     state.dropped = dropped;
     // The committer's walks: per draw step, the ms and the share of it in draws enqueued at d >= 2,
     // d >= 3 and at full depth (the predictable part a ticket or a receipt could move).
-    static constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WalkCaller::Count)> callers{"other", "revalidate", "index", "target", "depth", "bindings"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WalkCaller::Count)> callers{"other", "revalidate", "index", "target", "depth", "bindings", "inputs"};
     const auto walks = GuestMemory::TakeWalkStats();
     std::string steps;
     std::uint64_t totalNs = 0, totalTwoNs = 0, totalWalks = 0;
@@ -215,6 +284,26 @@ void Driver::reportQ0Prep() {
         parts += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[q0prep] tickets (10 s, %s): built %llu, skipped shallow %llu, skipped holding the GPU mutex %llu; refused at the commit: device %llu, pool %llu; parts:%s\n", Graphics::Q0Ticket() == 0 ? "shadow" : Graphics::Q0Ticket() == 2 ? "verify" : "used", count(tickets.built), count(tickets.shallow), count(tickets.locked), count(tickets.refusedDevice), count(tickets.refusedPool), parts.c_str());
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): queue 0's receipt walks (the walk time moved off
+    // the committer) and what the committer's collects made of them.
+    if (GuestMemory::Q0Receipts() != 0) {
+        const auto receipts = GuestMemory::TakeReceiptStats();
+        std::string steps;
+        for (std::size_t caller = 0; caller < callers.size(); ++caller) {
+            char item[48];
+            std::snprintf(item, sizeof(item), " %s %llu", callers[caller], count(receipts.hitsByCaller[caller]));
+            steps += item;
+        }
+        static constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::ReceiptMiss::Count)> missNames{"token", "epoch", "serial", "uncovered", "busy"};
+        std::string misses;
+        for (std::size_t why = 0; why < missNames.size(); ++why) {
+            char item[48];
+            std::snprintf(item, sizeof(item), " %s %llu", missNames[why], count(receipts.misses[why]));
+            misses += item;
+        }
+        const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+        AgcDriver::ProfilePrint_nid_no_patch("[q0prep] receipts (10 s, %s): queue 0 planned %llu draws, %llu ranges %.0f MiB (%.2f us per draw); walked %llu chunks %.0f MiB in %.1f ms before the push + %.1f ms after (%.1f + %.1f ms with the skips and publishing); runs skipped: noted by queue 0 (no lock) %llu, in the ring %llu, walked by queue 0 this epoch (published) %llu; ring locks %llu (%.1f per draw); chunks unwatched %llu, failed %llu; published %llu ranges, committer walks %llu; draws without the owner role %llu, unfinished after the push %llu; committer: hits %llu (%.0f MiB, by step:%s), count-only hits %llu (their walk stamped the requested range %llu, the walk widened to whole blocks %llu), misses:%s; dirty pages hidden by hits %llu\n", GuestMemory::Q0Receipts() == 2 ? "count only" : "used", count(receipts.draws), count(receipts.ranges), static_cast<double>(receipts.rangeBytes) / 1048576.0, receipts.draws == 0 ? 0.0 : static_cast<double>(receipts.planNs) / 1e3 / static_cast<double>(receipts.draws), count(receipts.chunks), static_cast<double>(receipts.walkedBytes) / 1048576.0, ms(receipts.walkNs[0]), ms(receipts.walkNs[1]), ms(receipts.spentNs[0]), ms(receipts.spentNs[1]), count(receipts.notedCovered), count(receipts.ringCovered), count(receipts.ownCovered), count(receipts.ringLocks), receipts.draws == 0 ? 0.0 : static_cast<double>(receipts.ringLocks) / static_cast<double>(receipts.draws), count(receipts.unwatched), count(receipts.failed), count(receipts.published), count(receipts.committerPublished), count(receipts.notOwner), count(receipts.unfinished), count(receipts.hits), static_cast<double>(receipts.hitBytes) / 1048576.0, steps.c_str(), count(receipts.wouldHits), count(receipts.wouldHitsStamped), count(receipts.wouldHitsWidened), misses.c_str(), count(receipts.hiddenPages));
+    }
     if (!Graphics::Q0TemplateParts()) return;
     // What the committer did with the template parts (TicketEvent).
     std::string events;
