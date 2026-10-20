@@ -356,6 +356,53 @@ public:
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS) and LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC,
+    // F1; see FlushGuard.hpp): what F1's predicate asks of the unfinished batches (the open one and
+    // every one in flight) about the ranges a flush stores: whether one reads a range through an
+    // address-based lease, whether a completion label lies in one (a label a batch's completion
+    // stores: behind write-backs, or also stored on the GPU and stored again after a CPU write-back;
+    // or a label a worker queued and has not recorded), and whether a write-back completion's
+    // written ranges (NoteCompletionMarks) overlap one. Under the mutex; reads only.
+    struct FlushWriterScan {
+        bool lease = false;
+        bool completionLabel = false;
+        bool completionMark = false;
+    };
+    FlushWriterScan ScanFlushWriters(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    // The batch PendingWriterSerial(address, bytes) names (0: none), and whether it matched by a
+    // write note, by an address-based lease, or both (the [stream] flush-guard section).
+    struct FlushWriter {
+        std::uint64_t serial = 0;
+        bool written = false;
+        bool lease = false;
+    };
+    FlushWriter DescribeFlushWriter(std::uint64_t address, std::size_t bytes) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1; FlushGuard.hpp): the newest unfinished
+    // batch (the open one first, with the serial it will get) that reads one of the ranges through an
+    // address-based lease; 0: none. Under the mutex.
+    std::uint64_t LeaseWriterSerial(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    // LOCAL EXPERIMENT (F1): watches the CPU stores and stamps completion actions make over `ranges`
+    // (a copied writer's write-back, which NoteWrittenBack announces, a completion label's store, and
+    // the MarkWritten of a write-back completion's direct and copied-back regions or of a lease's
+    // written pages, which NoteCompletionMarked announces). A wait watch (`behindOpen` false) sees
+    // every one until UnwatchCompletionStores returns their count. A skip watch (`behindOpen` true)
+    // sees the actions registered before the call (all of the in-flight batches' and the open
+    // batch's so far), which a write-back recorded now into the open batch precedes on the GPU while
+    // they store or stamp on the CPU after it; each one is counted into
+    // narrowFlushCounts.storesBehindSkip with a [narrow-flush] line (the first 8), and the watch ends
+    // once the open batch finished. Under the mutex.
+    std::uint64_t WatchCompletionStores(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool behindOpen);
+    std::uint64_t UnwatchCompletionStores(std::uint64_t id);
+    // LOCAL EXPERIMENT (F1): the ranges a write-back completion registered into the open batch
+    // writes (ShaderResources::MarkGpuWrites, for a non-reusable build whose completion runs
+    // GuestBufferMemory::WriteBack: that stores its copied regions on the CPU and stamps its direct
+    // and copied-back ones once more), which ScanFlushWriters reports as completionMark. Noted only
+    // while the predicate runs (the switch, or APS5_DEBUG_STREAM_STATS). Under the mutex.
+    void NoteCompletionMarks(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    // LOCAL EXPERIMENT (F1): a MarkWritten a completion action makes over [address, address + bytes)
+    // (GuestBufferMemory::WriteBack, BdaResources' written pages), for the watches above; nothing
+    // outside a completion action or without a watch.
+    static void NoteCompletionMarked(std::uint64_t address, std::size_t bytes);
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
@@ -792,6 +839,9 @@ private:
             bool counted;
         };
         std::vector<CompletionLabel> completionLabelRanges;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): the written ranges of this batch's
+        // write-back completions (NoteCompletionMarks).
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> completionMarks;
         // The store run in progress (RecordStore): whether its leading barrier was recorded and
         // the trailing one is still owed, the store not yet recorded (joined by contiguous ones),
         // and the [buffer, offset, end) of the stores already recorded (the WAW check).
@@ -1026,6 +1076,23 @@ private:
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): the completion-store watches (see
+    // WatchCompletionStores; a skip watch's `serial` is the batch its write-back went into and
+    // `actions` that batch's completions registered before it, a wait watch has both at their
+    // maximum), and the batch and action whose completion finish() runs.
+    struct CompletionWatch {
+        std::uint64_t id;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        bool behindOpen;
+        std::uint64_t serial;
+        std::size_t actions;
+        std::uint64_t stores;
+    };
+    std::vector<CompletionWatch> completionWatches;
+    std::uint64_t completionWatchIds = 0;
+    std::uint64_t completingSerial = 0;
+    std::size_t completingAction = 0;
+    void noteCompletionStore(std::uint64_t address, std::uint64_t end);
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;

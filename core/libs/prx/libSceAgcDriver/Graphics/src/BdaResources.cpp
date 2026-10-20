@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -322,6 +323,10 @@ void BdaResources::markWrittenPages() const {
             }
         }
         GuestMemory::MarkWritten(begin, bytes);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): an address-based use's marks land
+        // in its batch's completion; the storage hand-over guard's watches see them (nothing outside
+        // a completion or without a watch).
+        Recorder::NoteCompletionMarked(begin, bytes);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];

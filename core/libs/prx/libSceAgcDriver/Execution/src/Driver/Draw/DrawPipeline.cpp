@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FlushGuard.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
@@ -946,6 +947,8 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         streamWake = StreamWake{};
         lock.unlock();
         static_cast<void>(takeStreamTotals());
+        static_cast<void>(Graphics::TakeFlushGuardCounts());
+        static_cast<void>(Graphics::TakeNarrowFlushCounts());
         if (PrepHelpers::On()) static_cast<void>(PrepHelpers::TakeWindow(PrepHelpers::Report::Stream));
         return;
     }
@@ -1157,6 +1160,60 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
             const auto& outcomes = gate.presents[arm];
             if (outcomes[0] + outcomes[1] + outcomes[2] + outcomes[3] == 0) continue;
             appendStream(line, " %zu %llu/%llu/%llu/%llu", arm, count(outcomes[0]), count(outcomes[1]), count(outcomes[2]), count(outcomes[3]));
+        }
+    }
+    // 11. LOCAL DEBUG (PARALLEL-COMMIT-PLAN section 5, FlushGuard.hpp): StorageTexture::FlushPending's
+    // hand-over guard waits, by wait (sync: the writer is the open batch; finish: in flight) and by
+    // F1's class (the first blocking condition; stamped: F1 would skip the wait), with their wall,
+    // GPU-wait and queue-0 GPU-wait ms; would-skip summed over both waits; how the waited-for batch
+    // matched; and every condition that held per wait (no-import is looked for only when nothing
+    // else held).
+    {
+        const auto guard = Graphics::TakeFlushGuardCounts();
+        appendStream(line, "; flush guard waits (wait/class n, wall ms, GPU ms, queue-0 GPU ms):");
+        first = true;
+        std::uint64_t skipWaits = 0, skipWallNs = 0, skipGpuNs = 0, skipQueue0Ns = 0;
+        for (std::size_t kind = 0; kind < Graphics::FlushWaitKinds; ++kind) {
+            for (std::size_t index = 0; index < Graphics::FlushWaitClasses; ++index) {
+                if (guard.waits[kind][index] == 0) continue;
+                cell();
+                appendStream(line, " %s/%s %llu %.1f %.1f %.1f", Graphics::FlushWaitKindNames[kind], Graphics::FlushWaitClassNames[index], count(guard.waits[kind][index]), streamMs(guard.wallNs[kind][index]), streamMs(guard.gpuNs[kind][index]), streamMs(guard.queue0GpuNs[kind][index]));
+            }
+            const auto stamped = static_cast<std::size_t>(Graphics::FlushWaitClass::Stamped);
+            skipWaits += guard.waits[kind][stamped];
+            skipWallNs += guard.wallNs[kind][stamped];
+            skipGpuNs += guard.gpuNs[kind][stamped];
+            skipQueue0Ns += guard.queue0GpuNs[kind][stamped];
+        }
+        std::uint64_t allGpuNs = 0, allQueue0Ns = 0;
+        for (std::size_t kind = 0; kind < Graphics::FlushWaitKinds; ++kind) {
+            for (std::size_t index = 0; index < Graphics::FlushWaitClasses; ++index) {
+                allGpuNs += guard.gpuNs[kind][index];
+                allQueue0Ns += guard.queue0GpuNs[kind][index];
+            }
+        }
+        appendStream(line, "; F1 would skip %llu waits, %.1f ms wall, %.1f ms GPU (%.1f%%), %.1f ms queue-0 GPU (%.1f%%)", count(skipWaits), streamMs(skipWallNs), streamMs(skipGpuNs), streamPercent(skipGpuNs, allGpuNs), streamMs(skipQueue0Ns), streamPercent(skipQueue0Ns, allQueue0Ns));
+        appendStream(line, "; waited-for batch matched by (note/lease/both): sync %llu/%llu/%llu, finish %llu/%llu/%llu", count(guard.matches[0][0]), count(guard.matches[0][1]), count(guard.matches[0][2]), count(guard.matches[1][0]), count(guard.matches[1][1]), count(guard.matches[1][2]));
+        appendStream(line, "; conditions held (n):");
+        first = true;
+        for (std::size_t index = 0; index < Graphics::FlushWaitClasses; ++index) {
+            cell();
+            appendStream(line, " %s %llu", index == 0 ? "none" : Graphics::FlushWaitClassNames[index], count(guard.conditions[index]));
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): the waits it skipped (=1; its
+        // would-skip above then counts no waits), the completion stores and marks that landed behind
+        // a skipped write-back (must be 0), and =2's checks. LOCAL EXPERIMENT
+        // (APS5_EXPERIMENT_REFRESH_LEASE_WAIT, apart from F1): Refresh's own lease waits, with their
+        // wall, GPU-wait and queue-0 GPU-wait ms.
+        const int narrowMode = Graphics::NarrowFlushSync();
+        const bool refreshLeaseWait = Graphics::RefreshLeaseWait();
+        if (narrowMode != 0 || refreshLeaseWait) {
+            const auto narrow = Graphics::TakeNarrowFlushCounts();
+            if (narrowMode != 0) {
+                appendStream(line, "; F1 (APS5_EXPERIMENT_NARROW_FLUSH_SYNC=%d): skipped %llu, completion stores or marks behind a skipped write-back %llu (must be 0)", narrowMode, count(narrow.skipped), count(narrow.storesBehindSkip));
+                if (narrowMode == 2) appendStream(line, ", verified %llu: completion stores or marks during the wait %llu, keep decisions differed %llu, raced by a CPU store %llu", count(narrow.verified), count(narrow.storesDuringWait), count(narrow.keepDiffered), count(narrow.keepRaced));
+            }
+            if (refreshLeaseWait) appendStream(line, "; refresh lease waits (APS5_EXPERIMENT_REFRESH_LEASE_WAIT) %llu, %.1f ms wall, %.1f ms GPU, %.1f ms queue-0 GPU", count(narrow.refreshLeaseWaits), streamMs(narrow.refreshLeaseNs), streamMs(narrow.refreshLeaseGpuNs), streamMs(narrow.refreshLeaseQueue0GpuNs));
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
