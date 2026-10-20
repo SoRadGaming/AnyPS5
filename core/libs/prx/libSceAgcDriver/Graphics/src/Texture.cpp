@@ -10,12 +10,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -3538,13 +3540,46 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    std::vector<bool> unsaved(trackedLayers, false);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_LOCAL_CUTS): the unsaved-layer list goes into the thread's
+    // scratch and is filled only when some layer of the range can be unsaved and its bytes are
+    // captured, instead of a new vector per call (captureGuestBytes copies the list before its
+    // flush, which may reach another image's markLayersPending on this thread). =2 also builds
+    // today's list, uses it, and aborts when the two differ.
+    const int cuts = LocalCuts();
+    const auto canBeUnsaved = [&](std::uint32_t layer) { return !layerPending[layer] && !layerOriginal[layer] && layerGeneration[layer] == 0; };
+    std::vector<bool> unsaved;
     bool anyUnsaved = false;
-    for (std::uint32_t layer = first; layer < first + count; ++layer) {
-        unsaved[layer] = !layerPending[layer] && !layerOriginal[layer] && layerGeneration[layer] == 0;
-        anyUnsaved = anyUnsaved || unsaved[layer];
+    if (cuts != 1) {
+        unsaved.assign(trackedLayers, false);
+        for (std::uint32_t layer = first; layer < first + count; ++layer) {
+            unsaved[layer] = canBeUnsaved(layer);
+            anyUnsaved = anyUnsaved || unsaved[layer];
+        }
     }
-    if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
+    if (cuts != 0) {
+        bool anyCut = false;
+        for (std::uint32_t layer = first; layer < first + count && !anyCut; ++layer) anyCut = canBeUnsaved(layer);
+        if (cuts == 2) {
+            if (anyCut != anyUnsaved) LocalCutDisagrees(LocalCut::UnsavedLayers, "whether a layer of the range can be unsaved");
+            NoteLocalCutChecked(LocalCut::UnsavedLayers);
+        }
+        anyUnsaved = anyCut;
+    }
+    if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        if (cuts == 0) {
+            captureGuestBytes(&unsaved);
+        } else {
+            struct UnsavedLayersTag {};
+            auto& layers = ThreadScratch<std::vector<bool>, UnsavedLayersTag>();
+            layers.assign(trackedLayers, false);
+            for (std::uint32_t layer = first; layer < first + count; ++layer) layers[layer] = canBeUnsaved(layer);
+            if (cuts == 2) {
+                if (layers != unsaved) LocalCutDisagrees(LocalCut::UnsavedLayers, "the unsaved layers");
+                localCutCounts.layersFilled.fetch_add(1, std::memory_order_relaxed);
+            }
+            captureGuestBytes(cuts == 2 ? &unsaved : &layers);
+        }
+    }
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in

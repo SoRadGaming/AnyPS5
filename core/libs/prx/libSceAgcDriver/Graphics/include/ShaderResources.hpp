@@ -340,6 +340,10 @@ public:
     void StorageImages(std::vector<std::pair<VkImage, bool>>& out) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_LOCAL_CUTS): a reusable draw template's DeviceReads list as
+    // recordDraw found it at the template's first recorded draw (empty until then). Only GpuMutex
+    // holders record draws, so only they touch it.
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& KeptDeviceReads() { return keptDeviceReads; }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     bool HoldsReleasedTexture() const;
@@ -703,6 +707,8 @@ private:
         std::array<std::optional<std::uint32_t>, 2> variable{};
     };
     std::optional<DrawSetSizes> drawSetSizes;
+    // See KeptDeviceReads().
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> keptDeviceReads;
     void describeDrawSets(std::array<std::vector<VkDescriptorPoolSize>, 2>& sizes, std::array<bool, 2>& described) const;
     std::optional<std::uint32_t> drawVariableCount(std::size_t set) const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write

@@ -2455,7 +2455,11 @@ if(BUILD_TESTING)
             # HostImportFor PrepareScope assertions, alone and over queue 0's verified tickets
             # (whose preparation runs inside a PrepareScope).
             "stream_stats|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1"
-            "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2")
+            "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
+            # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the
+            # committed flag against std::uncaught_exceptions, including the failure run's throw;
+            # the scratch unsaved-layer list; a template's kept DeviceReads list against the walk).
+            "local_cuts|APS5_EXPERIMENT_LOCAL_CUTS=2")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

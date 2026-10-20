@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <cstdarg>
@@ -889,6 +890,13 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         if (totals.trackerAcquisitions[role] == 0) continue;
         cell();
         appendStream(line, " %s %llu/%llu %.1f", Stream::RoleNames[role], count(totals.trackerAcquisitions[role]), count(totals.trackerWaits[role]), streamMs(totals.trackerWaitNs[role]));
+    }
+    // 8. LOCAL EXPERIMENT (APS5_EXPERIMENT_LOCAL_CUTS=2, PARALLEL-COMMIT-PLAN C1): the checks each
+    // local cut passed, so a verify run shows the cuts were exercised.
+    if (Graphics::LocalCuts() == 2) {
+        auto& cuts = Graphics::localCutCounts;
+        const auto checked = [&](Graphics::LocalCut cut) { return count(Stream::Take(cuts.checked[static_cast<std::size_t>(cut)])); };
+        appendStream(line, "; local cuts verified: committed flag %llu commits, unsaved layers %llu calls (%llu lists filled), device reads %llu template draws (%llu lists kept), disagreements %llu", checked(Graphics::LocalCut::Committed), checked(Graphics::LocalCut::UnsavedLayers), count(Stream::Take(cuts.layersFilled)), checked(Graphics::LocalCut::DeviceReads), count(Stream::Take(cuts.readsKept)), count(Stream::Take(cuts.disagreed)));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }

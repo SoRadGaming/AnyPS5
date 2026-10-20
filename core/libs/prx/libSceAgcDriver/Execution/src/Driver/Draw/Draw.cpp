@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <bit>
@@ -749,8 +750,21 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
         bool countWork;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_LOCAL_CUTS): set on the commit's two returns (the
+        // recorded recipe, the end), so the destructor knows the commit completed without asking
+        // std::uncaught_exceptions() on every commit; =2 asks both and aborts when they differ.
+        bool committed = false;
         ~SubmitDue() noexcept(false) {
-            if (std::uncaught_exceptions() != 0) return;
+            if (const int cuts = Graphics::LocalCuts(); cuts == 1) {
+                if (!committed) return;
+            } else {
+                const bool unwinding = std::uncaught_exceptions() != 0;
+                if (cuts == 2) {
+                    if (committed == unwinding) Graphics::LocalCutDisagrees(Graphics::LocalCut::Committed, committed ? "the commit set its flag while an exception unwinds" : "the commit left without its flag and without an exception");
+                    Graphics::NoteLocalCutChecked(Graphics::LocalCut::Committed);
+                }
+                if (unwinding) return;
+            }
             if (countWork) Graphics::Recorder::CountRecordedWork();
             // Inside a run of commits (APS5_EXPERIMENT_COMMIT_RUNS) the check runs once, at its end.
             if (!DrawPipeline::DeferToRunEnd(&Driver::submitDueAfterRun)) driver.submitDueAfterCommit(device.get());
@@ -771,12 +785,16 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         noteDrawWriters(stages, queue);
     }
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) return;
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
+            submitDue.committed = true;
+            return;
+        }
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, prepared, ticket);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    submitDue.committed = true;
 }
 
 }
