@@ -37,6 +37,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -348,11 +349,16 @@ struct VulkanDevice::State {
     std::uint32_t queueFamily = 0;
     std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
     VkQueue sparseQueue = VK_NULL_HANDLE;
-    std::mutex sparseQueueMutex;
     VkQueue settleQueue = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     VkCommandPool settlePool = VK_NULL_HANDLE;
-    std::mutex settleQueueMutex;
+    // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queues' external synchronization (QueueGate):
+    // the settle and sparse queue mutexes (State's own before) and, under
+    // APS5_EXPERIMENT_PRESENT_QUEUE, the graphics and present queue mutexes and the out-of-date flag
+    // a present leaves for Resize. `presentQueue`: a further queue of the graphics family for
+    // vkQueuePresentKHR (null: presents stay on `queue`).
+    Graphics::QueueGate gate;
+    VkQueue presentQueue = VK_NULL_HANDLE;
     bool memoryBudget = false;
     bool depthRangeUnrestricted = false;
     bool samplerAnisotropy = false;
@@ -743,7 +749,13 @@ struct VulkanDevice::State {
             device = VK_NULL_HANDLE;
         }
         if (device != VK_NULL_HANDLE) {
-            const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            VkResult idle = VK_SUCCESS;
+            {
+                // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): every queue's mutex around the
+                // device-wide wait (QueueGate; none off the switches).
+                const auto queues = gate.AllQueues();
+                idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+            }
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
@@ -1560,6 +1572,26 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             }
         }
     }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE, PARALLEL-COMMIT-PLAN A3): one more queue of
+    // the graphics family (index 2 after the settle queue) for vkQueuePresentKHR, when the family
+    // has it: the same family, so the swapchain images need no ownership transfer. Without it the
+    // presents stay on the graphics queue, inside the presenter's hold.
+    const float presentPriorities[3]{1.0f, 1.0f, 1.0f};
+    std::uint32_t presentIndex = 0;
+    if (Graphics::QueueGate::PresentQueueMode() != 0) {
+        if (queues.empty()) {
+            std::uint32_t families = 0;
+            auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+            getFamilies(selected, &families, nullptr);
+            queues.resize(families);
+            getFamilies(selected, &families, queues.data());
+        }
+        presentIndex = Graphics::QueueGate::PresentQueueIndex(family < queues.size() ? queues[family].queueCount : 0, queueInfo.queueCount);
+        if (presentIndex != 0) {
+            queueInfo.queueCount = presentIndex + 1;
+            queueInfo.pQueuePriorities = presentPriorities;
+        }
+    }
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
@@ -1953,6 +1985,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, settleFamily, settleIndex, &state->settleQueue);
     }
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, 0, &state->sparseQueue);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE): the present queue, chosen above.
+    if (presentIndex != 0) {
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, presentIndex, &state->presentQueue);
+        state->gate.SetPresentQueue(state->presentQueue);
+    }
+    if (Graphics::QueueGate::PresentQueueMode() != 0) std::fprintf(stderr, "[present] APS5_EXPERIMENT_PRESENT_QUEUE=%d: %s\n", Graphics::QueueGate::PresentQueueMode(), presentIndex != 0 ? (Graphics::QueueGate::PresentQueueMode() == 1 ? "presents on their own queue of the graphics family, after the presenter's hold" : "presents on their own queue of the graphics family, inside the presenter's hold") : "the graphics family has no free queue; presents stay on the graphics queue, inside the presenter's hold");
     if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
     if (deviceFault || checkpoints) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
@@ -2169,7 +2207,12 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
-    check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    {
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): every queue's mutex around the device-wide
+        // wait, so a present issued after the presenter's hold cannot overlap it (QueueGate).
+        const auto queues = state->gate.AllQueues();
+        check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    }
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
 
@@ -2773,6 +2816,11 @@ void* VulkanDevice::Window() const {
 }
 
 void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE): a present that found the swapchain out of
+    // date or suboptimal left the flag (IssuePresent, perhaps after the presenter's hold); it is
+    // consumed here, under GpuMutex, where today's QueuePresent would have zeroed the extent, so the
+    // compare below recreates the swapchain.
+    if (state->gate.Gated() && state->gate.TakePresentOutOfDate()) state->extent = {0, 0};
     APS5_LOG_OUT_DEBUG("Resize requested=%ux%u current=%ux%u", width, height, state->extent.width, state->extent.height);
     require(state->swapchain != VK_NULL_HANDLE, "cannot resize an unavailable swapchain");
     if (width == 0 || height == 0) {
@@ -3501,7 +3549,12 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    {
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate).
+        const auto queueHold = state->gate.Lock(Graphics::QueueGate::Queue::Graphics);
+        state->gate.CheckOp(Graphics::QueueGate::Queue::Graphics, "vkQueueSubmit presentation blit");
+        check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    }
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -3621,6 +3674,11 @@ double VulkanDevice::FinishPresent() {
 
 void VulkanDevice::QueuePresent() {
     if (!state->queuePending) return;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE): the gated present is its two steps.
+    if (state->gate.Gated()) {
+        IssuePresent(PreparePresent());
+        return;
+    }
     PerformanceTimer timing("Vulkan.QueuePresent");
     state->queuePending = false;
     const auto index = state->queueIndex;
@@ -3632,10 +3690,53 @@ void VulkanDevice::QueuePresent() {
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
+    Graphics::QueueGate::NotePresent(presented);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
     APS5_LOG_OUT_DEBUG("vkQueuePresentKHR queued imageIndex=%u", index);
+}
+
+bool VulkanDevice::PresentsAfterHold() const {
+    return state->gate.PresentAfterHold();
+}
+
+VulkanDevice::PresentTicket VulkanDevice::PreparePresent() {
+    PresentTicket ticket;
+    if (!state->queuePending) return ticket;
+    state->queuePending = false;
+    const auto index = state->queueIndex;
+    require(index < state->rendered.size(), "presented image index is out of range");
+    ticket.pending = true;
+    ticket.index = index;
+    ticket.swapchain = state->swapchain;
+    ticket.rendered = state->rendered[index];
+    return ticket;
+}
+
+void VulkanDevice::IssuePresent(const PresentTicket& ticket) {
+    if (!ticket.pending) return;
+    PerformanceTimer timing("Vulkan.QueuePresent");
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1;
+    present.pWaitSemaphores = &ticket.rendered;
+    present.swapchainCount = 1;
+    present.pSwapchains = &ticket.swapchain;
+    present.pImageIndices = &ticket.index;
+    // The present queue when the device has one, else the graphics queue (whose present runs inside
+    // the hold: PresentsAfterHold is false then); each under its queue's mutex.
+    const bool own = state->presentQueue != VK_NULL_HANDLE;
+    const auto queue = own ? Graphics::QueueGate::Queue::Present : Graphics::QueueGate::Queue::Graphics;
+    VkResult presented = VK_SUCCESS;
+    {
+        const auto queueHold = state->gate.Lock(queue);
+        state->gate.CheckOp(queue, "vkQueuePresentKHR");
+        presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(own ? state->presentQueue : state->queue, &present);
+    }
+    // Out of date or suboptimal: only the gate's flag, Resize zeroes the extent under GpuMutex.
+    if (!state->gate.NotePresentResult(presented)) check(presented, "vkQueuePresentKHR");
+    timing.Mark("queue_present");
+    APS5_LOG_OUT_DEBUG("vkQueuePresentKHR queued imageIndex=%u", ticket.index);
 }
 
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize) const {
@@ -3799,11 +3900,12 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.queueFamily = state->queueFamily;
     context.sparseFamily = state->sparseFamily;
     context.sparseQueue = state->sparseQueue;
-    context.sparseQueueMutex = &state->sparseQueueMutex;
+    context.sparseQueueMutex = &state->gate.Mutex(Graphics::QueueGate::Queue::Sparse);
     context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;
-    context.settleQueueMutex = &state->settleQueueMutex;
+    context.settleQueueMutex = &state->gate.Mutex(Graphics::QueueGate::Queue::Settle);
+    context.queueGate = &state->gate;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.vertexInputs = state->vertexInputs.get();

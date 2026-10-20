@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
@@ -3642,9 +3643,18 @@ void Recorder::Submit() {
     }
     const auto submitStart = std::chrono::steady_clock::now();
     const auto queueSubmitStartNs = stream ? Stream::NowNs() : 0;
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    VkResult result = VK_SUCCESS;
+    {
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex around the submit
+        // (QueueGate; none off the switches).
+        const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+        CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueSubmit recorder");
+        result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    }
     if (stream) streamQueueSubmitNs = Stream::NowNs() - queueSubmitStartNs;
     if (result == VK_ERROR_DEVICE_LOST) {
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): every queue's mutex around the device-wide wait.
+        const auto queues = LockAllQueues(context);
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
     }
@@ -4123,7 +4133,13 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
-            const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            VkResult idle = VK_SUCCESS;
+            {
+                // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): every queue's mutex around the
+                // device-wide wait (QueueGate).
+                const auto queues = LockAllQueues(context);
+                idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            }
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {

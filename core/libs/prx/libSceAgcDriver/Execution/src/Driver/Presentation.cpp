@@ -11,6 +11,22 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE=1, PARALLEL-COMMIT-PLAN A3): a present issued on
+// the present queue after the presenter released GpuMutex, timed onto the [stream] line's
+// after-hold presents (LOCAL DEBUG, APS5_DEBUG_STREAM_STATS).
+void issuePresent(VulkanDevice& device, const VulkanDevice::PresentTicket& ticket) {
+    const auto startNs = Stream::On() ? Stream::NowNs() : 0;
+    device.IssuePresent(ticket);
+    if (Stream::On()) {
+        Stream::Add(Stream::counters.issuedPresents);
+        Stream::Add(Stream::counters.issuePresentNs, Stream::NowNs() - startNs);
+    }
+}
+
+}
+
 std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
     std::lock_guard lock(mutex);
     rethrowFailure();
@@ -105,6 +121,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presentable = presenting->AcquireImage();
             timing.Mark("acquire_image");
         }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE=1, PARALLEL-COMMIT-PLAN A3): with a present
+        // queue, a hold only prepares the present (PreparePresent); it is issued on the present
+        // queue after the release (IssuePresent), so queue workers no longer wait behind
+        // vkQueuePresentKHR. Otherwise QueuePresent stays in the hold, as before.
+        const bool presentAfterHold = presentable && presenting->PresentsAfterHold();
+        VulkanDevice::PresentTicket presentTicket;
         if (presentable) {
             // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): the second hold's lock
             // wait, PresentDisplayBuffer (or PresentClear), the in-hold QueuePresent and the whole
@@ -154,12 +176,17 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             if (submitted && (syncFlip || inFlight != 0)) {
 
                 const auto queueStartNs = streamHold.on ? Stream::NowNs() : 0;
-                presenting->QueuePresent();
+                if (presentAfterHold) presentTicket = presenting->PreparePresent();
+                else presenting->QueuePresent();
                 if (streamHold.on) streamHold.queuePresentNs = Stream::NowNs() - queueStartNs;
                 timing.Mark("queue_present");
                 trailing = !syncFlip;
                 submitted = false;
             }
+        }
+        if (presentTicket.pending) {
+            issuePresent(*presenting, presentTicket);
+            timing.Mark("issue_present");
         }
         if (trailing) {
             waitedMs += presenting->FinishPresent();
@@ -169,16 +196,25 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             waitedMs = presenting->FinishPresent();
             timing.Mark("render_fence_wait");
 
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
-            // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the third hold's QueuePresent, apart.
-            const auto queueStartNs = Stream::On() ? Stream::NowNs() : 0;
-            presenting->QueuePresent();
-            if (Stream::On()) {
-                Stream::Add(Stream::counters.latePresents);
-                Stream::Add(Stream::counters.lateQueuePresentNs, Stream::NowNs() - queueStartNs);
+            VulkanDevice::PresentTicket lateTicket;
+            {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+                std::lock_guard lock(GuestMemory::GpuMutex());
+                // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the third hold's QueuePresent, apart.
+                const auto queueStartNs = Stream::On() ? Stream::NowNs() : 0;
+                if (presentAfterHold) lateTicket = presenting->PreparePresent();
+                else presenting->QueuePresent();
+                if (Stream::On()) {
+                    Stream::Add(Stream::counters.latePresents);
+                    Stream::Add(Stream::counters.lateQueuePresentNs, Stream::NowNs() - queueStartNs);
+                }
+                timing.Mark("queue_present");
             }
-            timing.Mark("queue_present");
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE=1): as above, after the hold.
+            if (lateTicket.pending) {
+                issuePresent(*presenting, lateTicket);
+                timing.Mark("issue_present");
+            }
         }
         gpuReady(context);
         timing.Mark("release_and_callback");
@@ -220,6 +256,13 @@ bool Driver::TryPresentSplash(const PresentationWindow& window) {
         presenting->SelectDynamicRange(nullptr);
         if (!presenting->Presentable() || !presenting->PresentSlotFree() || !presenting->AcquireImage()) return false;
         if (!presenting->PresentClear(window.width, window.height, true)) return false;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE=1): issued after the release, as in Present.
+        if (presenting->PresentsAfterHold()) {
+            const auto ticket = presenting->PreparePresent();
+            lock.unlock();
+            issuePresent(*presenting, ticket);
+            return true;
+        }
         presenting->QueuePresent();
         return true;
     } catch (const ProcessShutdown&) {

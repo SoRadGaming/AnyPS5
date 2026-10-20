@@ -103,6 +103,10 @@ struct Counters {
     Counter queuePresentNs{};
     Counter latePresents{};
     Counter lateQueuePresentNs{};
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE=1, PARALLEL-COMMIT-PLAN A3): presents issued on
+    // the present queue after the hold (their PreparePresent counts as the hold's QueuePresent).
+    Counter issuedPresents{};
+    Counter issuePresentNs{};
     // Recorder::Submit with an open batch, by the submitting thread's role and the site tagged for
     // its hold: the whole call, vkEndCommandBuffer and vkQueueSubmit.
     std::array<std::array<Counter, Sites>, Roles> submits{};

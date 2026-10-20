@@ -33,6 +33,7 @@ class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
 class VertexInputCache;
+class QueueGate;
 
 class PipelineCacheSynchronization {
 public:
@@ -171,6 +172,9 @@ struct Context {
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
+    // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the device's queue mutexes (QueueGate.hpp; the
+    // settle and sparse mutexes above are its own); null in tests that build their own context.
+    QueueGate* queueGate = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes) = nullptr;
     RenderCache* renderCache = nullptr;

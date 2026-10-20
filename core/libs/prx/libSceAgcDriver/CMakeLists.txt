@@ -248,6 +248,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/QueueGate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
@@ -2462,7 +2463,12 @@ if(BUILD_TESTING)
             # and used as the play build uses them (=2 computes each cut but runs today's answer, so
             # only =1 runs the flag's return, the scratch list and the kept-list copy).
             "local_cuts|APS5_EXPERIMENT_LOCAL_CUTS=2"
-            "local_cuts_on|APS5_EXPERIMENT_LOCAL_CUTS=1")
+            "local_cuts_on|APS5_EXPERIMENT_LOCAL_CUTS=1"
+            # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue gate and the present queue, with
+            # every queue operation checked (its queue's mutex held, no device-wide wait overlapping;
+            # =2 aborts on the first violation, the assertion switch does at =1 too).
+            "present_queue|APS5_EXPERIMENT_PRESENT_QUEUE=2,APS5_ASSERT_GPU_LOCK=1"
+            "present_queue_on|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_ASSERT_GPU_LOCK=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
@@ -2529,6 +2535,48 @@ if(BUILD_TESTING)
     set_tests_properties(${prepareScopeTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     if(WIN32)
         set_tests_properties(${prepareScopeTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue gate (tests/execution/QueueGate.cpp; its
+    # plain run, agc_driver_queue_gate, has the switches unset) with the present queue on and
+    # verified, then its death tests: a GpuMutex lock under a queue mutex and a queue mutex out of
+    # the fixed order abort under APS5_ASSERT_GPU_LOCK=1, an operation without its queue's mutex at
+    # =2 (matched as the PrepareScope death tests above are).
+    set(queueGateTests)
+    foreach(queueGateCase IN ITEMS "present_queue|APS5_EXPERIMENT_PRESENT_QUEUE=1" "present_queue_verify|APS5_EXPERIMENT_PRESENT_QUEUE=2")
+        string(REPLACE "|" ";" queueGateCase "${queueGateCase}")
+        list(GET queueGateCase 0 queueGateName)
+        list(GET queueGateCase 1 queueGateEnvironment)
+        string(REPLACE "," ";" queueGateEnvironment "${queueGateEnvironment}")
+        add_test(NAME agc_driver_queue_gate_${queueGateName} COMMAND agc_driver_queue_gate_tests)
+        set_tests_properties(agc_driver_queue_gate_${queueGateName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ASSERT_GPU_LOCK=1;${queueGateEnvironment}")
+        list(APPEND queueGateTests agc_driver_queue_gate_${queueGateName})
+    endforeach()
+    add_test(NAME agc_driver_queue_gate_death_lock_order COMMAND agc_driver_queue_gate_tests --lock-order)
+    set_tests_properties(agc_driver_queue_gate_death_lock_order PROPERTIES ENVIRONMENT "APS5_ASSERT_GPU_LOCK=1"
+        PASS_REGULAR_EXPRESSION "\\[lock\\] ASSERT: [^\r\n]*holding a Vulkan queue mutex")
+    add_test(NAME agc_driver_queue_gate_death_misordered COMMAND agc_driver_queue_gate_tests --misordered)
+    set_tests_properties(agc_driver_queue_gate_death_misordered PROPERTIES ENVIRONMENT "APS5_ASSERT_GPU_LOCK=1"
+        PASS_REGULAR_EXPRESSION "\\[queue\\] ASSERT: queue mutex taken out of the fixed order")
+    add_test(NAME agc_driver_queue_gate_death_unheld_verify COMMAND agc_driver_queue_gate_tests --unheld-verify)
+    set_tests_properties(agc_driver_queue_gate_death_unheld_verify PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PRESENT_QUEUE=2"
+        PASS_REGULAR_EXPRESSION "\\[queue\\] ASSERT: queue operation without its queue's mutex")
+    list(APPEND queueGateTests agc_driver_queue_gate_death_lock_order agc_driver_queue_gate_death_misordered agc_driver_queue_gate_death_unheld_verify)
+    # The present queue's own suites, with it on and verified.
+    foreach(queueGateMode IN ITEMS 1 2)
+        set(queueGateSuffix present_queue)
+        if(queueGateMode STREQUAL "2")
+            set(queueGateSuffix present_queue_verify)
+        endif()
+        add_test(NAME agc_driver_presentation_pass_${queueGateSuffix} COMMAND agc_driver_presentation_pass_tests)
+        add_test(NAME agc_loading_splash_${queueGateSuffix} COMMAND agc_loading_splash_tests)
+        set_tests_properties(agc_driver_presentation_pass_${queueGateSuffix} agc_loading_splash_${queueGateSuffix} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ASSERT_GPU_LOCK=1;APS5_EXPERIMENT_PRESENT_QUEUE=${queueGateMode}")
+        list(APPEND queueGateTests agc_driver_presentation_pass_${queueGateSuffix} agc_loading_splash_${queueGateSuffix})
+    endforeach()
+    set_tests_properties(${queueGateTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(${queueGateTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -735,9 +736,13 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
     VkResult bound = VK_SUCCESS;
     VkResult waited = VK_SUCCESS;
     {
-        std::unique_lock<std::mutex> queueLock;
-        if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue's mutex from the context's gate (the
+        // sparse queue's, held across the wait as before; the graphics queue's, under the switches,
+        // only around the bind, so the fence wait holds no queue).
+        auto queueLock = LockQueue(context, ownQueue ? QueueGate::Queue::Sparse : QueueGate::Queue::Graphics);
+        CheckQueueOp(context, ownQueue ? QueueGate::Queue::Sparse : QueueGate::Queue::Graphics, "vkQueueBindSparse");
         bound = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
+        if (!ownQueue) queueLock = QueueGate::Hold();
         if (bound == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
@@ -828,7 +833,8 @@ ImportSettle& settleFor(const Context& context, HostImports& state) {
 std::atomic<std::uint64_t> settledImports{0};
 
 const char* settleImport(const Context& context, HostImports& state, const HostImport& entry, VkResult& result) {
-    std::unique_lock queueLock(*context.settleQueueMutex);
+    // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the settle queue's mutex, the gate's (QueueGate).
+    const auto queueLock = LockQueue(context, QueueGate::Queue::Settle);
     auto& settle = settleFor(context, state);
     if (settle.settleTarget == VK_NULL_HANDLE) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -891,6 +897,7 @@ const char* settleImport(const Context& context, HostImports& state, const HostI
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &settle.settleCommands;
+        CheckQueueOp(context, QueueGate::Queue::Settle, "vkQueueSubmit settle");
         if ((result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, settle.settleFence)) != VK_SUCCESS) return "vkQueueSubmit (settle)";
 #ifdef _WIN32
         ++state.settlesWaited;
@@ -899,7 +906,10 @@ const char* settleImport(const Context& context, HostImports& state, const HostI
         return nullptr;
     };
     const char* step = run();
-    if (step != nullptr) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.settleQueue);
+    if (step != nullptr) {
+        CheckQueueOp(context, QueueGate::Queue::Settle, "vkQueueWaitIdle settle");
+        context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.settleQueue);
+    }
     if (alias != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, alias, nullptr);
     if (step == nullptr) settledImports.fetch_add(1, std::memory_order_relaxed);
     return step;
@@ -962,7 +972,8 @@ void submitSettleBatch(const Context& context, HostImports& state) {
     if (free == deviceSettle.batches.end()) return;
     const auto index = static_cast<std::size_t>(free - deviceSettle.batches.begin());
     auto& batch = *free;
-    std::unique_lock queueLock(*context.settleQueueMutex);
+    // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the settle queue's mutex, the gate's (QueueGate).
+    const auto queueLock = LockQueue(context, QueueGate::Queue::Settle);
     VkResult result = VK_SUCCESS;
     const auto destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
     const auto fail = [&](const char* step) {
@@ -1024,6 +1035,7 @@ void submitSettleBatch(const Context& context, HostImports& state) {
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &batch.commands;
+    CheckQueueOp(context, QueueGate::Queue::Settle, "vkQueueSubmit settle batch");
     if ((result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, batch.fence)) != VK_SUCCESS) return fail("vkQueueSubmit (settle batch)");
     batch.busy = true;
     state.settlesSubmitted += batch.bases.size();
@@ -2805,7 +2817,13 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &buffer;
-            if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+            {
+                // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate),
+                // around the submit only.
+                const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+                CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueSubmit import probe");
+                if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+            }
             submitted = true;
             if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
             submitted = false;
@@ -2822,7 +2840,12 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         return nullptr;
     };
     probe.failure = run();
-    if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    if (submitted) {
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex (QueueGate).
+        const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+        CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueWaitIdle import probe");
+        context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    }
     if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (commands[0] != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 2, commands);
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);

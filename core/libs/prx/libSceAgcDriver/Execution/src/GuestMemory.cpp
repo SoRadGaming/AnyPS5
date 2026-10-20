@@ -2839,6 +2839,10 @@ bool assertGpuLock() {
     std::abort();
 }
 
+// LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue mutexes the thread holds (QueueGate).
+struct QueueMutexesTag {};
+using QueueMutexesSlot = HostThreadSlot<std::uint8_t, QueueMutexesTag>;
+
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): the calling thread's role, the
 // site tagged for its next acquisition (TagGpuLockSite), the site of its outermost hold (for the
 // submit split), the role of the thread that last took the mutex outermost and when, and each
@@ -2939,6 +2943,14 @@ GpuLockSite CurrentGpuHoldSite() {
 
 void AssertOutsidePrepareScope(const char* where) {
     if (assertGpuLock() && PrepareScopeSlot::Get()) abortInPrepareScope(where);
+}
+
+std::uint8_t QueueMutexesHeld() {
+    return QueueMutexesSlot::Get();
+}
+
+void SetQueueMutexesHeld(std::uint8_t held) {
+    QueueMutexesSlot::Set(held);
 }
 
 void GpuMutexType::enter() {
@@ -3090,6 +3102,12 @@ void GpuMutexType::lock() {
     // LOCAL EXPERIMENT (room-wait draw tickets): queue 0 never takes the mutex while it prepares
     // a ticket (PrepareScope); under APS5_ASSERT_GPU_LOCK=1 doing so aborts here.
     if (assertGpuLock() && PrepareScopeSlot::Get()) abortInPrepareScope("GuestMemory::GpuMutex taken");
+    // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): GpuMutex comes before every queue mutex
+    // (Graphics::QueueGate); acquiring it under one could deadlock against a device-wide wait.
+    if (assertGpuLock() && QueueMutexesSlot::Get() != 0 && !HeldByThisThread()) {
+        std::fprintf(stderr, "[lock] ASSERT: GuestMemory::GpuMutex taken while holding a Vulkan queue mutex (QueueGate; held mask 0x%x) on thread tagged 0x%x\n", static_cast<unsigned>(QueueMutexesSlot::Get()), GpuLockThreadTag());
+        std::abort();
+    }
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr && StreamStats() != 0) {
