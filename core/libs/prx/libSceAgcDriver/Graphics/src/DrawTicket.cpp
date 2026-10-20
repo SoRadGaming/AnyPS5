@@ -43,9 +43,10 @@ bool counting() {
     return GuestMemory::Q0PrepStats() != 0;
 }
 
-// The release list (TicketReference): producers are queue 0 (its caches' evictions) and the
-// reaper (tickets of items that never committed); the committer drains it. Never destroyed: a
-// reference left at exit belongs to a device that is going.
+// The release list (TicketReference): producers are queue 0 (its caches' evictions), the reaper
+// (tickets of items that never committed) and, under APS5_EXPERIMENT_PREP_HELPERS, the prep helpers
+// (the word cache's evictions, tickets a commit closed the slot before); the committer drains it.
+// Never destroyed: a reference left at exit belongs to a device that is going.
 struct ReleaseList {
     std::mutex mutex;
     std::vector<TicketReference> references;
@@ -145,9 +146,10 @@ namespace {
 // Queue 0's moved data-word buffers (Q2b), for reuse by later tickets of the same template with
 // the same words, as the template's own movedWordBuffers serve today's path. A hit needs the very
 // template (owner equality with the live hint, so a recycled address never matches, and no
-// temporary strong reference that could end up the last one on queue 0). Only queue 0 makes
-// tickets; the mutex only guards against another producer. An evicted buffer goes to the ticket
-// release list: a batch may still read it.
+// temporary strong reference that could end up the last one on a ticket producer). The producers
+// are queue 0, or under APS5_EXPERIMENT_PREP_HELPERS (PARALLEL-COMMIT-PLAN B0) the prep helpers, any
+// number at once: the mutex serves all of them. An evicted buffer goes to the ticket release list:
+// a batch may still read it.
 struct WordCacheEntry {
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<ShaderResources> owner;

@@ -2941,6 +2941,35 @@ void AssertOutsidePrepareScope(const char* where) {
     if (assertGpuLock() && PrepareScopeSlot::Get()) abortInPrepareScope(where);
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): see the header.
+namespace {
+struct PrepHelperTag {};
+using PrepHelperSlot = HostThreadSlot<bool, PrepHelperTag>;
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HelperDestroyed::Count)> helperDestructions{};
+}
+
+void SetPrepHelperThread(bool helper) {
+    PrepHelperSlot::Set(helper);
+}
+
+bool OnPrepHelperThread() {
+    return PrepHelperSlot::Get();
+}
+
+void NoteDestroyedOnHelper(HelperDestroyed what) {
+    if (!PrepHelperSlot::Get()) return;
+    helperDestructions[static_cast<std::size_t>(what)].fetch_add(1, std::memory_order_relaxed);
+    if (!assertGpuLock()) return;
+    static constexpr std::array<const char*, static_cast<std::size_t>(HelperDestroyed::Count)> names{"~ShaderResources", "~Pipeline", "a pipelined draw's closure"};
+    std::fprintf(stderr, "[lock] ASSERT: %s ran on a prep helper (it must drop no last reference to a cache-owned object or a closure)\n", names[static_cast<std::size_t>(what)]);
+    std::fflush(stderr);
+    std::abort();
+}
+
+std::uint64_t HelperDestructions(HelperDestroyed what) {
+    return helperDestructions[static_cast<std::size_t>(what)].load(std::memory_order_relaxed);
+}
+
 void GpuMutexType::enter() {
     if (HeldByThisThread()) return;
     if (!WaitersCounted()) {

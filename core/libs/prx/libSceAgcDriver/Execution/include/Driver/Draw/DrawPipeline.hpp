@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <source_location>
@@ -63,11 +64,29 @@ public:
         std::size_t pre = 0;
         std::size_t bail = 0;
     };
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
+    // Returns the item's seq (LOCAL EXPERIMENT APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0:
+    // assigned under the pipeline mutex at the push, from 1 up, in queue order), or 0 for a commit run
+    // inline because the pipeline is closing (no item, so no helper job).
+    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
     // `site` names the caller for the [stream] drain sites (APS5_DEBUG_STREAM_STATS); unused otherwise.
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100, std::source_location site = std::source_location::current());
+    // Stops the prep helpers first (PrepHelpers::Stop: their queued jobs' pins go to RetirePin), then
+    // closes the pipeline: the committer commits what is queued and ends, later commits run inline.
     void Stop();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the seq of the item
+    // whose commit started last (0 before the first): the committer stores it (release) right before
+    // it runs an item's commit, and again at the item's pop, which also advances it past the items
+    // a stopped pipeline pops without committing. A helper job whose seq is at or below it is stale:
+    // its commit started, so its slot is closed or about to be. CurrentItemEnqueuedNs is the push
+    // time (Stream::NowNs) of the item the calling committer is committing, 0 outside a commit and
+    // without helpers: a thread slot set by the committer around every item's commit. RetirePin
+    // hands a helper's pin of a closure to the reaper, so a closure's last reference never drops on
+    // a helper (it drops there, on the committer or on queue 0). It never throws: the pin moves only
+    // into the reaper's list, and should that fail it is leaked, never dropped on the caller.
+    std::uint64_t CommittingSeq() const { return committingSeq.load(std::memory_order_acquire); }
+    static std::uint64_t CurrentItemEnqueuedNs();
+    void RetirePin(std::shared_ptr<void>&& pin) noexcept;
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
@@ -174,11 +193,13 @@ private:
         // (APS5_DEBUG_Q0_PREP_STATS attribution).
         std::uint32_t enqueueDepth = 0;
         bool full = false;
-        // The push time (Stream::NowNs) under APS5_DEBUG_STREAM_STATS, 0 otherwise, and the depth
-        // the push found (after the producer's preparation and its room wait): a draw's lead and
-        // the depth it was pushed behind.
+        // The push time (Stream::NowNs) under APS5_DEBUG_STREAM_STATS or APS5_EXPERIMENT_PREP_HELPERS,
+        // 0 otherwise, and the depth the push found (after the producer's preparation and its room
+        // wait): a draw's lead and the depth it was pushed behind.
         std::uint64_t enqueuedAtNs = 0;
         std::uint32_t pushDepth = 0;
+        // The item's place in the stream (Enqueue's return; CommittingSeq).
+        std::uint64_t seq = 0;
     };
     struct CommitRun;
     DrawPipeline() = default;
@@ -213,9 +234,15 @@ private:
     bool stopped = false;
     bool closing = false;
     std::thread thread;
+    // Under the pipeline mutex: the last seq given out. The seq of the item whose commit started
+    // last (CommittingSeq).
+    std::uint64_t lastSeq = 0;
+    std::atomic<std::uint64_t> committingSeq{0};
     std::mutex retireMutex;
     std::condition_variable reapWake;
     std::deque<Item> retired;
+    // Helper pins of closures (RetirePin), cleared by the reaper with the retired items.
+    std::vector<std::shared_ptr<void>> retiredPins;
     std::thread reaper;
     bool reaperWaiting = false;
     std::uint64_t commits = 0;
