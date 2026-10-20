@@ -50,18 +50,23 @@ void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, cons
     while (writtenBuffers.size() > WrittenBufferRing) writtenBuffers.pop_front();
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded) {
+std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded, std::uint32_t* unboundedRoles) {
     bounded = compiled.bdaAbiVersion == 0;
+    std::uint32_t roles = bounded ? 0u : DispatchUnbounded::Bda;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     constexpr std::uint64_t UnknownImageBytes = 64ull * 1024 * 1024;
     for (const auto& binding : compiled.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) bounded = false;
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) {
+            bounded = false;
+            roles |= binding.role == ShaderRecompiler::DescriptorRole::Gds ? DispatchUnbounded::Gds : binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer ? DispatchUnbounded::Fault : DispatchUnbounded::Pagetable;
+        }
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
             if (!written) continue;
             if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) {
                 bounded = false;
+                roles |= DispatchUnbounded::Image;
                 continue;
             }
             const auto resource = Graphics::DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8));
@@ -72,6 +77,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
         }
     }
     visitWrittenBuffers(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+    if (unboundedRoles != nullptr) *unboundedRoles = roles;
     return ranges;
 }
 

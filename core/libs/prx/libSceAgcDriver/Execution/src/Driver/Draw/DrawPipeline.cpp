@@ -5,8 +5,12 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +27,112 @@ std::atomic<unsigned> runningCommitters{0};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+}
+
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the [stream] line's helpers. StreamTotals is what the
+// report takes from Stream::counters (each counter exchanged with 0).
+static_assert(Stream::DispatchClasses < 16, "DrawPipeline::StreamClassSlots holds every dispatch class and the later-drains slot");
+
+template<std::size_t N>
+std::array<std::uint64_t, N> takeCounters(std::array<Stream::Counter, N>& counters) {
+    std::array<std::uint64_t, N> values{};
+    for (std::size_t i = 0; i < N; ++i) values[i] = Stream::Take(counters[i]);
+    return values;
+}
+
+template<std::size_t N, std::size_t M>
+std::array<std::array<std::uint64_t, M>, N> takeCounters(std::array<std::array<Stream::Counter, M>, N>& counters) {
+    std::array<std::array<std::uint64_t, M>, N> values{};
+    for (std::size_t i = 0; i < N; ++i) values[i] = takeCounters(counters[i]);
+    return values;
+}
+
+struct StreamTotals {
+    std::array<std::uint64_t, Stream::DispatchClasses> dispatches{};
+    std::array<std::uint64_t, Stream::BehindBuckets> readsBehind{};
+    std::uint64_t unshadowed = 0;
+    std::uint64_t shadowNs = 0;
+    std::uint64_t bdaRoleMismatches = 0;
+    std::uint64_t presents = 0;
+    std::uint64_t holdNs = 0;
+    std::uint64_t holdLockWaitNs = 0;
+    std::uint64_t presentBufferNs = 0;
+    std::uint64_t queuePresentNs = 0;
+    std::uint64_t latePresents = 0;
+    std::uint64_t lateQueuePresentNs = 0;
+    std::array<std::array<std::uint64_t, Stream::Sites>, Stream::Roles> submits{};
+    std::array<std::array<std::uint64_t, Stream::Sites>, Stream::Roles> submitNs{};
+    std::array<std::array<std::uint64_t, Stream::Sites>, Stream::Roles> endNs{};
+    std::array<std::array<std::uint64_t, Stream::Sites>, Stream::Roles> queueSubmitNs{};
+    std::array<std::array<std::uint64_t, Stream::CompareByteBuckets>, Stream::CompareSpanBuckets> compares{};
+    std::array<std::array<std::uint64_t, Stream::CompareByteBuckets>, Stream::CompareSpanBuckets> compareNs{};
+    std::array<std::array<std::uint64_t, Stream::CompareByteBuckets>, Stream::CompareSpanBuckets> compareCommitterNs{};
+    std::array<std::uint64_t, Stream::CompareModes> compareModes{};
+    std::array<std::uint64_t, Stream::CompareModes> compareModeNs{};
+    std::array<std::uint64_t, Stream::Roles> trackerAcquisitions{};
+    std::array<std::uint64_t, Stream::Roles> trackerWaits{};
+    std::array<std::uint64_t, Stream::Roles> trackerWaitNs{};
+    std::array<std::array<std::uint64_t, Stream::Roles>, Stream::Roles> gpuWaits{};
+    std::array<std::array<std::uint64_t, Stream::Roles>, Stream::Roles> gpuWaitNs{};
+};
+
+StreamTotals takeStreamTotals() {
+    auto& counters = Stream::counters;
+    StreamTotals totals;
+    totals.dispatches = takeCounters(counters.dispatches);
+    totals.readsBehind = takeCounters(counters.readsBehind);
+    totals.unshadowed = Stream::Take(counters.unshadowed);
+    totals.shadowNs = Stream::Take(counters.shadowNs);
+    totals.bdaRoleMismatches = Stream::Take(counters.bdaRoleMismatches);
+    totals.presents = Stream::Take(counters.presents);
+    totals.holdNs = Stream::Take(counters.holdNs);
+    totals.holdLockWaitNs = Stream::Take(counters.holdLockWaitNs);
+    totals.presentBufferNs = Stream::Take(counters.presentBufferNs);
+    totals.queuePresentNs = Stream::Take(counters.queuePresentNs);
+    totals.latePresents = Stream::Take(counters.latePresents);
+    totals.lateQueuePresentNs = Stream::Take(counters.lateQueuePresentNs);
+    totals.submits = takeCounters(counters.submits);
+    totals.submitNs = takeCounters(counters.submitNs);
+    totals.endNs = takeCounters(counters.endNs);
+    totals.queueSubmitNs = takeCounters(counters.queueSubmitNs);
+    totals.compares = takeCounters(counters.compares);
+    totals.compareNs = takeCounters(counters.compareNs);
+    totals.compareCommitterNs = takeCounters(counters.compareCommitterNs);
+    totals.compareModes = takeCounters(counters.compareModes);
+    totals.compareModeNs = takeCounters(counters.compareModeNs);
+    totals.trackerAcquisitions = takeCounters(counters.trackerAcquisitions);
+    totals.trackerWaits = takeCounters(counters.trackerWaits);
+    totals.trackerWaitNs = takeCounters(counters.trackerWaitNs);
+    totals.gpuWaits = takeCounters(counters.gpuWaits);
+    totals.gpuWaitNs = takeCounters(counters.gpuWaitNs);
+    return totals;
+}
+
+double streamMs(std::uint64_t ns) {
+    return static_cast<double>(ns) / 1e6;
+}
+
+double streamPercent(std::uint64_t part, std::uint64_t whole) {
+    return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
+}
+
+const char* streamFileName(const char* path) {
+    if (path == nullptr) return "other";
+    const char* name = path;
+    for (const char* at = path; *at != '\0'; ++at) {
+        if (*at == '/' || *at == '\\') name = at + 1;
+    }
+    return name;
+}
+
+// Formatted with printf's checks; a piece is cut at 191 characters.
+__attribute__((format(gnu_printf, 2, 3))) void appendStream(std::string& text, const char* format, ...) {
+    char item[192];
+    std::va_list args;
+    va_start(args, format);
+    const auto size = std::vsnprintf(item, sizeof(item), format, args);
+    va_end(args);
+    if (size > 0) text.append(item, std::min(static_cast<std::size_t>(size), sizeof(item) - 1));
 }
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_ROOM_WAKE=1): a producer waiting for room is woken once the
@@ -167,6 +277,7 @@ void DrawPipeline::rethrowFailure() {
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_REPORT") != nullptr;
+    const bool streamOn = Stream::On();
     std::unique_lock lock(mutex);
     rethrowFailure();
     if (closing) {
@@ -242,16 +353,28 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full});
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the push time and depth (a draw's lead) end an open drain
+    // episode and the gate writers kept for it.
+    const auto pushedAtNs = streamOn ? Stream::NowNs() : 0;
+    const auto pushDepth = streamOn ? static_cast<std::uint32_t>(items.size()) : 0;
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full, pushedAtNs, pushDepth});
+    if (streamOn) {
+        closeStreamEpisode(pushedAtNs);
+        streamGateEpisode.store(0, std::memory_order_relaxed);
+        streamGateSerial = 0;
+    }
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);
     }
     if (committerWaiting) wake.notify_one();
-    if (!profile) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    if (profile) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    }
+    // Last: it releases the pipeline mutex before it prints.
+    if (streamOn) reportStream(lock);
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -300,19 +423,41 @@ void DrawPipeline::run() {
     StartCommitterSampler();
     PerformanceTrace::BindThread("draw committer");
     if (GuestMemory::Q0Receipts() != 0) CommitterThread::Set(true);
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the loop's idle (top to the item taken; a wait when the
+    // queue was empty at the top) and busy (the front's commit or run) spans; a busy span is added
+    // under the mutex at the next iteration.
+    const bool streamOn = Stream::On();
+    if (streamOn) GuestMemory::SetStreamRole(GuestMemory::StreamRole::Committer);
+    std::uint64_t busyNs = 0;
+    std::size_t busyKind = 0;
     for (;;) {
         Item* front = nullptr;
+        const auto idleStartNs = streamOn ? Stream::NowNs() : 0;
+        const bool emptyAtTop = streamOn && outstanding.load(std::memory_order_acquire) == 0;
+        if (streamOn) streamIdleSinceNs.store(idleStartNs, std::memory_order_relaxed);
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
+            if (streamOn) {
+                const auto foundNs = Stream::NowNs();
+                streamIdleSinceNs.store(0, std::memory_order_relaxed);
+                streamCounts.idleNs += foundNs - idleStartNs;
+                if (emptyAtTop) ++streamCounts.idleWaits;
+                streamCounts.busyNs[busyKind] += std::exchange(busyNs, 0);
+                // The wake after the push that ended a drain episode belongs to that drain.
+                if (streamWake.pending) fileStreamWake(foundNs, idleStartNs);
+            }
             if (items.empty()) break;
             front = stopped ? nullptr : &items.front();
         }
+        const auto busyStartNs = streamOn ? Stream::NowNs() : 0;
+        busyKind = front != nullptr ? static_cast<std::size_t>(front->kind) : 0;
         if (front != nullptr && front->kind != ItemKind::Other && commitRunItems() != 0) commitRun(front);
         else commitFront(front, nullptr);
+        if (streamOn) busyNs = Stream::NowNs() - busyStartNs;
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -380,6 +525,25 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
             if (outcome.fatal != nullptr && !stopped) {
                 stopped = true;
                 if (!outcome.shutdown) run->unreported = outcome.fatal;
+            }
+        }
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the [draw] commit time over the [stream] window, and a
+        // committed draw's lead from its push to this commit's start, by the depth its push found.
+        if (Stream::On()) {
+            ++streamCounts.commits;
+            streamCounts.commitNs += spent;
+            const auto& item = items.front();
+            const auto startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count());
+            if (front != nullptr && item.kind == ItemKind::Draw && item.enqueuedAtNs != 0 && startNs >= item.enqueuedAtNs) {
+                const auto leadNs = startNs - item.enqueuedAtNs;
+                constexpr std::array<std::uint64_t, LeadBuckets - 1> bounds{5000, 10000, 20000, 50000, 100000, 200000, 500000};
+                const auto bucket = static_cast<std::size_t>(std::upper_bound(bounds.begin(), bounds.end(), leadNs) - bounds.begin());
+                const auto depthBucket = std::min<std::size_t>(item.pushDepth, LeadDepthBuckets - 1);
+                ++streamCounts.leadDraws;
+                if (leadNs >= 20000) ++streamCounts.leadAtLeast20;
+                ++streamCounts.leads[bucket];
+                ++streamCounts.leadDepths[depthBucket];
+                streamCounts.leadDepthNs[depthBucket] += leadNs;
             }
         }
         done = std::move(items.front());
@@ -481,25 +645,406 @@ void DrawPipeline::Stop() {
     else committer.join();
 }
 
-void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode, std::source_location site) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
-    if (!Busy()) return;
+    if (!Busy()) {
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): nothing queued, but A1 would drain a queued dispatch
+        // item here, so this cuts an open eligible episode. Not a dispatch's own drain (its class
+        // decides, NoteDrainClass) nor a flush (PacketFlush notes the flushes that would drain).
+        if (Stream::On() && reason != DrainReason::Flush && !(reason == DrainReason::Packet && opcode == 0x15)) NoteWouldDrain(reason, opcode);
+        return;
+    }
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): a drain that found items queued opens an episode.
+    const bool streamOn = Stream::On();
+    if (streamOn) openStreamEpisode(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()), reason, opcode, site);
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
-    drainWaitNs[index] += elapsedNs(start);
+    const auto waitedNs = elapsedNs(start);
+    drainWaitNs[index] += waitedNs;
+    if (streamOn && streamEpisode.serial != 0) {
+        streamEpisode.returnNs = Stream::NowNs();
+        streamEpisode.waitNs = waitedNs;
+        if (streamEpisode.thread == std::this_thread::get_id()) streamEpisode.returnGpuWaitNs = Stream::ThreadGpuWait::Get();
+    }
     rethrowFailure();
 }
 
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
+}
+
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): drain episodes (see the header).
+// Only queue 0 drains and enqueues in the driver, so one episode is open at a time; a drain that
+// finds one still open (a test's other producer) closes it first.
+void DrawPipeline::openStreamEpisode(std::uint64_t startNs, DrainReason reason, std::uint32_t opcode, const std::source_location& site) {
+    if (streamEpisode.serial != 0) closeStreamEpisode(startNs);
+    streamEpisode = StreamEpisode{};
+    streamEpisode.serial = ++streamEpisodes;
+    streamEpisode.startNs = startNs;
+    streamEpisode.file = site.file_name();
+    streamEpisode.line = site.line();
+    streamEpisode.opcode = opcode;
+    streamEpisode.reason = reason;
+    streamEpisode.thread = std::this_thread::get_id();
+    streamEpisode.gate = streamGateSerial == streamEpisode.serial;
+    streamGateSerial = 0;
+    streamEpisodeSerial.store(streamEpisode.serial, std::memory_order_relaxed);
+    streamCuttable.store(false, std::memory_order_relaxed);
+}
+
+void DrawPipeline::closeStreamEpisode(std::uint64_t nowNs) {
+    auto& episode = streamEpisode;
+    if (episode.serial == 0) return;
+    // The committer's idle inside the episode: from the later of the episode's start and the
+    // committer's last look for work (0 when it is committing) to now.
+    const auto idleSince = streamIdleSinceNs.load(std::memory_order_relaxed);
+    const auto from = std::max(idleSince, episode.startNs);
+    const auto idleNs = idleSince != 0 && nowNs > from ? nowNs - from : 0;
+    const auto serialNs = episode.returnNs != 0 && nowNs > episode.returnNs ? nowNs - episode.returnNs : 0;
+    // A cut splits the idle: before it the episode's class, from it on the cut's slot. Queue 0's
+    // GPU waits since the drain's return (the queue is empty, so the committer idles through all
+    // of them) split the same way, read on the draining thread only; each part's waits and shadow
+    // work are capped at its idle, and they do not overlap (the shadow never waits for the GPU).
+    const bool cut = episode.cutNs != 0;
+    const auto cutIdleNs = cut && idleNs != 0 ? nowNs - std::clamp(episode.cutNs, from, nowNs) : 0;
+    const auto ownIdleNs = idleNs - cutIdleNs;
+    std::uint64_t ownGpuWaitNs = 0, cutGpuWaitNs = 0;
+    if (episode.returnNs != 0 && episode.thread == std::this_thread::get_id()) {
+        const auto nowWaitNs = std::max(Stream::ThreadGpuWait::Get(), episode.returnGpuWaitNs);
+        const auto cutWaitNs = cut ? std::clamp(episode.cutGpuWaitNs, episode.returnGpuWaitNs, nowWaitNs) : nowWaitNs;
+        ownGpuWaitNs = std::min(cutWaitNs - episode.returnGpuWaitNs, ownIdleNs);
+        cutGpuWaitNs = std::min(nowWaitNs - cutWaitNs, cutIdleNs);
+    }
+    // The site's slot: by call site, reason and opcode; the last slot takes the sites that find
+    // every other slot taken.
+    auto& sites = streamCounts.sites;
+    const auto matches = [&](const StreamSite& site) { return site.line == episode.line && site.opcode == episode.opcode && site.reason == episode.reason && (site.file == episode.file || std::strcmp(site.file, episode.file) == 0); };
+    std::size_t slot = 0;
+    while (slot + 1 < sites.size() && sites[slot].file != nullptr && !matches(sites[slot])) ++slot;
+    if (sites[slot].file == nullptr && slot + 1 < sites.size()) {
+        sites[slot].file = episode.file;
+        sites[slot].line = episode.line;
+        sites[slot].opcode = episode.opcode;
+        sites[slot].reason = episode.reason;
+    }
+    auto& site = sites[slot];
+    ++site.episodes;
+    site.waitNs += episode.waitNs;
+    site.idleNs += idleNs;
+    site.serialNs += serialNs;
+    ++streamCounts.episodes;
+    streamCounts.drainIdleNs += idleNs;
+    streamCounts.serialNs += serialNs;
+    const auto ownSlot = std::min<std::size_t>(episode.dispatchClass, LaterDrainSlot - 1);
+    ++streamCounts.classEpisodes[ownSlot];
+    streamCounts.classIdleNs[ownSlot] += ownIdleNs;
+    streamCounts.classGpuWaitNs[ownSlot] += ownGpuWaitNs;
+    streamCounts.classShadowNs[ownSlot] += std::min(episode.shadowNs, ownIdleNs - ownGpuWaitNs);
+    if (cut) {
+        streamCounts.classIdleNs[episode.cutSlot] += cutIdleNs;
+        streamCounts.classGpuWaitNs[episode.cutSlot] += cutGpuWaitNs;
+        streamCounts.classShadowNs[episode.cutSlot] += std::min(episode.cutShadowNs, cutIdleNs - cutGpuWaitNs);
+        streamCounts.cutIdleNs += cutIdleNs;
+    }
+    // The committer, idle at this push, takes the item after its wake (fileStreamWake).
+    streamWake = idleNs != 0 ? StreamWake{true, slot, cut ? episode.cutSlot : ownSlot, cut, nowNs} : StreamWake{};
+    episode = StreamEpisode{};
+    streamEpisodeSerial.store(0, std::memory_order_relaxed);
+    streamCuttable.store(false, std::memory_order_relaxed);
+}
+
+// The open episode's cut, at `at` (or now) and never before its drain returned, into class slot
+// `slot`. Under the mutex, with an episode open that can still be cut.
+void DrawPipeline::cutStreamEpisode(std::size_t slot, StreamPoint at) {
+    auto& episode = streamEpisode;
+    episode.cutNs = std::max(at.ns != 0 ? at.ns : Stream::NowNs(), episode.returnNs);
+    if (at.ns != 0) episode.cutGpuWaitNs = at.gpuWaitNs;
+    else if (episode.thread == std::this_thread::get_id()) episode.cutGpuWaitNs = Stream::ThreadGpuWait::Get();
+    episode.cutSlot = slot;
+    streamCuttable.store(false, std::memory_order_relaxed);
+}
+
+// The committer's wake after the push that closed an episode, from the later of the push and its
+// loop's top to the item taken: filed under that episode's site and the class slot its idle ended
+// in. Under the mutex.
+void DrawPipeline::fileStreamWake(std::uint64_t foundNs, std::uint64_t idleStartNs) {
+    const auto wake = std::exchange(streamWake, StreamWake{});
+    const auto since = std::max(wake.pushedAtNs, idleStartNs);
+    if (foundNs <= since) return;
+    const auto ns = foundNs - since;
+    streamCounts.sites[wake.site].idleNs += ns;
+    streamCounts.classIdleNs[wake.classSlot] += ns;
+    if (wake.cut) streamCounts.cutIdleNs += ns;
+    streamCounts.drainIdleNs += ns;
+    streamCounts.wakeNs += ns;
+}
+
+void DrawPipeline::copyQueuedWriters(std::vector<QueuedWriter>& writers) const {
+    for (std::size_t position = 0; position < items.size(); ++position) {
+        const auto& item = items[position];
+        for (const auto& [begin, end] : item.writes) writers.push_back({begin, end, static_cast<std::uint32_t>(position)});
+        for (const auto& label : item.labels) {
+            const auto [begin, end] = labelRange(label);
+            if (end > begin) writers.push_back({begin, end, static_cast<std::uint32_t>(position)});
+        }
+    }
+}
+
+std::size_t DrawPipeline::SnapshotWriters(std::vector<QueuedWriter>& writers, std::uint64_t episode) {
+    writers.clear();
+    // Nothing queued and no gate writers kept for this episode: nothing to copy, no lock.
+    if (!Busy() && (episode == 0 || streamGateEpisode.load(std::memory_order_relaxed) != episode)) return 0;
+    std::lock_guard lock(mutex);
+    if (episode != 0 && streamGateEpisode.load(std::memory_order_relaxed) == episode && streamEpisode.serial == episode) {
+        streamGateEpisode.store(0, std::memory_order_relaxed);
+        writers.swap(streamGateWriters);
+        return streamGateQueued;
+    }
+    copyQueuedWriters(writers);
+    return items.size();
+}
+
+// Right before queue 0's gate drain for a dispatch (PacketExecution): the episode that drain opens
+// is marked a gate episode, and takes these writers (a push first drops both).
+void DrawPipeline::NoteGateDrain() {
+    std::lock_guard lock(mutex);
+    streamGateWriters.clear();
+    copyQueuedWriters(streamGateWriters);
+    streamGateQueued = items.size();
+    streamGateSerial = streamEpisodes + 1;
+    streamGateEpisode.store(streamGateSerial, std::memory_order_relaxed);
+}
+
+void DrawPipeline::NoteDrainClass(std::uint64_t before, std::uint8_t dispatchClass, std::uint64_t shadowNs, StreamPoint drain) {
+    // No episode open: the committer was not starved by a drain (producer slow, or a drain's
+    // episode already ended at a push of this dispatch's own).
+    if (streamEpisodeSerial.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard lock(mutex);
+    auto& episode = streamEpisode;
+    if (episode.serial == 0) return;
+    auto value = static_cast<Stream::DispatchClass>(dispatchClass);
+    // Opened before this dispatch, by a drain made for it: the gate drain (A1 skips it, so this
+    // dispatch's class decides), or its 0x16 packet's own drain (A1 keeps it: indirect).
+    const bool indirectDrain = !episode.gate && episode.opcode == 0x16;
+    if (episode.serial != before || (episode.dispatches == 0 && (episode.gate || indirectDrain))) {
+        if (episode.serial == before && indirectDrain) value = Stream::DispatchClass::Indirect;
+        episode.dispatchClass = static_cast<std::uint8_t>(value);
+        streamCuttable.store(Stream::ItemEligible(value), std::memory_order_relaxed);
+    } else if (streamCuttable.load(std::memory_order_relaxed) && !Stream::ItemEligible(value)) {
+        // A later dispatch A1 would drain for: the cut. Its own shadow work came before it.
+        episode.shadowNs += std::exchange(shadowNs, 0);
+        ++streamCounts.dispatchCuts;
+        cutStreamEpisode(dispatchClass, drain);
+    }
+    (episode.cutNs != 0 ? episode.cutShadowNs : episode.shadowNs) += shadowNs;
+    ++episode.dispatches;
+}
+
+void DrawPipeline::NoteWouldDrain(DrainReason reason, std::uint32_t opcode) {
+    if (!streamCuttable.load(std::memory_order_relaxed)) return;
+    std::lock_guard lock(mutex);
+    if (streamEpisode.serial == 0 || !streamCuttable.load(std::memory_order_relaxed)) return;
+    ++streamCounts.drainCuts[static_cast<std::size_t>(reason)];
+    if (reason == DrainReason::Packet) ++streamCounts.packetCuts[std::min<std::uint32_t>(opcode, 0x100)];
+    cutStreamEpisode(LaterDrainSlot, {});
+}
+
+// The [stream] line, its sections in the order of PARALLEL-COMMIT-PLAN S0's items (counters in
+// StreamStats.hpp and above). The first call starts the first window (what was counted before is
+// dropped); later calls print every 10 s, after the pipeline mutex is released.
+void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
+    const auto now = std::chrono::steady_clock::now();
+    if (streamLastReport == std::chrono::steady_clock::time_point{}) {
+        streamLastReport = now;
+        streamCounts = StreamCounts{};
+        streamWake = StreamWake{};
+        lock.unlock();
+        static_cast<void>(takeStreamTotals());
+        return;
+    }
+    if (now - streamLastReport < std::chrono::seconds(10)) return;
+    const auto wallNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - streamLastReport).count());
+    streamLastReport = now;
+    const auto counts = std::exchange(streamCounts, StreamCounts{});
+    // A wake still to file names a site slot of the window just taken.
+    streamWake = StreamWake{};
+    lock.unlock();
+    const auto totals = takeStreamTotals();
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    std::string line;
+    // Cells of one section are separated by commas, sections by semicolons.
+    bool first = true;
+    const auto cell = [&] {
+        if (!first) line += ',';
+        first = false;
+    };
+    // 1. The committer: busy (by its front's kind) against the [draw] pipelined commit time of the
+    // same window (the self-check: within 5%), idle split into drain episodes and producer slow,
+    // and busy + idle against the wall.
+    const auto busyNs = counts.busyNs[0] + counts.busyNs[1] + counts.busyNs[2];
+    const auto drainIdleNs = std::min(counts.drainIdleNs, counts.idleNs);
+    const double busyDifference = counts.commitNs == 0 ? 0.0 : 100.0 * (static_cast<double>(busyNs) - static_cast<double>(counts.commitNs)) / static_cast<double>(counts.commitNs);
+    const bool busyMatches = counts.commitNs != 0 && busyDifference <= 5.0 && busyDifference >= -5.0;
+    appendStream(line, "[stream] (10 s, %.2f s measured) committer: busy %.1f ms (draws %.1f, labels %.1f, other %.1f)", static_cast<double>(wallNs) / 1e9, streamMs(busyNs), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Draw)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Label)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Other)]));
+    appendStream(line, " vs [draw] pipelined commit time %.1f ms in %llu commits: %+.1f%%, %s", streamMs(counts.commitNs), count(counts.commits), busyDifference, busyMatches ? "within 5%" : "OFF BY MORE THAN 5%");
+    appendStream(line, "; idle %.1f ms (%llu waits on an empty queue): drains %.1f ms (%.1f ms of it waking after the push)", streamMs(counts.idleNs), count(counts.idleWaits), streamMs(drainIdleNs), streamMs(counts.wakeNs));
+    appendStream(line, ", producer slow %.1f ms; busy + idle %.1f ms of %.1f ms", streamMs(counts.idleNs - drainIdleNs), streamMs(busyNs + counts.idleNs), streamMs(wallNs));
+    // Drain episodes, queue 0's serial phases, and the sites with the most committer idle.
+    appendStream(line, "; drain episodes %llu, serial phases %.1f ms (%.1f us each); sites (episodes, drain wait ms, committer idle ms, serial ms):", count(counts.episodes), streamMs(counts.serialNs), counts.episodes == 0 ? 0.0 : static_cast<double>(counts.serialNs) / 1e3 / static_cast<double>(counts.episodes));
+    std::array<std::size_t, StreamSiteSlots> order{};
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return counts.sites[a].idleNs != counts.sites[b].idleNs ? counts.sites[a].idleNs > counts.sites[b].idleNs : counts.sites[a].episodes > counts.sites[b].episodes; });
+    first = true;
+    for (std::size_t shown = 0; shown < 10; ++shown) {
+        const auto& site = counts.sites[order[shown]];
+        if (site.episodes == 0) continue;
+        cell();
+        if (site.file == nullptr) {
+            // The overflow slot, in the cells' shape: one name token, reason and opcode "-".
+            appendStream(line, " other-sites - - %llu %.1f %.1f %.1f", count(site.episodes), streamMs(site.waitNs), streamMs(site.idleNs), streamMs(site.serialNs));
+            continue;
+        }
+        char opcode[8];
+        if (site.opcode >= 0x100) std::snprintf(opcode, sizeof(opcode), "-");
+        else std::snprintf(opcode, sizeof(opcode), "0x%02x", site.opcode);
+        appendStream(line, " %s:%u %s %s %llu %.1f %.1f %.1f", streamFileName(site.file), site.line, DrainNames[static_cast<std::size_t>(site.reason)], opcode, count(site.episodes), streamMs(site.waitNs), streamMs(site.idleNs), streamMs(site.serialNs));
+    }
+    // 2. The shadow dispatch classifier: per class the dispatches, the drain episodes their own
+    // drains opened, the committer idle filed under the class (its episodes up to a cut, and the
+    // cuts it made) and queue 0's GPU waits inside that idle; later-drains is the idle of cuts at
+    // a drain or a packet. The reads class by the items queued behind the newest overlapping
+    // writer. The A1 gate: item-eligible idle against all drain idle, then net of the queue-0 GPU
+    // waits in it (A1 moves them onto the committer) and of the shadow's own work.
+    appendStream(line, "; queue-0 dispatches, A1 shadow (class dispatches/episodes/idle ms/queue-0 GPU wait ms):");
+    first = true;
+    std::uint64_t eligibleNs = 0, eligibleGpuWaitNs = 0, eligibleShadowNs = 0;
+    for (std::size_t index = 0; index < Stream::DispatchClasses; ++index) {
+        if (Stream::ItemEligible(static_cast<Stream::DispatchClass>(index))) {
+            eligibleNs += counts.classIdleNs[index];
+            eligibleGpuWaitNs += counts.classGpuWaitNs[index];
+            eligibleShadowNs += counts.classShadowNs[index];
+        }
+        if (totals.dispatches[index] == 0 && counts.classEpisodes[index] == 0 && counts.classIdleNs[index] == 0) continue;
+        cell();
+        appendStream(line, " %s %llu/%llu/%.1f/%.1f", Stream::DispatchClassNames[index], count(totals.dispatches[index]), count(counts.classEpisodes[index]), streamMs(counts.classIdleNs[index]), streamMs(counts.classGpuWaitNs[index]));
+    }
+    std::uint64_t drainCuts = 0;
+    for (const auto cuts : counts.drainCuts) drainCuts += cuts;
+    if (counts.classIdleNs[LaterDrainSlot] != 0 || drainCuts != 0) {
+        cell();
+        appendStream(line, " later-drains 0/%llu/%.1f/%.1f", count(drainCuts), streamMs(counts.classIdleNs[LaterDrainSlot]), streamMs(counts.classGpuWaitNs[LaterDrainSlot]));
+    }
+    if (totals.unshadowed != 0) appendStream(line, " (%llu not classified: APS5_PIPELINE_DISPATCH is on)", count(totals.unshadowed));
+    if (totals.bdaRoleMismatches != 0) appendStream(line, " (%llu unbounded hits with a BDA ABI but no fault buffer, or the reverse)", count(totals.bdaRoleMismatches));
+    appendStream(line, "; reads by items behind the newest writer:");
+    first = true;
+    for (std::size_t bucket = 0; bucket < Stream::BehindBuckets; ++bucket) {
+        cell();
+        appendStream(line, " %s %llu", Stream::BehindNames[bucket], count(totals.readsBehind[bucket]));
+    }
+    const auto netGpuNs = eligibleNs - std::min(eligibleNs, eligibleGpuWaitNs);
+    const auto netNs = netGpuNs - std::min(netGpuNs, eligibleShadowNs);
+    appendStream(line, "; A1 gate: item-eligible idle %.1f ms = %.1f%% of drain idle", streamMs(eligibleNs), streamPercent(eligibleNs, drainIdleNs));
+    appendStream(line, ", net of its queue-0 GPU waits (%.1f ms) %.1f%%, and of the shadow's work in it (%.1f ms) %.1f%%", streamMs(eligibleGpuWaitNs), streamPercent(netGpuNs, drainIdleNs), streamMs(eligibleShadowNs), streamPercent(netNs, drainIdleNs));
+    appendStream(line, "; shadow work %.1f ms; eligible episodes cut where A1 would still drain (%.1f ms filed there; cause n): dispatch %llu", streamMs(totals.shadowNs), streamMs(counts.cutIdleNs), count(counts.dispatchCuts));
+    for (std::size_t reason = 0; reason < counts.drainCuts.size(); ++reason) {
+        if (counts.drainCuts[reason] == 0 || reason == static_cast<std::size_t>(DrainReason::Packet)) continue;
+        appendStream(line, ", %s %llu", DrainNames[reason], count(counts.drainCuts[reason]));
+    }
+    for (std::size_t opcode = 0; opcode < counts.packetCuts.size(); ++opcode) {
+        if (counts.packetCuts[opcode] == 0) continue;
+        if (opcode >= 0x100) appendStream(line, ", packet-- %llu", count(counts.packetCuts[opcode]));
+        else appendStream(line, ", packet-0x%02zx %llu", opcode, count(counts.packetCuts[opcode]));
+    }
+    // 5. Draw leads, push to commit start, and the depth pushed behind (draws, mean lead).
+    static constexpr std::array<const char*, LeadBuckets> leadNames{"<5us", "<10us", "<20us", "<50us", "<100us", "<200us", "<500us", ">=500us"};
+    appendStream(line, "; draw leads %llu (>=20us %.1f%%):", count(counts.leadDraws), streamPercent(counts.leadAtLeast20, counts.leadDraws));
+    first = true;
+    for (std::size_t bucket = 0; bucket < LeadBuckets; ++bucket) {
+        cell();
+        appendStream(line, " %s %llu", leadNames[bucket], count(counts.leads[bucket]));
+    }
+    appendStream(line, "; by depth pushed behind (draws/mean lead us):");
+    first = true;
+    for (std::size_t bucket = 0; bucket < LeadDepthBuckets; ++bucket) {
+        if (counts.leadDepths[bucket] == 0) continue;
+        cell();
+        appendStream(line, " %zu%s %llu/%.1f", bucket, bucket + 1 == LeadDepthBuckets ? "+" : "", count(counts.leadDepths[bucket]), static_cast<double>(counts.leadDepthNs[bucket]) / 1e3 / static_cast<double>(counts.leadDepths[bucket]));
+    }
+    // 3. The presenter's second hold and its parts; the late (third-hold) presents apart.
+    appendStream(line, "; presenter: %llu presents, lock wait %.1f ms, second hold %.1f ms: PresentDisplayBuffer %.1f ms, QueuePresent %.1f ms (%.0f%% of the hold); late QueuePresent %llu, %.1f ms", count(totals.presents), streamMs(totals.holdLockWaitNs), streamMs(totals.holdNs), streamMs(totals.presentBufferNs), streamMs(totals.queuePresentNs), streamPercent(totals.queuePresentNs, totals.holdNs), count(totals.latePresents), streamMs(totals.lateQueuePresentNs));
+    // Contended GpuMutex waits by waiter and holder role (counted under the holder seen first, the
+    // time split over every holder the wait sat behind), and the committer's wait behind the
+    // presenter per present (the A3 gate).
+    const auto committer = static_cast<std::size_t>(GuestMemory::StreamRole::Committer);
+    const auto presenter = static_cast<std::size_t>(GuestMemory::StreamRole::Presenter);
+    appendStream(line, "; GpuMutex waits, committer behind the presenter %.2f ms per present (waiter<holder waits begun behind it/ms behind it):", totals.presents == 0 ? 0.0 : streamMs(totals.gpuWaitNs[committer][presenter]) / static_cast<double>(totals.presents));
+    first = true;
+    for (std::size_t waiter = 0; waiter < Stream::Roles; ++waiter) {
+        for (std::size_t holder = 0; holder < Stream::Roles; ++holder) {
+            if (totals.gpuWaits[waiter][holder] == 0 && totals.gpuWaitNs[waiter][holder] == 0) continue;
+            cell();
+            appendStream(line, " %s<%s %llu/%.1f", Stream::RoleNames[waiter], Stream::RoleNames[holder], count(totals.gpuWaits[waiter][holder]), streamMs(totals.gpuWaitNs[waiter][holder]));
+        }
+    }
+    // 4. Recorder::Submit by role and hold site, and the committer's vkQueueSubmit share (the A4
+    // gate).
+    std::uint64_t committerSubmitNs = 0, committerQueueSubmitNs = 0;
+    for (std::size_t site = 0; site < Stream::Sites; ++site) {
+        committerSubmitNs += totals.submitNs[committer][site];
+        committerQueueSubmitNs += totals.queueSubmitNs[committer][site];
+    }
+    appendStream(line, "; Recorder::Submit, committer vkQueueSubmit %.1f ms = %.0f%% of its %.1f ms (role/site n, Submit ms, vkEndCommandBuffer ms, vkQueueSubmit ms):", streamMs(committerQueueSubmitNs), streamPercent(committerQueueSubmitNs, committerSubmitNs), streamMs(committerSubmitNs));
+    first = true;
+    for (std::size_t role = 0; role < Stream::Roles; ++role) {
+        for (std::size_t site = 0; site < Stream::Sites; ++site) {
+            if (totals.submits[role][site] == 0) continue;
+            cell();
+            appendStream(line, " %s/%s %llu %.1f %.1f %.1f", Stream::RoleNames[role], GuestMemory::GpuLockSiteName(static_cast<GuestMemory::GpuLockSite>(site)), count(totals.submits[role][site]), streamMs(totals.submitNs[role][site]), streamMs(totals.endNs[role][site]), streamMs(totals.queueSubmitNs[role][site]));
+        }
+    }
+    // 6. CompareSpansFrom by span count and total bytes, and by how it ran.
+    appendStream(line, "; CompareSpansFrom (spans/bytes n, ms, committer ms):");
+    first = true;
+    for (std::size_t spans = 0; spans < Stream::CompareSpanBuckets; ++spans) {
+        for (std::size_t bytes = 0; bytes < Stream::CompareByteBuckets; ++bytes) {
+            if (totals.compares[spans][bytes] == 0) continue;
+            cell();
+            appendStream(line, " %s/%s %llu %.1f %.1f", Stream::CompareSpanNames[spans], Stream::CompareByteNames[bytes], count(totals.compares[spans][bytes]), streamMs(totals.compareNs[spans][bytes]), streamMs(totals.compareCommitterNs[spans][bytes]));
+        }
+    }
+    appendStream(line, "; by mode (n, ms):");
+    first = true;
+    for (std::size_t mode = 0; mode < Stream::CompareModes; ++mode) {
+        cell();
+        appendStream(line, " %s %llu %.1f", Stream::CompareModeNames[mode], count(totals.compareModes[mode]), streamMs(totals.compareModeNs[mode]));
+    }
+    // 7. The write tracker's lock per role.
+    appendStream(line, "; tracker lock (role acquisitions/waits, wait ms):");
+    first = true;
+    for (std::size_t role = 0; role < Stream::Roles; ++role) {
+        if (totals.trackerAcquisitions[role] == 0) continue;
+        cell();
+        appendStream(line, " %s %llu/%llu %.1f", Stream::RoleNames[role], count(totals.trackerAcquisitions[role]), count(totals.trackerWaits[role]), streamMs(totals.trackerWaitNs[role]));
+    }
+    // 8. LOCAL EXPERIMENT (APS5_EXPERIMENT_LOCAL_CUTS=2, PARALLEL-COMMIT-PLAN C1): the checks each
+    // local cut passed, so a verify run shows the cuts were exercised.
+    if (Graphics::LocalCuts() == 2) {
+        auto& cuts = Graphics::localCutCounts;
+        const auto checked = [&](Graphics::LocalCut cut) { return count(Stream::Take(cuts.checked[static_cast<std::size_t>(cut)])); };
+        // Two pieces, so neither reaches appendStream's 191-character cut.
+        appendStream(line, "; local cuts verified: committed flag %llu commits, unsaved layers %llu calls (%llu lists filled)", checked(Graphics::LocalCut::Committed), checked(Graphics::LocalCut::UnsavedLayers), count(Stream::Take(cuts.layersFilled)));
+        appendStream(line, ", device reads %llu template draws (%llu lists kept), disagreements %llu", checked(Graphics::LocalCut::DeviceReads), count(Stream::Take(cuts.readsKept)), count(Stream::Take(cuts.disagreed)));
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

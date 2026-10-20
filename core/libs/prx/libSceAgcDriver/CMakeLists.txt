@@ -2450,7 +2450,19 @@ if(BUILD_TESTING)
             "q0_template|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2"
             "q0_words|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
             "q0_receipts|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1,APS5_DEBUG_Q0_PREP_STATS=1,APS5_DEBUG_Q0_VERIFY_WALKS=1"
-            "q0_receipts_vram|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+            "q0_receipts_vram|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
+            # LOCAL DEBUG (PARALLEL-COMMIT-PLAN S0): the [stream] counters with the GpuMutex and
+            # HostImportFor PrepareScope assertions, alone and over queue 0's verified tickets
+            # (whose preparation runs inside a PrepareScope).
+            "stream_stats|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1"
+            "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
+            # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the
+            # committed flag against std::uncaught_exceptions, including the failure run's throw;
+            # the scratch unsaved-layer list; a template's kept DeviceReads list against the walk),
+            # and used as the play build uses them (=2 computes each cut but runs today's answer, so
+            # only =1 runs the flag's return, the scratch list and the kept-list copy).
+            "local_cuts|APS5_EXPERIMENT_LOCAL_CUTS=2"
+            "local_cuts_on|APS5_EXPERIMENT_LOCAL_CUTS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
@@ -2497,6 +2509,26 @@ if(BUILD_TESTING)
     set_tests_properties(${committerExperimentTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
     if(WIN32)
         set_tests_properties(${committerExperimentTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL DEBUG (APS5_ASSERT_GPU_LOCK, PARALLEL-COMMIT-PLAN S0): death tests. Inside a
+    # GuestMemory::PrepareScope a GpuMutex try_lock and a HostImportFor call abort with a [lock] line,
+    # which is matched. A nonzero exit code is then ignored, but only a plain one: ctest fails a run
+    # that ends in an exception (0xc0000409, a signal) without reading its output, so the test turns
+    # abort() into exit code 3 (PrepareScopeDeath). The _unasserted runs check that both return.
+    set(prepareScopeTests)
+    foreach(prepareScopeCase IN ITEMS try_lock host_import)
+        string(REPLACE "_" "-" prepareScopeArgument "${prepareScopeCase}")
+        add_test(NAME agc_driver_locks_prepare_scope_${prepareScopeCase} COMMAND agc_driver_locks_tests --prepare-scope-${prepareScopeArgument})
+        set_tests_properties(agc_driver_locks_prepare_scope_${prepareScopeCase} PROPERTIES ENVIRONMENT "APS5_ASSERT_GPU_LOCK=1"
+            PASS_REGULAR_EXPRESSION "\\[lock\\] ASSERT: [^\r\n]*inside a PrepareScope")
+        add_test(NAME agc_driver_locks_prepare_scope_${prepareScopeCase}_unasserted COMMAND ${CMAKE_COMMAND} -E env --unset=APS5_ASSERT_GPU_LOCK
+            $<TARGET_FILE:agc_driver_locks_tests> --prepare-scope-${prepareScopeArgument})
+        list(APPEND prepareScopeTests agc_driver_locks_prepare_scope_${prepareScopeCase} agc_driver_locks_prepare_scope_${prepareScopeCase}_unasserted)
+    endforeach()
+    set_tests_properties(${prepareScopeTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(${prepareScopeTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

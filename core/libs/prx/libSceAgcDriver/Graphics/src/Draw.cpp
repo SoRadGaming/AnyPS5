@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -2425,7 +2426,31 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
     auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
     passReads.clear();
-    if (!addressBased) resources.DeviceReads(passReads);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_LOCAL_CUTS): a reusable template's list is kept from its
+    // first recorded draw (ShaderResources::KeptDeviceReads) and copied, instead of walking the
+    // template's regions on every draw. =2 walks them as today, uses that, and aborts when the walk
+    // differs from the kept list; the cut stays only if it never does.
+    if (!addressBased) {
+        const int cuts = LocalCuts();
+        auto* kept = cuts != 0 && resources.Reusable() ? &resources.KeptDeviceReads() : nullptr;
+        if (cuts == 1 && kept != nullptr && kept->has_value()) {
+            passReads.assign((*kept)->begin(), (*kept)->end());
+        } else {
+            resources.DeviceReads(passReads);
+            if (kept != nullptr && !kept->has_value()) {
+                kept->emplace(passReads);
+                if (cuts == 2) localCutCounts.readsKept.fetch_add(1, std::memory_order_relaxed);
+            } else if (kept != nullptr) {
+                if (passReads != **kept) {
+                    const auto mismatch = std::mismatch(passReads.begin(), passReads.end(), (*kept)->begin(), (*kept)->end());
+                    char what[192];
+                    std::snprintf(what, sizeof(what), "template %p: the kept list has %zu ranges, the walk %zu, first difference at range %zu", static_cast<const void*>(&resources), (*kept)->size(), passReads.size(), static_cast<std::size_t>(mismatch.first - passReads.begin()));
+                    LocalCutDisagrees(LocalCut::DeviceReads, what);
+                }
+                NoteLocalCutChecked(LocalCut::DeviceReads);
+            }
+        }
+    }
     if (gpuIndirect) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);

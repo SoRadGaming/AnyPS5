@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
@@ -1205,15 +1206,25 @@ WriteTracker& Tracker() {
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the same per thread role, with the wait timed ([stream]).
 std::unique_lock<AgcDriver::Mutex> lockTracker(WriteTracker& tracker) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return std::unique_lock(tracker.mutex);
+    static const bool counted = profile || StreamStats() != 0;
+    if (!counted) return std::unique_lock(tracker.mutex);
+    const bool stream = StreamStats() != 0;
+    const auto role = stream ? static_cast<std::size_t>(CurrentStreamRole()) : 0;
     std::unique_lock lock(tracker.mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        trackerWaits.fetch_add(1, std::memory_order_relaxed);
+        if (profile) trackerWaits.fetch_add(1, std::memory_order_relaxed);
+        const auto start = stream ? Stream::NowNs() : 0;
         lock.lock();
+        if (stream) {
+            Stream::Add(Stream::counters.trackerWaits[role]);
+            Stream::Add(Stream::counters.trackerWaitNs[role], Stream::NowNs() - start);
+        }
     }
-    trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
+    if (profile) trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
+    if (stream) Stream::Add(Stream::counters.trackerAcquisitions[role]);
     return lock;
 }
 
@@ -2815,6 +2826,119 @@ public:
 private:
     std::atomic<std::uint32_t>* counter;
 };
+
+struct PrepareScopeTag {};
+using PrepareScopeSlot = HostThreadSlot<bool, PrepareScopeTag>;
+bool assertGpuLock() {
+    static const bool enabled = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
+    return enabled;
+}
+
+[[noreturn]] void abortInPrepareScope(const char* what) {
+    std::fprintf(stderr, "[lock] ASSERT: %s inside a PrepareScope (queue 0 preparing a draw ticket, or a thread that must never take GuestMemory::GpuMutex) on thread tagged 0x%x\n", what, GpuLockThreadTag());
+    std::abort();
+}
+
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): the calling thread's role, the
+// site tagged for its next acquisition (TagGpuLockSite), the site of its outermost hold (for the
+// submit split), the role of the thread that last took the mutex outermost and when, and each
+// role's completed outermost holds (ns, added at the release), which split a contended lock()'s
+// wait (StreamWaitSplit). Written only while the switch is on.
+struct StreamRoleTag {};
+struct StreamNextSiteTag {};
+struct StreamHoldSiteTag {};
+using StreamRoleSlot = HostThreadSlot<std::uint8_t, StreamRoleTag>;
+using StreamNextSite = HostThreadSlot<std::uint8_t, StreamNextSiteTag>;
+using StreamHoldSite = HostThreadSlot<std::uint8_t, StreamHoldSiteTag>;
+std::atomic<std::uint8_t> streamHolderRole{0};
+std::atomic<std::uint64_t> streamHoldStartNs{0};
+std::array<std::atomic<std::uint64_t>, Stream::Roles> streamHeldNs{};
+
+void noteStreamAcquisition(bool outermost) {
+    const auto site = StreamNextSite::Get();
+    StreamNextSite::Set(0);
+    if (!outermost) return;
+    StreamHoldSite::Set(site);
+    streamHolderRole.store(StreamRoleSlot::Get(), std::memory_order_relaxed);
+    streamHoldStartNs.store(Stream::NowNs(), std::memory_order_relaxed);
+}
+
+// The outermost release, by the holder before it gives the mutex up: its hold onto its role.
+void noteStreamRelease() {
+    const auto role = std::min<std::size_t>(streamHolderRole.load(std::memory_order_relaxed), Stream::Roles - 1);
+    const auto startNs = streamHoldStartNs.load(std::memory_order_relaxed);
+    const auto nowNs = Stream::NowNs();
+    if (startNs != 0 && nowNs > startNs) streamHeldNs[role].fetch_add(nowNs - startNs, std::memory_order_relaxed);
+}
+
+// A contended lock()'s wait, counted once under the role of the holder seen when it began, and
+// its time split over the roles whose holds overlapped it (the lock is not FIFO, so a waiter often
+// waits behind more than that first holder): each role's held ns over the wait, the first holder's
+// only from the wait's start, scaled to the wait (the hand-offs between holds shared out the same
+// way). Begun after a failed try, ended once the mutex is this thread's.
+class StreamWaitSplit {
+public:
+    StreamWaitSplit() {
+        for (std::size_t role = 0; role < Stream::Roles; ++role) heldBefore[role] = streamHeldNs[role].load(std::memory_order_relaxed);
+        holder = std::min<std::size_t>(streamHolderRole.load(std::memory_order_relaxed), Stream::Roles - 1);
+        holderStartNs = streamHoldStartNs.load(std::memory_order_relaxed);
+        startNs = Stream::NowNs();
+    }
+
+    void End() const {
+        const auto ns = Stream::NowNs() - startNs;
+        const auto waiter = static_cast<std::size_t>(StreamRoleSlot::Get());
+        std::array<std::uint64_t, Stream::Roles> overlap{};
+        for (std::size_t role = 0; role < Stream::Roles; ++role) overlap[role] = streamHeldNs[role].load(std::memory_order_relaxed) - heldBefore[role];
+        if (holderStartNs != 0 && holderStartNs < startNs) overlap[holder] -= std::min(overlap[holder], startNs - holderStartNs);
+        std::uint64_t total = 0;
+        for (const auto held : overlap) total += held;
+        Stream::Add(Stream::counters.gpuWaits[waiter][holder]);
+        if (total == 0) {
+            Stream::Add(Stream::counters.gpuWaitNs[waiter][holder], ns);
+            return;
+        }
+        std::uint64_t given = 0;
+        for (std::size_t role = 0; role < Stream::Roles; ++role) {
+            if (overlap[role] == 0) continue;
+            const auto share = static_cast<std::uint64_t>(static_cast<double>(ns) * static_cast<double>(overlap[role]) / static_cast<double>(total));
+            Stream::Add(Stream::counters.gpuWaitNs[waiter][role], share);
+            given += share;
+        }
+        // The rounding remainder.
+        if (given < ns) Stream::Add(Stream::counters.gpuWaitNs[waiter][holder], ns - given);
+    }
+
+private:
+    std::array<std::uint64_t, Stream::Roles> heldBefore{};
+    std::size_t holder = 0;
+    std::uint64_t holderStartNs = 0;
+    std::uint64_t startNs = 0;
+};
+}
+
+int StreamStats() {
+    static const int level = [] {
+        const char* text = std::getenv("APS5_DEBUG_STREAM_STATS");
+        return text != nullptr && text[0] != '\0' && text[0] != '0' ? 1 : 0;
+    }();
+    return level;
+}
+
+void SetStreamRole(StreamRole role) {
+    if (StreamStats() != 0) StreamRoleSlot::Set(static_cast<std::uint8_t>(role));
+}
+
+StreamRole CurrentStreamRole() {
+    return StreamStats() != 0 ? static_cast<StreamRole>(StreamRoleSlot::Get()) : StreamRole::Other;
+}
+
+GpuLockSite CurrentGpuHoldSite() {
+    return StreamStats() != 0 ? static_cast<GpuLockSite>(StreamHoldSite::Get()) : GpuLockSite::Other;
+}
+
+void AssertOutsidePrepareScope(const char* where) {
+    if (assertGpuLock() && PrepareScopeSlot::Get()) abortInPrepareScope(where);
 }
 
 void GpuMutexType::enter() {
@@ -2830,17 +2954,30 @@ void GpuMutexType::enter() {
 }
 
 bool GpuMutexType::tryEnter() {
+    // LOCAL DEBUG (APS5_ASSERT_GPU_LOCK, PARALLEL-COMMIT-PLAN S0): a try_lock inside a PrepareScope
+    // aborts as a lock() there does (a recursive try by a holder included).
+    if (assertGpuLock() && PrepareScopeSlot::Get()) abortInPrepareScope("GuestMemory::GpuMutex tried");
     return HeldByThisThread() || mutex.try_lock();
 }
 
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): every acquisition consumes the thread's site tag; the
+    // outermost one makes it the hold's site and publishes the holder's role.
+    if (StreamStats() != 0) noteStreamAcquisition(depth == 1);
 }
 
 bool GpuMutexType::try_lock() {
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): as below, a try consumes its site tag whether or not
+    // it succeeds, and an untagged try's hold is 'try'.
+    const bool stream = StreamStats() != 0;
+    if (stream && StreamNextSite::Get() == 0) StreamNextSite::Set(static_cast<std::uint8_t>(GpuLockSite::Try));
     if (!GpuLockProfiled()) {
-        if (!tryEnter()) return false;
+        if (!tryEnter()) {
+            if (stream) StreamNextSite::Set(0);
+            return false;
+        }
         acquired();
         return true;
     }
@@ -2851,6 +2988,7 @@ bool GpuMutexType::try_lock() {
     ++stats.tries;
     if (!tryEnter()) {
         ++stats.triesFailed;
+        if (stream) StreamNextSite::Set(0);
         return false;
     }
     acquired();
@@ -2876,6 +3014,8 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the hold's time onto its role, for StreamWaitSplit.
+        if (StreamStats() != 0) noteStreamRelease();
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
@@ -2899,15 +3039,6 @@ void AssertGpuLockHeld(const char* where) {
     if (!enabled || GpuMutex().HeldByThisThread()) return;
     std::fprintf(stderr, "[lock] ASSERT: %s reached without GuestMemory::GpuMutex on thread tagged 0x%x\n", where, GpuLockThreadTag());
     std::abort();
-}
-
-namespace {
-struct PrepareScopeTag {};
-using PrepareScopeSlot = HostThreadSlot<bool, PrepareScopeTag>;
-bool assertGpuLock() {
-    static const bool enabled = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
-    return enabled;
-}
 }
 
 PrepareScope::PrepareScope() : previous(PrepareScopeSlot::Get()) {
@@ -2958,13 +3089,21 @@ WalkStats TakeWalkStats() {
 void GpuMutexType::lock() {
     // LOCAL EXPERIMENT (room-wait draw tickets): queue 0 never takes the mutex while it prepares
     // a ticket (PrepareScope); under APS5_ASSERT_GPU_LOCK=1 doing so aborts here.
-    if (assertGpuLock() && PrepareScopeSlot::Get()) {
-        std::fprintf(stderr, "[lock] ASSERT: GuestMemory::GpuMutex taken inside a PrepareScope (queue 0 preparing a draw ticket) on thread tagged 0x%x\n", GpuLockThreadTag());
-        std::abort();
-    }
+    if (assertGpuLock() && PrepareScopeSlot::Get()) abortInPrepareScope("GuestMemory::GpuMutex taken");
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
-        if (trace == nullptr) {
+        if (trace == nullptr && StreamStats() != 0) {
+            // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): enter() with a contended acquisition timed,
+            // per waiter role, over the holders' roles (StreamWaitSplit).
+            if (!HeldByThisThread() && !mutex.try_lock()) {
+                const StreamWaitSplit split;
+                {
+                    const CountedWait counted(waiting);
+                    LockSpinning(mutex, HandoffSpinWindow());
+                }
+                split.End();
+            }
+        } else if (trace == nullptr) {
             enter();
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
@@ -2990,11 +3129,14 @@ void GpuMutexType::lock() {
         const bool holders = GpuHoldProfiled();
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
+        std::optional<StreamWaitSplit> streamSplit;
+        if (StreamStats() != 0) streamSplit.emplace();
         const auto start = std::chrono::steady_clock::now();
         {
             const CountedWait counted(waiting);
             LockSpinning(mutex, HandoffSpinWindow());
         }
+        if (streamSplit.has_value()) streamSplit->End();
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
@@ -3070,13 +3212,20 @@ void GpuMutexType::lock() {
 }
 
 void TagGpuLockSite(GpuLockSite site) {
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the [stream] submit split's own copy of the tag.
+    if (StreamStats() != 0) StreamNextSite::Set(static_cast<std::uint8_t>(site));
     // Off the profiled path the tag is never read, so the thread-local is not touched either.
     if (!GpuLockProfiled() && !PerformanceTrace::Recording()) return;
     LockStats().nextSite = site;
 }
 
+const char* GpuLockSiteName(GpuLockSite site) {
+    return GpuLockSiteNames[std::min(static_cast<std::size_t>(site), GpuLockSiteCount - 1)];
+}
+
 void MarkPresenterThread() {
     LockStats().holderColumn = PresenterColumn;
+    SetStreamRole(StreamRole::Presenter);
 }
 
 void NoteLockedGpuWait(double ms) {
@@ -3102,6 +3251,7 @@ GpuMutexType& GpuMutex() {
 
 void TagGpuLockThread(std::uint32_t queue) {
     LockStats().tag = queue;
+    SetStreamRole(queue == 0 ? StreamRole::Queue0 : StreamRole::Compute);
 }
 
 unsigned long long CodeOffset(const void* address) {

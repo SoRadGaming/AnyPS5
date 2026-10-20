@@ -3017,6 +3017,10 @@ std::uint64_t HostImportsSettled() {
 }
 
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
+    // LOCAL DEBUG (APS5_ASSERT_GPU_LOCK, PARALLEL-COMMIT-PLAN S0): only GpuMutex holders may import
+    // (COMMITTER-MAP 3.3); a call inside a GuestMemory::PrepareScope (queue 0's ticket preparation,
+    // a prep helper, the submitter) aborts, before anything else, with or without imports.
+    GuestMemory::AssertOutsidePrepareScope("HostImportFor called");
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
     auto& state = Imports();

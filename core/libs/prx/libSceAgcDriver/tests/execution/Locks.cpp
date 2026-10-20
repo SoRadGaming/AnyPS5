@@ -1,15 +1,19 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
@@ -229,9 +233,48 @@ void ThreadSlots() {
     AgcDriver::GuestMemory::SetReadSite(previous);
 }
 
+// LOCAL DEBUG (APS5_ASSERT_GPU_LOCK, PARALLEL-COMMIT-PLAN S0): death tests, one per argument. Inside
+// a GuestMemory::PrepareScope, a GpuMutex try_lock (GpuMutexType::tryEnter) and a HostImportFor call
+// must abort with a "[lock] ASSERT: ... inside a PrepareScope" line under APS5_ASSERT_GPU_LOCK=1
+// (ctest matches the line); without the switch both return and the run reports that, failing when
+// the switch was set. HostImportFor gets an empty context (no import support): past the assertion
+// it returns nullptr at once. The abort must end the process with a plain exit code, or ctest calls
+// the run an exception and fails it without reading its output: on Windows the UCRT's report-fault
+// path is turned off (libc.prx's SIGABRT handler returns, and abort() would then fast-fail with
+// 0xc0000409 instead of exiting with 3), elsewhere a SIGABRT handler exits with 3.
+[[maybe_unused]] void ExitOnAbort(int) {
+    std::_Exit(3);
 }
 
-int main() {
+int PrepareScopeDeath(const char* mode) {
+    const bool asserted = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#else
+    std::signal(SIGABRT, ExitOnAbort);
+#endif
+    {
+        const AgcDriver::GuestMemory::PrepareScope scope;
+        if (std::strcmp(mode, "--prepare-scope-try-lock") == 0) {
+            auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+            if (mutex.try_lock()) mutex.unlock();
+        } else if (std::strcmp(mode, "--prepare-scope-host-import") == 0) {
+            const AgcDriver::Graphics::Context context{};
+            if (AgcDriver::Graphics::HostImportFor(context, 0x10000, 16) != nullptr) std::fprintf(stderr, "FAIL: an empty context imported\n");
+        } else {
+            std::fprintf(stderr, "unknown argument %s\n", mode);
+            return 2;
+        }
+    }
+    std::printf("%s: the call returned (APS5_ASSERT_GPU_LOCK %s)\n", mode, asserted ? "set: the assertion did not fire" : "unset");
+    return asserted ? 1 : 0;
+}
+
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) return PrepareScopeDeath(argv[1]);
     MutexCounts(8, 100000, 0);
     MutexCounts(4, 2000, 20000);
     MutexTryLock();
