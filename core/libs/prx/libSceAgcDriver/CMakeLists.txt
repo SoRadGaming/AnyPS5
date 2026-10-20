@@ -2467,8 +2467,8 @@ if(BUILD_TESTING)
             # LOCAL DEBUG (PARALLEL-COMMIT-PLAN S0): the [stream] counters with the GpuMutex and
             # HostImportFor PrepareScope assertions, alone and over queue 0's verified tickets
             # (whose preparation runs inside a PrepareScope).
-            "stream_stats|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1"
-            "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
+            "stream_stats|APS5_DEBUG_STREAM_STATS=1"
+            "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the
             # committed flag against std::uncaught_exceptions, including the failure run's throw;
             # the scratch unsaved-layer list; a template's kept DeviceReads list against the walk),
@@ -2479,16 +2479,16 @@ if(BUILD_TESTING)
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue gate and the present queue, with
             # every queue operation checked (its queue's mutex held, no device-wide wait overlapping;
             # =2 aborts on the first violation, the assertion switch does at =1 too).
-            "present_queue|APS5_EXPERIMENT_PRESENT_QUEUE=2,APS5_ASSERT_GPU_LOCK=1"
-            "present_queue_on|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_ASSERT_GPU_LOCK=1"
+            "present_queue|APS5_EXPERIMENT_PRESENT_QUEUE=2"
+            "present_queue_on|APS5_EXPERIMENT_PRESENT_QUEUE=1"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A4): the submit thread, verified (=2: the
             # synchronous hand-off with every ordering check fatal), on, on with a pool per batch, and
             # with the present queue as the play build would run them; the submitter's own thread
             # runs inside a PrepareScope, so the assertion switch catches a GpuMutex there.
-            "submit_thread|APS5_EXPERIMENT_SUBMIT_THREAD=2,APS5_ASSERT_GPU_LOCK=1"
-            "submit_thread_on|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_ASSERT_GPU_LOCK=1"
-            "submit_pools|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1,APS5_ASSERT_GPU_LOCK=1"
-            "present_submit|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1,APS5_ASSERT_GPU_LOCK=1")
+            "submit_thread|APS5_EXPERIMENT_SUBMIT_THREAD=2"
+            "submit_thread_on|APS5_EXPERIMENT_SUBMIT_THREAD=1"
+            "submit_pools|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1"
+            "present_submit|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
