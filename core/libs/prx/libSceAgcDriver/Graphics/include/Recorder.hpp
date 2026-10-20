@@ -356,6 +356,25 @@ public:
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS) and LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC,
+    // F1; see FlushGuard.hpp): what F1's predicate asks of the unfinished batches (the open one and
+    // every one in flight) about the ranges a flush stores: whether one reads a range through an
+    // address-based lease, and whether a completion label lies in one (a label a batch's completion
+    // stores: behind write-backs, or also stored on the GPU and stored again after a CPU write-back;
+    // or a label a worker queued and has not recorded). Under the mutex; reads only.
+    struct FlushWriterScan {
+        bool lease = false;
+        bool completionLabel = false;
+    };
+    FlushWriterScan ScanFlushWriters(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    // The batch PendingWriterSerial(address, bytes) names (0: none), and whether it matched by a
+    // write note, by an address-based lease, or both (the [stream] flush-guard section).
+    struct FlushWriter {
+        std::uint64_t serial = 0;
+        bool written = false;
+        bool lease = false;
+    };
+    FlushWriter DescribeFlushWriter(std::uint64_t address, std::size_t bytes) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the

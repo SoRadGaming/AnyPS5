@@ -3119,6 +3119,16 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     return false;
 }
 
+bool CopiedCompletionWritersOverlap(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return false;
+    const auto overlaps = [&](const auto& writers) {
+        return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
+    };
+    if (context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) return true;
+    const auto drawWriters = DrawCopiedWriters();
+    return overlaps(*drawWriters);
+}
+
 namespace {
 
 // Whether some CompletePendingCpuWrites call could sync: false exactly when its checks that do not

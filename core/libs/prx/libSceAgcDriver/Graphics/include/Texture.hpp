@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FlushGuard.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -25,6 +26,7 @@ namespace AgcDriver::Graphics {
 class Buffer;
 class ResidentColor;
 class CommandBatch;
+class Recorder;
 class StorageTexture;
 struct HostImport;
 
@@ -531,6 +533,20 @@ private:
     // saying whether any live image overlaps the fill (see Texture.cpp).
     bool keysFillMatches(std::uint64_t address, std::size_t bytes, bool overlapped) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS) and LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC,
+    // F1; FlushGuard.hpp): what this image's write-back reads that a CPU wait for the unfinished
+    // writers of its memory would change: Untracked (its memory lies outside the write watch: the
+    // keep decision compares the guest bytes), Baseline (a pending unit whose blocks
+    // unchangedSinceBaseline compares with a held baseline, `original` where layerOriginal holds,
+    // else the generation baseline), with `importCheck` NoImport (no host import, whole or in
+    // segments: the write-back is the CPU round trip; HostImportFor, as the write-back's own
+    // lookup, may make the import), else Stamped (stamps alone).
+    FlushWaitClass handOverNeeds(bool importCheck) const;
+    // FlushPending's guard wait classified by F1's predicate (the first condition of FlushGuard.hpp's
+    // order that holds; Stamped: none); `ranges` receives the ranges scanned (the access, every
+    // flushed image's surface and DCC keys), `conditions` a bit per condition that held (the import
+    // is looked up only when no other condition held). Under GuestMemory::GpuMutex.
+    static FlushWaitClass guardWaitClass(const Recorder& recorder, std::uint64_t address, std::size_t bytes, std::span<const std::shared_ptr<StorageTexture>> flush, const char* reason, PublishScope scope, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint32_t& conditions);
     VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format) const;
     bool singlePass();
     VkImageView elementLayerView(std::uint32_t level, std::uint32_t layer);

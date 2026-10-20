@@ -3157,6 +3157,56 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
     return 0;
 }
 
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS) and LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1):
+// see the declaration. A label dword overlaps a range when it starts less than 4 bytes before its
+// end; a recorded entry without a batch is a queued one (APS5_NO_SEPARATE_QUEUED_LABELS=1).
+Recorder::FlushWriterScan Recorder::ScanFlushWriters(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+    FlushWriterScan scan;
+    const auto scanBatch = [&](const Batch& batch) {
+        for (const auto& [begin, end] : ranges) {
+            if (begin >= end) continue;
+            if (!scan.lease && readOverlap(batch, begin, end, ReadKind::AddressBased).has_value()) scan.lease = true;
+            if (!scan.completionLabel && std::any_of(batch.completionLabelRanges.begin(), batch.completionLabelRanges.end(), [&](const Batch::CompletionLabel& label) { return label.begin < end && begin < label.end; })) scan.completionLabel = true;
+        }
+    };
+    if (open != nullptr) scanBatch(*open);
+    for (const auto& batch : inFlight) scanBatch(*batch);
+    if (scan.completionLabel) return scan;
+    std::lock_guard tableLock(labelTableMutex);
+    for (const auto& [begin, end] : ranges) {
+        if (begin >= end) continue;
+        const auto first = begin >= 3 ? begin - 3 : 0;
+        for (auto it = labels.lower_bound(first); it != labels.end() && it->first < end; ++it) {
+            if (it->second.behindCompletion || it->second.batch == nullptr) {
+                scan.completionLabel = true;
+                return scan;
+            }
+        }
+        if (const auto queued = queuedLabels.lower_bound(first); queued != queuedLabels.end() && queued->first < end) {
+            scan.completionLabel = true;
+            return scan;
+        }
+    }
+    return scan;
+}
+
+Recorder::FlushWriter Recorder::DescribeFlushWriter(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return {};
+    const auto end = address + bytes;
+    const auto describe = [&](const Batch& batch, std::uint64_t serial) {
+        FlushWriter writer{serial, overlaps(batch, address, end), readOverlap(batch, address, end, ReadKind::AddressBased).has_value()};
+        if (!writer.written && !writer.lease) writer.serial = 0;
+        return writer;
+    };
+    if (open != nullptr) {
+        if (const auto writer = describe(*open, OpenSerial()); writer.serial != 0) return writer;
+    }
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (const auto writer = describe(**it, (*it)->serial); writer.serial != 0) return writer;
+    }
+    return {};
+}
+
 bool Recorder::signaled(const Batch& batch) const {
     return batch.submitted && issued(batch, "signaled") && fenceStatus(batch.fence) == VK_SUCCESS;
 }

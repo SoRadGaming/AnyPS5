@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
@@ -3674,6 +3675,59 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     return false;
 }
 
+// LOCAL DEBUG (APS5_DEBUG_STREAM_STATS) and LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1;
+// FlushGuard.hpp): see the declarations. Every unit pending is looked at (writeBack may widen its
+// selection to all of them); a unit's blocks compare bytes exactly where unchangedSinceBaseline
+// would: with `original` where the unit's layerOriginal holds, else with the generation baseline,
+// either only at the surface's full size.
+FlushWaitClass StorageTexture::handOverNeeds(bool importCheck) const {
+    if (!GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return FlushWaitClass::Untracked;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (!layerPending[unit]) continue;
+        const bool fromOriginal = unit < layerOriginal.size() && layerOriginal[unit];
+        if ((fromOriginal ? original : generationBaseline).size() == guestBytes) return FlushWaitClass::Baseline;
+    }
+    if (importCheck && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr && importSegments().empty()) return FlushWaitClass::NoImport;
+    return FlushWaitClass::Stamped;
+}
+
+FlushWaitClass StorageTexture::guardWaitClass(const Recorder& recorder, std::uint64_t address, std::size_t bytes, std::span<const std::shared_ptr<StorageTexture>> flush, const char* reason, PublishScope scope, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint32_t& conditions) {
+    const auto rangeEnd = [](std::uint64_t begin, std::uint64_t length) { return length > std::numeric_limits<std::uint64_t>::max() - begin ? std::numeric_limits<std::uint64_t>::max() : begin + length; };
+    ranges.clear();
+    ranges.emplace_back(address, rangeEnd(address, bytes));
+    for (const auto& texture : flush) {
+        ranges.emplace_back(texture->descriptor.baseAddress, rangeEnd(texture->descriptor.baseAddress, texture->guestBytes));
+        if (texture->descriptor.dccAddress != 0) ranges.emplace_back(texture->descriptor.dccAddress, rangeEnd(texture->descriptor.dccAddress, DccKeyBytes(texture->guestBytes)));
+    }
+    conditions = 0;
+    const auto hold = [&](FlushWaitClass which) { conditions |= 1u << static_cast<unsigned>(which); };
+    // VulkanDevice's AliasCopy is the one caller that flushes a copy destination with every unit
+    // published (the transfer path publishes partial units only).
+    if (scope == PublishScope::Whole && reason != nullptr && std::strcmp(reason, "buffer copy destination") == 0) hold(FlushWaitClass::AliasCopy);
+    const auto scan = recorder.ScanFlushWriters(ranges);
+    if (scan.lease) hold(FlushWaitClass::Lease);
+    if (!flush.empty()) {
+        const auto& context = flush.front()->context;
+        if (std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.second > range.first && CopiedCompletionWritersOverlap(context, range.first, static_cast<std::size_t>(range.second - range.first)); })) hold(FlushWaitClass::CopiedWriter);
+    }
+    if (scan.completionLabel) hold(FlushWaitClass::CompletionLabel);
+    for (const auto& texture : flush) {
+        if (const auto needs = texture->handOverNeeds(false); needs != FlushWaitClass::Stamped) hold(needs);
+    }
+    if (conditions == 0) {
+        for (const auto& texture : flush) {
+            if (texture->handOverNeeds(true) == FlushWaitClass::NoImport) {
+                hold(FlushWaitClass::NoImport);
+                break;
+            }
+        }
+    }
+    for (std::size_t index = 1; index < FlushWaitClasses; ++index) {
+        if ((conditions & (1u << index)) != 0) return static_cast<FlushWaitClass>(index);
+    }
+    return FlushWaitClass::Stamped;
+}
+
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
@@ -3731,11 +3785,41 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes) != 0) {
         try {
             recorder->Reap();
-            if (const auto writer = recorder->PendingWriterSerial(address, bytes); writer == recorder->OpenSerial()) {
+            const auto writer = recorder->PendingWriterSerial(address, bytes);
+            // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, FlushGuard.hpp): the wait below, classified by
+            // F1's predicate over the ranges F1 scans, with how its batch matched, and timed (wall,
+            // and the thread's GPU wait; queue 0's apart).
+            const bool counted = writer != 0 && Stream::On();
+            const std::size_t kind = writer == recorder->OpenSerial() ? 0 : 1;
+            auto waitClass = FlushWaitClass::Stamped;
+            std::uint64_t startNs = 0, gpuBefore = 0;
+            if (counted) {
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+                std::uint32_t conditions = 0;
+                waitClass = guardWaitClass(*recorder, address, bytes, flush, reason, scope, ranges, conditions);
+                const auto match = recorder->DescribeFlushWriter(address, bytes);
+                auto& counts = flushGuardCounts;
+                counts.matches[kind][match.written && match.lease ? 2 : match.lease ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+                for (std::size_t index = 0; index < FlushWaitClasses; ++index) {
+                    if ((index == 0 && conditions == 0) || (conditions & (1u << index)) != 0) counts.conditions[index].fetch_add(1, std::memory_order_relaxed);
+                }
+                startNs = Stream::NowNs();
+                gpuBefore = Stream::ThreadGpuWait::Get();
+            }
+            if (writer == recorder->OpenSerial()) {
                 Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
                 recorder->Sync();
             } else if (writer != 0) {
                 recorder->FinishUpTo(writer);
+            }
+            if (counted) {
+                const auto index = static_cast<std::size_t>(waitClass);
+                const auto gpuNs = Stream::ThreadGpuWait::Get() - gpuBefore;
+                auto& counts = flushGuardCounts;
+                counts.waits[kind][index].fetch_add(1, std::memory_order_relaxed);
+                counts.wallNs[kind][index].fetch_add(Stream::NowNs() - startNs, std::memory_order_relaxed);
+                counts.gpuNs[kind][index].fetch_add(gpuNs, std::memory_order_relaxed);
+                if (GuestMemory::CurrentStreamRole() == GuestMemory::StreamRole::Queue0) counts.queue0GpuNs[kind][index].fetch_add(gpuNs, std::memory_order_relaxed);
             }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
