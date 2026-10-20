@@ -109,11 +109,13 @@ bool Stress();
 bool Timed();
 // Whether Stop began (helpers stop between parts and drop what they take).
 bool Stopping();
-// Starts the helpers (once; never after Stop). Publish starts them at the first job.
+// Starts the helpers (one attempt; never after Stop). Publish starts them at the first job. It never
+// throws: a helper that cannot be started is said once ([q0prep]) and counted in Unstarted, and the
+// ones started before it run.
 void Start();
 // Queue 0, after the draw's Enqueue returned a nonzero seq: queues the job (see the top). A job
 // whose commit already started is dropped at once (its pin on the caller), and so is every job
-// after Stop.
+// after Stop and every job when no helper could be started.
 void Publish(PrepJob job);
 // Stops the helpers for good: wakes and joins them (each finishes or cuts its build, offers what
 // it built and retires its pin) and hands the queued jobs' pins to DrawPipeline::RetirePin.
@@ -121,12 +123,15 @@ void Publish(PrepJob job);
 void Stop();
 // The helper threads running now.
 unsigned Running();
+// The helpers the start could not start (0 before it, and when all started).
+unsigned Unstarted();
 // Test hook: frozen helpers take no job (they wait; Stop still ends them); the jobs stay queued.
 void Freeze(bool frozen);
 
 // Counters (cumulative relaxed atomics, never reset; each report takes its own window):
 // - queue 0 (Publish): jobs published; the oldest dropped from a full queue; jobs whose commit had
-//   started at the publish; jobs published after the stop;
+//   started at the publish; jobs published after the stop; jobs dropped because no helper could be
+//   started;
 // - helpers: jobs dropped at the pickup because their commit had started (stale) and at the stop;
 //   builds started, builds that made no ticket, builds cut between parts (their commit started);
 //   tickets made ready in their slot, and wasted (a commit closed the slot first) with their
@@ -135,7 +140,7 @@ void Freeze(bool frozen);
 //   ready to commit start by bucket (< 5, < 20, < 100, >= 100 us) and in total, and for both kinds
 //   push to commit start (with their counts).
 enum class Counter : std::uint8_t {
-    Published, Overflowed, StaleAtPublish, AfterStop,
+    Published, Overflowed, StaleAtPublish, AfterStop, NoHelper,
     Stale, AtStop, Builds, Empty, Cut, Ready, Wasted, WastedParts, PickupNs, BuildNs, PushToReadyNs,
     ClosedReady, ClosedEmpty, ReadyLeadUnder5, ReadyLeadUnder20, ReadyLeadUnder100, ReadyLeadOver100, ReadyLeadNs, TimedReady, ReadyItemLeadNs, TimedEmpty, EmptyItemLeadNs,
     Count

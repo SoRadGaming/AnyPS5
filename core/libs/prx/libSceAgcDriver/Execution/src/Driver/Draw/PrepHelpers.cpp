@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -44,6 +45,8 @@ struct PrepQueue {
     // The queue's size, for the helpers' spin before they lock (written under the mutex).
     std::atomic<std::size_t> queued{0};
     std::vector<std::thread> threads;
+    // The helpers that could not be started (no thread), set once by the start.
+    std::atomic<unsigned> unstarted{0};
     std::uint32_t waiting = 0;
     bool started = false;
     bool stopped = false;
@@ -82,15 +85,10 @@ void stressDelay() {
     }
 }
 
-// Hands a pin to the reaper; should that fail (no memory), the pin is leaked rather than dropped
-// here, since this may be a helper.
-void retirePin(std::shared_ptr<void>&& pin) {
-    if (pin == nullptr) return;
-    try {
-        DrawPipeline::Queue0().RetirePin(std::move(pin));
-    } catch (...) {
-        if (pin != nullptr) static_cast<void>(new std::shared_ptr<void>(std::move(pin)));
-    }
+// Hands a pin to the reaper. RetirePin never throws: should the hand-off fail, it leaks the pin
+// rather than drop it here, since this may be a helper.
+void retirePin(std::shared_ptr<void>&& pin) noexcept {
+    DrawPipeline::Queue0().RetirePin(std::move(pin));
 }
 
 // One job on a helper: build its ticket unless its commit started, offer it to the slot, retire the
@@ -192,15 +190,24 @@ void helperMain(unsigned index) {
     queue.running.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-// Under the queue's mutex.
+// Under the queue's mutex, on queue 0's first job (inside the draw path, after its Enqueue): one
+// attempt, which never throws. A helper that cannot be started (no thread, no memory) is said once
+// and the ones before it keep running; with none, Publish drops every job at once (NoHelper).
 void startLocked(PrepQueue& queue) {
     if (queue.started || queue.stopped) return;
-    queue.started = true;
     const auto count = PrepHelpers::Threads();
-    for (unsigned index = 0; index < count; ++index) {
-        queue.threads.emplace_back([index] { helperMain(index); });
-        queue.running.fetch_add(1, std::memory_order_acq_rel);
+    unsigned index = 0;
+    try {
+        queue.threads.reserve(count);
+        for (; index < count; ++index) {
+            queue.threads.emplace_back([index] { helperMain(index); });
+            queue.running.fetch_add(1, std::memory_order_acq_rel);
+        }
+    } catch (const std::exception& error) {
+        queue.unstarted.store(count - index, std::memory_order_relaxed);
+        std::fprintf(stderr, "[q0prep] prep helper agcprep%u could not be started (%s): %u of %u helpers run%s\n", index, error.what(), index, count, index == 0 ? ", no tickets are built" : "");
     }
+    queue.started = true;
 }
 
 }
@@ -299,11 +306,15 @@ void Publish(PrepJob job) {
     std::shared_ptr<void> dropped;
     {
         std::lock_guard lock(queue.mutex);
+        startLocked(queue);
         if (queue.stopped) {
             add(Counter::AfterStop);
             dropped = std::move(job.pin);
+        } else if (queue.threads.empty()) {
+            // No helper could be started: nothing would take the job. The caller's reference keeps
+            // the pin from being the last one.
+            add(Counter::NoHelper);
         } else {
-            startLocked(queue);
             if (queue.jobs.size() >= prepCapacity()) {
                 add(Counter::Overflowed);
                 dropped = std::move(queue.jobs.front().pin);
@@ -342,6 +353,10 @@ void Stop() {
 
 unsigned Running() {
     return prepQueue().running.load(std::memory_order_acquire);
+}
+
+unsigned Unstarted() {
+    return prepQueue().unstarted.load(std::memory_order_relaxed);
 }
 
 void Freeze(bool frozen) {

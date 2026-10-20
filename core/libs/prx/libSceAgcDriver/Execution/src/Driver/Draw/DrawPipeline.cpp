@@ -647,14 +647,22 @@ void DrawPipeline::retire(Item&& item) {
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0 fix N1): a helper's pin of a
 // pipelined draw's closure; the reaper drops it with the retired items, so the closure is never
 // destroyed on a helper. Always through the reaper, also under APS5_NO_COMMIT_REAPER (which only
-// keeps the items on the committer).
-void DrawPipeline::RetirePin(std::shared_ptr<void> pin) {
+// keeps the items on the committer). The pin is taken by reference and moves only into the list:
+// push_back has the strong guarantee (a shared_ptr's move never throws), so on a failure the pin is
+// still the caller's, and it is leaked here rather than dropped on the caller, which may be a
+// helper (a second failure, of that allocation, ends the process: noexcept). Without a reaper
+// thread the pin waits on the list for the one a later retire starts.
+void DrawPipeline::RetirePin(std::shared_ptr<void>&& pin) noexcept {
     if (pin == nullptr) return;
     constexpr std::size_t ReapBatch = 64;
-    std::lock_guard lock(retireMutex);
-    retiredPins.push_back(std::move(pin));
-    if (!reaper.joinable()) reaper = std::thread([this] { reap(); });
-    if (retired.size() + retiredPins.size() >= ReapBatch && reaperWaiting) reapWake.notify_one();
+    try {
+        std::lock_guard lock(retireMutex);
+        retiredPins.push_back(std::move(pin));
+        if (!reaper.joinable()) reaper = std::thread([this] { reap(); });
+        if (retired.size() + retiredPins.size() >= ReapBatch && reaperWaiting) reapWake.notify_one();
+    } catch (...) {
+        if (pin != nullptr) static_cast<void>(new std::shared_ptr<void>(std::move(pin)));
+    }
 }
 
 std::uint64_t DrawPipeline::CurrentItemEnqueuedNs() {

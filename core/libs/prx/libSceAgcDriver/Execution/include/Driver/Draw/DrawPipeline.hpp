@@ -82,10 +82,11 @@ public:
     // time (Stream::NowNs) of the item the calling committer is committing, 0 outside a commit and
     // without helpers: a thread slot set by the committer around every item's commit. RetirePin
     // hands a helper's pin of a closure to the reaper, so a closure's last reference never drops on
-    // a helper (it drops there, on the committer or on queue 0).
+    // a helper (it drops there, on the committer or on queue 0). It never throws: the pin moves only
+    // into the reaper's list, and should that fail it is leaked, never dropped on the caller.
     std::uint64_t CommittingSeq() const { return committingSeq.load(std::memory_order_acquire); }
     static std::uint64_t CurrentItemEnqueuedNs();
-    void RetirePin(std::shared_ptr<void> pin);
+    void RetirePin(std::shared_ptr<void>&& pin) noexcept;
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
