@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FlushGuard.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -5699,6 +5701,13 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
     guestMemory.MarkDirectWrites();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1) and LOCAL DEBUG (APS5_DEBUG_STREAM_STATS;
+    // FlushGuard.hpp, class CompletionMark): a non-reusable build with completion work is the one
+    // whose use registers WriteBackBuffers as its batch's completion next (VulkanDevice::dispatch and
+    // keepRecordedDraw); GuestBufferMemory::WriteBack then stores its copied regions on the CPU and
+    // stamps its direct and copied-back ones again, after a hand-over write-back F1 recorded behind
+    // it, so the storage hand-over guard must still wait for it there.
+    if ((NarrowFlushSync() != 0 || Stream::On()) && NeedsCompletion() && !Reusable()) recorder.NoteCompletionMarks(guestMemory.Writes());
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

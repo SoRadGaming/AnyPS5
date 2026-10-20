@@ -22,6 +22,10 @@
 //   batch's completion runs) writes a scanned range;
 // - CompletionLabel: a completion label (stored by a completion action, or stored on the GPU with a
 //   completion store behind a CPU write-back) or a label a worker queued lies in a scanned range;
+// - CompletionMark: an unfinished batch holds a write-back completion (GuestBufferMemory::WriteBack
+//   of a non-reusable build: a listed copied writer, or a fault-checked build) whose written ranges
+//   (any kind: its direct and copied-back regions are stamped once more by GuestMemory::MarkWritten
+//   when the completion runs) lie in a scanned range (Recorder::NoteCompletionMarks);
 // - Untracked: a flushed image lies outside the write watch (its write-back compares the guest
 //   bytes, compareUntracked);
 // - Baseline: a pending unit of a flushed image holds a byte baseline (`original`, or the generation
@@ -31,14 +35,17 @@
 // - Stamped: none of these. Every unfinished writer of the ranges stamped its blocks when it was
 //   recorded, so the write-back's keep decision reads the same stamps with or without the wait, and
 //   F1 skips it ("would skip").
-// The scanned ranges are the access, every flushed image's surface and its DCC keys, over the open
-// batch and every in-flight one. Counters: relaxed, constant-initialized; DrawPipeline's [stream]
-// report takes them (TakeFlushGuardCounts).
+// The scanned ranges are the 64 KiB blocks of the access, of every flushed image's surface and of
+// its DCC keys (the write tracker, the keep rule and the unit shadow judge whole blocks: a completion
+// stamp in the part of a stored block outside the surface, landing after the write-back's settle,
+// makes the unit stale and drops it from the shadow), over the open batch and every in-flight one.
+// Counters: relaxed, constant-initialized; DrawPipeline's [stream] report takes them
+// (TakeFlushGuardCounts).
 namespace AgcDriver::Graphics {
 
-enum class FlushWaitClass : std::uint8_t { Stamped, AliasCopy, Lease, CopiedWriter, CompletionLabel, Untracked, Baseline, NoImport, Count };
+enum class FlushWaitClass : std::uint8_t { Stamped, AliasCopy, Lease, CopiedWriter, CompletionLabel, CompletionMark, Untracked, Baseline, NoImport, Count };
 constexpr std::size_t FlushWaitClasses = static_cast<std::size_t>(FlushWaitClass::Count);
-inline constexpr std::array<const char*, FlushWaitClasses> FlushWaitClassNames{"stamped", "alias-copy", "lease", "copied-writer", "completion-label", "untracked", "baseline", "no-import"};
+inline constexpr std::array<const char*, FlushWaitClasses> FlushWaitClassNames{"stamped", "alias-copy", "lease", "copied-writer", "completion-label", "completion-mark", "untracked", "baseline", "no-import"};
 // The guard's two waits: the writer is the open batch (Recorder::Sync) or in flight (FinishUpTo).
 constexpr std::size_t FlushWaitKinds = 2;
 inline constexpr std::array<const char*, FlushWaitKinds> FlushWaitKindNames{"sync", "finish"};
@@ -94,19 +101,20 @@ inline FlushGuardTotals TakeFlushGuardCounts() {
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, PARALLEL-COMMIT-PLAN section 5, F1): the guard
 // skips its wait when F1's predicate holds (class Stamped above) and stores at once: every unfinished
-// writer of the scanned ranges stamped its blocks when it was recorded, the GPU runs it before the
-// write-back recorded behind it, and no completion of those batches stores into the ranges on the
-// CPU. Otherwise it waits as today. Also, under the switch, Refresh's own write-back waits like the
-// guard for an unfinished address-based lease over the image (its keep decision would miss the
-// lease's marks, which land at completion), which nothing waits for today. 1 uses it, and counts
-// the completion stores over a skipped flush's ranges that were registered before its write-back
-// and land after it (must stay 0; a tagged line each, the first 8). 2 verifies it: the guard waits
-// as today wherever the predicate would skip, and aborts with a [narrow-flush] line when a
-// completion stored into the ranges during the wait, or when a flushed image's keep decision (its
-// write-back's 64 KiB blocks left to the CPU) differs before and after the wait without a CPU store
-// collected in between (one with a CPU store is counted apart: today's own race, not F1's).
-// Unset or 0: today's guard alone. The CPU round-trip write-back (no import) and the alias copy's
-// flush keep their wait (classes NoImport and AliasCopy).
+// writer of the scanned blocks stamped them when it was recorded, the GPU runs it before the
+// write-back recorded behind it, and no completion of those batches stores into the blocks on the
+// CPU or stamps them again. Otherwise it waits as today. The switch changes the guard alone. 1 uses
+// it, and counts the completion stores and marks (a copied writer's write-back via NoteWrittenBack,
+// a completion label's store, a write-back completion's or a lease's MarkWritten via
+// Recorder::NoteCompletionMarked) over a skipped flush's blocks that were registered before its
+// write-back and land after it (must stay 0; a tagged line each, the first 8). 2 verifies it: the
+// guard waits as today wherever the predicate would skip, and aborts with a [narrow-flush] line when
+// a completion stored into or marked the blocks during the wait, or when a flushed image's keep
+// decision (each piece of its write-back's 64 KiB blocks: stored, or left to the CPU) differs before
+// and after the wait in a block no CPU store was collected in meanwhile (a difference only in blocks
+// a CPU store newly stamped is counted apart: today's own race, not F1's). Unset or 0: today's guard
+// alone. The CPU round-trip write-back (no import) and the alias copy's flush keep their wait
+// (classes NoImport and AliasCopy).
 inline int NarrowFlushSync() {
     static const int mode = [] {
         const char* text = std::getenv("APS5_EXPERIMENT_NARROW_FLUSH_SYNC");
@@ -117,27 +125,48 @@ inline int NarrowFlushSync() {
     return mode;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_REFRESH_LEASE_WAIT=1, PARALLEL-COMMIT-PLAN section 5, apart from
+// F1): StorageTexture::Refresh's own write-back of its pending results (writeBackLayers(stored))
+// first waits, as the guard does, for an unfinished batch holding an address-based lease over the
+// image's surface or keys (its keep decision would miss the lease's marks, which land at completion:
+// the 9fffceaa9 hole on that path). Nothing waits there today. A behaviour change of its own (the
+// lease writer's blocks are then kept for the CPU instead of taking the image's texels, and the
+// image re-uploads them), so it has its own switch and is compared with control on its own. Unset or
+// 0: no wait.
+inline bool RefreshLeaseWait() {
+    static const bool on = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_REFRESH_LEASE_WAIT");
+        return text != nullptr && std::strtol(text, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
 // Relaxed, constant-initialized; the [stream] report takes them (TakeNarrowFlushCounts).
 struct NarrowFlushCounts {
-    // =1: guard waits skipped, and completion stores behind a skipped write-back (must stay 0).
+    // =1: guard waits skipped, and completion stores or marks behind a skipped write-back (must
+    // stay 0).
     FlushCounter skipped{};
     FlushCounter storesBehindSkip{};
-    // =2: waits the predicate would skip, made and checked; completion stores over the ranges during
-    // them and keep decisions that differed without a CPU store (each aborts); keep decisions that
-    // differed with a CPU store collected during the wait.
+    // =2: waits the predicate would skip, made and checked; completion stores or marks over the
+    // blocks during them and keep decisions that differed in a block without a new CPU stamp (each
+    // aborts); keep decisions that differed only in blocks a CPU store stamped during the wait.
     FlushCounter verified{};
     FlushCounter storesDuringWait{};
     FlushCounter keepDiffered{};
     FlushCounter keepRaced{};
-    // =1 and =2: Refresh's own write-back waiting for an address-based lease, and the wall time.
+    // APS5_EXPERIMENT_REFRESH_LEASE_WAIT: Refresh's own write-back waiting for an address-based
+    // lease: the waits, their wall time, their GPU wait (the thread's Stream::ThreadGpuWait over the
+    // wait) and that GPU wait when the thread was queue 0.
     FlushCounter refreshLeaseWaits{};
     FlushCounter refreshLeaseNs{};
+    FlushCounter refreshLeaseGpuNs{};
+    FlushCounter refreshLeaseQueue0GpuNs{};
 };
 
 inline constinit NarrowFlushCounts narrowFlushCounts;
 
 struct NarrowFlushTotals {
-    std::uint64_t skipped = 0, storesBehindSkip = 0, verified = 0, storesDuringWait = 0, keepDiffered = 0, keepRaced = 0, refreshLeaseWaits = 0, refreshLeaseNs = 0;
+    std::uint64_t skipped = 0, storesBehindSkip = 0, verified = 0, storesDuringWait = 0, keepDiffered = 0, keepRaced = 0, refreshLeaseWaits = 0, refreshLeaseNs = 0, refreshLeaseGpuNs = 0, refreshLeaseQueue0GpuNs = 0;
 };
 
 inline NarrowFlushTotals TakeNarrowFlushCounts() {
@@ -152,6 +181,8 @@ inline NarrowFlushTotals TakeNarrowFlushCounts() {
     totals.keepRaced = take(counts.keepRaced);
     totals.refreshLeaseWaits = take(counts.refreshLeaseWaits);
     totals.refreshLeaseNs = take(counts.refreshLeaseNs);
+    totals.refreshLeaseGpuNs = take(counts.refreshLeaseGpuNs);
+    totals.refreshLeaseQueue0GpuNs = take(counts.refreshLeaseQueue0GpuNs);
     return totals;
 }
 

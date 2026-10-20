@@ -3168,6 +3168,7 @@ Recorder::FlushWriterScan Recorder::ScanFlushWriters(std::span<const std::pair<s
             if (begin >= end) continue;
             if (!scan.lease && readOverlap(batch, begin, end, ReadKind::AddressBased).has_value()) scan.lease = true;
             if (!scan.completionLabel && std::any_of(batch.completionLabelRanges.begin(), batch.completionLabelRanges.end(), [&](const Batch::CompletionLabel& label) { return label.begin < end && begin < label.end; })) scan.completionLabel = true;
+            if (!scan.completionMark && std::any_of(batch.completionMarks.begin(), batch.completionMarks.end(), [&](const auto& mark) { return mark.first < end && begin < mark.second; })) scan.completionMark = true;
         }
     };
     if (open != nullptr) scanBatch(*open);
@@ -3236,9 +3237,24 @@ std::uint64_t Recorder::UnwatchCompletionStores(std::uint64_t id) {
     return stores;
 }
 
-// A CPU store a completion action makes over [address, end): counted by the watches it concerns (a
-// skip watch only for the actions registered before its write-back: every action of an earlier
-// batch, the first `actions` of its own).
+void Recorder::NoteCompletionMarks(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (ranges.empty()) return;
+    ensureOpen();
+    open->completionMarks.insert(open->completionMarks.end(), ranges.begin(), ranges.end());
+}
+
+// The depth is this thread's: completions run inside finish() under the mutex, so the watches are
+// read only there.
+void Recorder::NoteCompletionMarked(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || CompletionDepth::Get() == 0) return;
+    Recorder* recorder = activeRecorder;
+    if (recorder == nullptr || recorder->completionWatches.empty()) return;
+    recorder->noteCompletionStore(address, address + bytes);
+}
+
+// A CPU store or stamp a completion action makes over [address, end): counted by the watches it
+// concerns (a skip watch only for the actions registered before its write-back: every action of an
+// earlier batch, the first `actions` of its own).
 void Recorder::noteCompletionStore(std::uint64_t address, std::uint64_t end) {
     if (completionWatches.empty() || CompletionDepth::Get() == 0) return;
     for (auto& watch : completionWatches) {
@@ -3248,7 +3264,7 @@ void Recorder::noteCompletionStore(std::uint64_t address, std::uint64_t end) {
         if (!watch.behindOpen) continue;
         narrowFlushCounts.storesBehindSkip.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> reports{0};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[narrow-flush] APS5_EXPERIMENT_NARROW_FLUSH_SYNC=1: a completion store over 0x%llx+0x%llx (batch %llu, action %zu) landed after a skipped hand-over write-back recorded behind it into batch %llu\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address), static_cast<unsigned long long>(completingSerial), completingAction, static_cast<unsigned long long>(watch.serial));
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[narrow-flush] APS5_EXPERIMENT_NARROW_FLUSH_SYNC=1: a completion store or mark over 0x%llx+0x%llx (batch %llu, action %zu) landed after a skipped hand-over write-back recorded behind it into batch %llu\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address), static_cast<unsigned long long>(completingSerial), completingAction, static_cast<unsigned long long>(watch.serial));
     }
 }
 

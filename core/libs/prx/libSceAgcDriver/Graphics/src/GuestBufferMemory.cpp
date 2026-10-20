@@ -4871,6 +4871,9 @@ void GuestBufferMemory::WriteBack() {
         if (region.direct != nullptr) {
             // The GPU wrote imported guest memory directly; page write watching did not see it.
             GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): a completion's stamp, for the
+            // hand-over guard's watches (nothing outside a completion or without a watch).
+            Recorder::NoteCompletionMarked(begin, static_cast<std::size_t>(end - begin));
             continue;
         }
         if (region.mirror != nullptr) {
@@ -4901,6 +4904,8 @@ void GuestBufferMemory::WriteBack() {
                 // The GPU copied the written sub-range back into the import; page write watching
                 // did not see it.
                 GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+                // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): as for a direct region.
+                Recorder::NoteCompletionMarked(begin, static_cast<std::size_t>(end - begin));
                 continue;
             }
             static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

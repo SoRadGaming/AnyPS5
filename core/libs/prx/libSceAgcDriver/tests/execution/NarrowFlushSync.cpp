@@ -11,7 +11,11 @@
 //   before the write-back and its block is left to the CPU (the image's texel there is not stored);
 // - the fill over a 128 KiB image, which holds a generation baseline (the write-back compares the
 //   block's bytes with it): a wait in every mode, without which the block would still read as the
-//   baseline and the image's texels would be stored over the fill.
+//   baseline and the image's texels would be stored over the fill;
+// - the fill over an image whose surface ends inside its last 64 KiB block, with a write-back
+//   completion of the open batch marking that block past the surface (Recorder::NoteCompletionMarks:
+//   a non-reusable build's direct or copied-back regions, which its completion stamps once more):
+//   a wait in every mode, since the keep rule and the unit shadow judge the whole block.
 // Each case uses its own 4 MiB of a write-watched guest block. Without write watching, or when the
 // block cannot be host-imported (no recorded fill), the cases are skipped.
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -49,7 +53,7 @@ using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
 
 constexpr std::size_t CaseBytes = std::size_t{4} << 20u;
-constexpr std::size_t BlockBytes = 4 * CaseBytes;
+constexpr std::size_t BlockBytes = 5 * CaseBytes;
 constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Initial = 0x3f800000u;
@@ -60,17 +64,23 @@ constexpr std::size_t OverwrittenDword = 0x100u / 4u;
 constexpr std::size_t FillBytes = 65536;
 
 // A linear 32-bit image of `width` x `height` texels: 512 x 1024 is 2 MiB (above the 1 MiB up to
-// which an image keeps a generation baseline), 256 x 128 is 128 KiB (below it).
+// which an image keeps a generation baseline), 256 x 128 is 128 KiB (below it), 512 x 1000 is
+// 0x1f4000 bytes (above it, ending 0x4000 bytes into its last 64 KiB block; a linear surface has no
+// row padding at this width).
 struct Surface {
     std::uint32_t width;
     std::uint32_t height;
-    std::size_t Bytes() const { return std::size_t{width} * height * 4u; }
+    constexpr std::size_t Bytes() const { return std::size_t{width} * height * 4u; }
     // Texel (0, 100), which StoreImageCode stores: in the image's second 64 KiB block or later.
-    std::size_t FarDword() const { return std::size_t{100} * width; }
+    constexpr std::size_t FarDword() const { return std::size_t{100} * width; }
 };
 
 constexpr Surface Large{512, 1024};
 constexpr Surface Small{256, 128};
+constexpr Surface Ragged{512, 1000};
+// Where case (v)'s completion marks lie: past Ragged's surface, inside its last 64 KiB block.
+constexpr std::size_t RaggedMark = 0x1f8000;
+static_assert(Ragged.Bytes() < RaggedMark && RaggedMark / 65536 == (Ragged.Bytes() - 1) / 65536, "the mark must lie past the surface in its last block");
 
 // Stores `Stored` at texels (0, 0) and (0, 100) of the image in user data 4-7.
 alignas(256) constexpr std::array<std::uint32_t, 11> StoreImageCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Stored, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
@@ -264,6 +274,33 @@ bool RunBaseline(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::
     return true;
 }
 
+// (v) The fill over an image ending inside its last 64 KiB block, and a write-back completion of the
+// open batch marking that block past the surface: every mode waits (the scan covers whole blocks,
+// and a write-back completion's marks keep the wait).
+bool RunCompletionMark(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const auto what = Name("completion mark past the surface");
+    const auto image = guest.Address() + offset;
+    const auto* words = guest.Words() + offset / 4u;
+    StoreImage(device, image, Ragged);
+    if (!FillFirstBlock(device, image)) {
+        std::puts("the guest block is not host-imported: the completion mark case is skipped");
+        device.WaitIdle();
+        return false;
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(recorder != nullptr && recorder->Recording(), what + "the fill's batch is not open");
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> marks{{{image + RaggedMark, image + RaggedMark + 0x100u}}};
+        recorder->NoteCompletionMarks(marks);
+    }
+    Require(FlushSynced(image, Ragged, what), what + "the guard did not wait for a write-back completion marking the image's last block past its surface");
+    device.WaitIdle();
+    Require(words[0] == Filled, what + "the image's store put its older texels over the newer fill");
+    Require(words[Ragged.FarDword()] == Stored, what + "the pending image's texel away from the fill was not stored");
+    return true;
+}
+
 }
 
 int main() {
@@ -279,7 +316,8 @@ int main() {
         RunLeaseWriter(*device, guest, CaseBytes);
         RunCompletionLabel(*device, guest, 2 * CaseBytes);
         const bool baseline = RunBaseline(*device, guest, 3 * CaseBytes);
-        if (!stamped && !baseline) std::puts("narrow flush sync: only the lease and completion label cases ran");
+        const bool mark = RunCompletionMark(*device, guest, 4 * CaseBytes);
+        if (!stamped && !baseline && !mark) std::puts("narrow flush sync: only the lease and completion label cases ran");
         std::puts("narrow flush sync tests passed");
         return 0;
     } catch (const std::exception& error) {

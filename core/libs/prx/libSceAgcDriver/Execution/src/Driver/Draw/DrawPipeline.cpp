@@ -1201,13 +1201,19 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
             appendStream(line, " %s %llu", index == 0 ? "none" : Graphics::FlushWaitClassNames[index], count(guard.conditions[index]));
         }
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1): the waits it skipped (=1; its
-        // would-skip above then counts no waits), the completion stores that landed behind a
-        // skipped write-back (must be 0), Refresh's lease waits, and =2's checks.
-        if (const int narrowMode = Graphics::NarrowFlushSync(); narrowMode != 0) {
+        // would-skip above then counts no waits), the completion stores and marks that landed behind
+        // a skipped write-back (must be 0), and =2's checks. LOCAL EXPERIMENT
+        // (APS5_EXPERIMENT_REFRESH_LEASE_WAIT, apart from F1): Refresh's own lease waits, with their
+        // wall, GPU-wait and queue-0 GPU-wait ms.
+        const int narrowMode = Graphics::NarrowFlushSync();
+        const bool refreshLeaseWait = Graphics::RefreshLeaseWait();
+        if (narrowMode != 0 || refreshLeaseWait) {
             const auto narrow = Graphics::TakeNarrowFlushCounts();
-            appendStream(line, "; F1 (APS5_EXPERIMENT_NARROW_FLUSH_SYNC=%d): skipped %llu, completion stores behind a skipped write-back %llu (must be 0)", narrowMode, count(narrow.skipped), count(narrow.storesBehindSkip));
-            appendStream(line, ", refresh lease waits %llu, %.1f ms", count(narrow.refreshLeaseWaits), streamMs(narrow.refreshLeaseNs));
-            if (narrowMode == 2) appendStream(line, ", verified %llu: completion stores during the wait %llu, keep decisions differed %llu, raced by a CPU store %llu", count(narrow.verified), count(narrow.storesDuringWait), count(narrow.keepDiffered), count(narrow.keepRaced));
+            if (narrowMode != 0) {
+                appendStream(line, "; F1 (APS5_EXPERIMENT_NARROW_FLUSH_SYNC=%d): skipped %llu, completion stores or marks behind a skipped write-back %llu (must be 0)", narrowMode, count(narrow.skipped), count(narrow.storesBehindSkip));
+                if (narrowMode == 2) appendStream(line, ", verified %llu: completion stores or marks during the wait %llu, keep decisions differed %llu, raced by a CPU store %llu", count(narrow.verified), count(narrow.storesDuringWait), count(narrow.keepDiffered), count(narrow.keepRaced));
+            }
+            if (refreshLeaseWait) appendStream(line, "; refresh lease waits (APS5_EXPERIMENT_REFRESH_LEASE_WAIT) %llu, %.1f ms wall, %.1f ms GPU, %.1f ms queue-0 GPU", count(narrow.refreshLeaseWaits), streamMs(narrow.refreshLeaseNs), streamMs(narrow.refreshLeaseGpuNs), streamMs(narrow.refreshLeaseQueue0GpuNs));
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
