@@ -246,7 +246,8 @@ WalkStats TakeWalkStats();
 // the current generation is returned with an acquire load, as a memo hit returns it, so every
 // later stamp check still runs. The ring is only try_locked by the committer (a busy ring walks)
 // and is never taken under the tracker lock. 2 counts only: the committer counts the hits it would
-// have served (and how many of those walks then stamped a CPU write) and still walks. Needs
+// have served (and how many of those walks then stamped a CPU write on a page of the requested
+// range, the writes a receipt would have hidden) and still walks. Needs
 // APS5_EXPERIMENT_Q0_TICKET, APS5_DEBUG_COVERAGE=1 (a hit joins the epoch coverage) and
 // APS5_EXPERIMENT_LAZY_GENERATION=1 (queue 0's clean walks must not move the tracker generation and
 // retire the committer's slice memos); without one of them it stays off (said once). Read once.
@@ -275,20 +276,26 @@ void PlanReceiptWalks(std::span<const std::pair<std::uint64_t, std::uint64_t>> p
 // Queue 0, owner of `token` in the epoch it took for it (otherwise it drops the list and walks
 // nothing): walks the rest of `walks` in chunks of APS5_EXPERIMENT_Q0_RECEIPT_CHUNK_KIB (default
 // 1024, chunk-aligned), each under one tracker hold of its own (collectWrites' initialize, covers
-// and walkWrites), so the committer never waits for more than one chunk. A chunk the ring already
-// covers is skipped; one its own epoch coverage covers (walked by this thread in this epoch) is
-// published without a walk. A completed chunk joins its epoch coverage, as any completed collect,
-// and the ring. `stop` is asked before each chunk and the draw stops at `budget` bytes walked;
-// returns false when it stopped with ranges left. `afterPush` only attributes the time ([q0prep]).
+// and walkWrites), so the committer never waits for more than one chunk. Coverage is decided per
+// run of a range, not per chunk: a run queue 0 already published (or found in the ring) under this
+// token, serial and epoch is skipped without a lock (its own note, kept per thread and cleared
+// when any of the three changes); a run its own epoch coverage holds (walked by this thread in
+// this epoch) is published in one ring hold without a walk; a run the ring holds is skipped after
+// one try_lock; only the rest is chunked and walked, up to the next run already held. A completed
+// chunk joins its epoch coverage, as any completed collect, and the ring. `stop` is asked before
+// each test or chunk and the draw stops at `budget` bytes walked; returns false when it stopped
+// with ranges left. `afterPush` only attributes the time ([q0prep]).
 bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget, bool (*stop)(const void* context), const void* context, bool afterPush);
 // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS with APS5_EXPERIMENT_Q0_RECEIPTS): the [q0prep] receipt
 // counts since the last call (reset by it). Queue 0: draws and ranges planned (and the planning
 // time), chunks walked
-// (bytes and ns: the walk time moved to it, before and after the push), skipped because the ring
-// or its own coverage held them, not watched or failed, published, draws it could not publish for
-// (no owner role for the draw's token) or left unfinished. Committer: chunks of its own walks
-// published, hits served (bytes, by draw step), would-be hits under =2 and how many of those walks
-// stamped, misses by reason, dirty pages a hit hid (APS5_DEBUG_Q0_VERIFY_WALKS).
+// (bytes and ns: the walk time moved to it, before and after the push), runs skipped because its
+// own note, the ring or its own coverage held them, its ring mutex acquisitions (blocking and
+// try_lock), chunks not watched or failed, ranges published, draws it could not publish for (no
+// owner role for the draw's token) or left unfinished. Committer: its own walks published, hits
+// served (bytes, by draw step), would-be hits under =2 and how many of those walks stamped a page
+// of the requested range (and, apart, anywhere in the walk widened to whole blocks), misses by
+// reason, dirty pages a hit hid (APS5_DEBUG_Q0_VERIFY_WALKS).
 enum class ReceiptMiss : std::uint8_t { Token, Epoch, Serial, Uncovered, Busy, Count };
 struct ReceiptStats {
     std::uint64_t draws = 0;
@@ -301,6 +308,8 @@ struct ReceiptStats {
     std::array<std::uint64_t, 2> spentNs{};
     std::uint64_t ringCovered = 0;
     std::uint64_t ownCovered = 0;
+    std::uint64_t notedCovered = 0;
+    std::uint64_t ringLocks = 0;
     std::uint64_t unwatched = 0;
     std::uint64_t failed = 0;
     std::uint64_t published = 0;
@@ -312,6 +321,7 @@ struct ReceiptStats {
     std::array<std::uint64_t, static_cast<std::size_t>(WalkCaller::Count)> hitsByCaller{};
     std::uint64_t wouldHits = 0;
     std::uint64_t wouldHitsStamped = 0;
+    std::uint64_t wouldHitsWidened = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ReceiptMiss::Count)> misses{};
     std::uint64_t hiddenPages = 0;
 };
