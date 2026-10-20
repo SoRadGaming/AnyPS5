@@ -2455,8 +2455,8 @@ if(BUILD_TESTING)
             # LOCAL DEBUG (PARALLEL-COMMIT-PLAN S0): the [stream] counters with the GpuMutex and
             # HostImportFor PrepareScope assertions, alone and over queue 0's verified tickets
             # (whose preparation runs inside a PrepareScope).
-            "stream_stats|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1"
-            "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
+            "stream_stats|APS5_DEBUG_STREAM_STATS=1"
+            "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the
             # committed flag against std::uncaught_exceptions, including the failure run's throw;
             # the scratch unsaved-layer list; a template's kept DeviceReads list against the walk),
@@ -2468,8 +2468,8 @@ if(BUILD_TESTING)
             # after the push (every used part verified at the commit, GpuMutex and HostImportFor
             # asserted off the helpers, a destruction on a helper aborts), and the same with random
             # helper delays, so tickets land early, late (wasted) and not at all.
-            "prep_helpers|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
-            "prep_helpers_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1")
+            "prep_helpers|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3"
+            "prep_helpers_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
@@ -2526,7 +2526,7 @@ if(BUILD_TESTING)
     # name|argument|environment.
     set(prepHelperTests)
     foreach(prepHelperCase IN ITEMS
-            "prep_helpers|none|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
+            "prep_helpers_on|none|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
             "prep_helpers_stress|none|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1"
             "prep_helpers_stopped|--stopped|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
             "prep_helpers_closing|--closing|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
