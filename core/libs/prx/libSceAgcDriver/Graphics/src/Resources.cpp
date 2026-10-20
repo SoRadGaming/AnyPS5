@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -364,7 +365,13 @@ CommandBatch::~CommandBatch() {
 void CommandBatch::release() noexcept {
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) {
+            // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): the graphics queue's mutex (QueueGate),
+            // after the submitter issued every earlier seal.
+            const auto queueHold = LockForeignQueue(context, "vkQueueWaitIdle command batch");
+            CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueWaitIdle command batch");
+            result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
@@ -388,7 +395,14 @@ void CommandBatch::Submit() {
     submission.commandBufferCount = 1;
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    {
+        // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, A4): a foreign submit: the submitter's FIFO
+        // drained first (the constructor sealed the recorder's open batch, which must go first),
+        // then the graphics queue's mutex (QueueGate).
+        const auto queueHold = LockForeignQueue(context, "vkQueueSubmit command batch");
+        CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueSubmit command batch");
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    }
     pending = true;
     submitted = true;
     timing.Mark("queue_submit");

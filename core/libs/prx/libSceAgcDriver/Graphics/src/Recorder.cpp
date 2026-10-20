@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
@@ -1154,6 +1155,10 @@ Recorder::~Recorder() {
     // Sync() above completed every batch, so every timeline wait in progress on this recorder
     // returns now; the semaphore is destroyed only once they all left it.
     while (WaitersOf(id).load(std::memory_order_acquire) != 0) std::this_thread::yield();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the FIFO drained
+    // and the submitter joined before the batches' pools, buffers and fences go (Sync() above
+    // issued and completed every seal, unless a submit failed: the FIFO behind it was dropped).
+    if (auto* gate = submitGate()) gate->StopSubmitter();
     // The kept objects of every batch this thread finished (Sync() above included) belong to the
     // device that is going away: destroyed now, here (no hand-off: nothing should stay in flight
     // behind this thread); the release thread is then stopped and joined (it drains its queue
@@ -1182,8 +1187,10 @@ Recorder::~Recorder() {
         context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, dumpLayout, nullptr);
         sampleCounter.reset();
     }
-    for (auto& [commands, fence] : spare) {
-        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    for (auto& [commands, fence, pool] : spare) {
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_POOLS=1): a batch's own pool frees its buffer.
+        if (pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, pool, nullptr);
+        else context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     }
     spare.clear();
@@ -1613,12 +1620,28 @@ void Recorder::ensureOpen() {
         auto batch = std::make_unique<Batch>();
         try {
             if (!spare.empty()) {
-                // The pool resets command buffers on begin; the fence was reset when the batch completed.
-                std::tie(batch->commands, batch->fence) = spare.back();
+                // The pool resets command buffers on begin (a batch's own pool was reset at its
+                // release); the fence was reset when the batch completed.
+                const auto reused = spare.back();
                 spare.pop_back();
+                batch->commands = reused.commands;
+                batch->fence = reused.fence;
+                batch->pool = reused.pool;
             } else {
                 VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
                 allocation.commandPool = context.pool;
+                // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_POOLS=1, PARALLEL-COMMIT-PLAN A4): a pool of
+                // the batch's own, so the submitter never submits from a pool that a GpuMutex holder
+                // records into (defect #10: legal, but amdvlk-dependent).
+                if (auto* gate = submitGate(); gate != nullptr && gate->OwnPools()) {
+                    // The pools' reset at release, resolved here once (APS5_NO_PROC_TABLE=1: per call).
+                    if (resetCommandPool == nullptr && ProcTable()) resetCommandPool = context.Function<PFN_vkResetCommandPool>("vkResetCommandPool");
+                    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+                    poolInfo.queueFamilyIndex = context.queueFamily;
+                    Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &poolInfo, nullptr, &batch->pool), "vkCreateCommandPool recorder batch");
+                    allocation.commandPool = batch->pool;
+                }
                 allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
                 allocation.commandBufferCount = 1;
                 Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
@@ -3135,7 +3158,26 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
 }
 
 bool Recorder::signaled(const Batch& batch) const {
-    return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
+    return batch.submitted && issued(batch, "signaled") && fenceStatus(batch.fence) == VK_SUCCESS;
+}
+
+QueueGate* Recorder::submitGate() const {
+    return context.queueGate != nullptr && context.queueGate->Threaded() ? context.queueGate : nullptr;
+}
+
+bool Recorder::issued(const Batch& batch, const char* what) const {
+    auto* gate = submitGate();
+    return gate == nullptr || gate->PollIssued(batch.gpuSubmitted, what);
+}
+
+void Recorder::awaitIssued(const Batch& batch) {
+    auto* gate = submitGate();
+    if (gate == nullptr || batch.gpuSubmitted.load(std::memory_order_acquire)) return;
+    // =2: Seal returned once its batch was issued, so a wait finding one unissued is a violation.
+    if (gate->Mode().submitThread == 2) static_cast<void>(gate->PollIssued(batch.gpuSubmitted, "fence wait"));
+    // Awaits the serial, then checks the batch's own flag: a batch a failed submit dropped is never
+    // issued, so its fence is not waited for (it would time out forever); the failure is thrown.
+    gate->AwaitIssued(batch.gpuSubmitted, batch.serial);
 }
 
 bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) const {
@@ -3332,8 +3374,9 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it, --finished) {
         const auto* range = firstOverlap(**it);
         if (range == nullptr) continue;
-        // In flight means submitted, so the fence is live; signaled = the GPU already ran it.
-        const bool signaled = fenceStatus((*it)->fence) == VK_SUCCESS;
+        // In flight means submitted, so the fence is live; signaled = the GPU already ran it. Under
+        // APS5_EXPERIMENT_SUBMIT_THREAD a batch not yet issued reads unsignaled (the poll rule).
+        const bool signaled = issued(**it, "DescribePendingWrite") && fenceStatus((*it)->fence) == VK_SUCCESS;
         if (syncAll) return PendingWriteInfo{submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, range->first, range->second, allBatches};
         return PendingWriteInfo{(*it)->serial, false, signaled, range->first, range->second, finished};
     }
@@ -3477,7 +3520,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
 
 bool Recorder::unsignaled(std::uint64_t serial) const {
     for (const auto& batch : inFlight) {
-        if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
+        if (batch->serial == serial) return !issued(*batch, "unsignaled") || fenceStatus(batch->fence) != VK_SUCCESS;
     }
     return false;
 }
@@ -3642,13 +3685,32 @@ void Recorder::Submit() {
     }
     const auto submitStart = std::chrono::steady_clock::now();
     const auto queueSubmitStartNs = stream ? Stream::NowNs() : 0;
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
-    if (stream) streamQueueSubmitNs = Stream::NowNs() - queueSubmitStartNs;
-    if (result == VK_ERROR_DEVICE_LOST) {
-        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
-        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+    if (auto* gate = submitGate()) {
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): sealed, not
+        // submitted: the submitter issues the batch in serial order. Seal rethrows a stored submit
+        // failure first (the batch is then discarded below), and at =2 returns once the batch was
+        // issued. A device lost by the submit is the submitter's to handle.
+        gate->Seal({&batch->gpuSubmitted, batch->commands, batch->fence, timeline, serial});
+        if (stream) streamQueueSubmitNs = Stream::NowNs() - queueSubmitStartNs;
+    } else {
+        VkResult result = VK_SUCCESS;
+        {
+            // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the graphics queue's mutex around the
+            // submit (QueueGate; none off the switches).
+            const auto queueHold = LockQueue(context, QueueGate::Queue::Graphics);
+            CheckQueueOp(context, QueueGate::Queue::Graphics, "vkQueueSubmit recorder");
+            result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+        }
+        if (stream) streamQueueSubmitNs = Stream::NowNs() - queueSubmitStartNs;
+        if (result == VK_ERROR_DEVICE_LOST) {
+            // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): every queue's mutex around the device-wide
+            // wait.
+            const auto queues = LockAllQueues(context);
+            const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+        }
+        Check(result, "vkQueueSubmit recorder");
     }
-    Check(result, "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3728,6 +3790,10 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the await rule: the
+    // timeline is waited for only once the batch of `serial` was issued (no GpuMutex here; the
+    // submitter never takes it).
+    if (auto* gate = submitGate()) gate->AwaitSubmitted(serial);
     const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
@@ -3921,6 +3987,10 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     announcedSite = nullptr;
     if (targetSerial == 0) return true;
     if (unsignaled(targetSerial)) ++hookRealWaits;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the await rule,
+    // still under the mutex (the submitter never takes it, and a stored failure is thrown with the
+    // mutex held as the caller expects): the timeline is waited for only once the target was issued.
+    if (auto* gate = submitGate()) gate->AwaitSubmitted(targetSerial);
     // Everything the wait needs is copied out: the recorder may be torn down while the mutex is
     // released (its destructor completes every batch and waits for the semaphore to be left, see
     // WaitTimeline), after which `this` must not be touched. The id re-check below relies on the
@@ -3947,7 +4017,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
             if (batch->serial > targetSerial) break;
             ++batchesToTarget;
             ++aheadByQueue[batch->queue];
-            if (status(context.device, batch->fence) != VK_SUCCESS) ++unsignaledAtStart;
+            if (!issued(*batch, "syncThroughUnlocked") || status(context.device, batch->fence) != VK_SUCCESS) ++unsignaledAtStart;
             if (batch->serial != targetSerial) continue;
             targetSubmittedAt = batch->submittedAt;
             targetRanges = batch->writes.size();
@@ -4038,7 +4108,8 @@ bool Recorder::Reap() {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;
     while (!inFlight.empty()) {
-        if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD): a batch not yet issued is unsignaled.
+        if (!issued(*inFlight.front(), "Reap") || fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);
@@ -4084,7 +4155,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         const auto waitStart = std::chrono::steady_clock::now();
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
-        const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        const bool signaledAtStart = !profile || (issued(*batch, "finish") && context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS);
         struct Report {
             bool enabled;
             int source;
@@ -4115,6 +4186,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the same span on the thread's [stream] GPU-wait
         // clock (Stream::ThreadGpuWait), which the drain episodes read on queue 0.
         const Stream::GpuWaitScope streamWait;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the await rule:
+        // the fence is waited for only once the batch was issued (a stored failure is thrown here).
+        awaitIssued(*batch);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
@@ -4123,7 +4197,13 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
-            const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            VkResult idle = VK_SUCCESS;
+            {
+                // LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): every queue's mutex around the
+                // device-wide wait (QueueGate).
+                const auto queues = LockAllQueues(context);
+                idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+            }
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
@@ -4240,18 +4320,30 @@ void Recorder::release(Batch& batch) noexcept {
     batch.samplePool.reset();
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD=2): a sealed batch's fence was issued exactly
+    // once before this reset.
+    if (batch.submitted && batch.fence != VK_NULL_HANDLE) {
+        if (auto* gate = submitGate()) gate->NoteFenceReset(batch.fence);
+    }
     // A completed (or never submitted) batch's objects are kept for reuse: the fence is signaled or
-    // untouched, so resetting it cannot block, and the command buffer is no longer pending.
-    if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {
-        spare.emplace_back(batch.commands, batch.fence);
+    // untouched, so resetting it cannot block, and the command buffer is no longer pending. A pool
+    // of the batch's own (APS5_EXPERIMENT_SUBMIT_POOLS=1) is reset with them, so its buffer begins
+    // again from the initial state.
+    if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64 && (batch.pool == VK_NULL_HANDLE || function(resetCommandPool, "vkResetCommandPool")(context.device, batch.pool, 0) == VK_SUCCESS) &&
+        function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {
+        spare.push_back({batch.commands, batch.fence, batch.pool});
         batch.commands = VK_NULL_HANDLE;
         batch.fence = VK_NULL_HANDLE;
+        batch.pool = VK_NULL_HANDLE;
         return;
     }
-    if (batch.commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.commands);
+    // A batch's own pool frees its buffer with it.
+    if (batch.pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, batch.pool, nullptr);
+    else if (batch.commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.commands);
     if (batch.fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, batch.fence, nullptr);
     batch.commands = VK_NULL_HANDLE;
     batch.fence = VK_NULL_HANDLE;
+    batch.pool = VK_NULL_HANDLE;
 }
 
 }

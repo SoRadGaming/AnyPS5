@@ -718,6 +718,10 @@ private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_POOLS=1, PARALLEL-COMMIT-PLAN A4): the batch's own
+        // command pool (`commands` is its one buffer), reset at its release; null: `commands` comes
+        // from Context::pool, as without the switch.
+        VkCommandPool pool = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
@@ -744,7 +748,12 @@ private:
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;
+        // Submit ran: under APS5_EXPERIMENT_SUBMIT_THREAD the batch is then sealed (handed to the
+        // submitter), and `gpuSubmitted` is set once its vkQueueSubmit returned (QueueGate): a poll
+        // of the fence reads unsignaled before, a blocking wait first awaits it. Without the switch
+        // the two never differ.
         bool submitted = false;
+        std::atomic<bool> gpuSubmitted{false};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
@@ -919,11 +928,23 @@ private:
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_POOLS=1): resolved when the recorder makes its first
+    // batch pool (ensureOpen), never off the switch: the constructor resolves exactly today's entry
+    // points, which the mock device tables of the unit tests list.
+    PFN_vkResetCommandPool resetCommandPool = nullptr;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the gate whose
+    // submitter issues this recorder's batches (null without the switch: Submit issues them itself);
+    // the poll rule (a sealed batch the submitter has not issued reads unsignaled; `what` names the
+    // poll for the =2 check) and the await rule (a blocking wait on a batch first awaits its
+    // submission; the stored submit failure is thrown there).
+    QueueGate* submitGate() const;
+    bool issued(const Batch& batch, const char* what) const;
+    void awaitIssued(const Batch& batch);
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
@@ -1012,8 +1033,14 @@ private:
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
-    // frame would otherwise allocate and free their objects each time).
-    std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
+    // frame would otherwise allocate and free their objects each time); with
+    // APS5_EXPERIMENT_SUBMIT_POOLS=1 each with its own (reset) command pool.
+    struct SpareBatch {
+        VkCommandBuffer commands;
+        VkFence fence;
+        VkCommandPool pool;
+    };
+    std::vector<SpareBatch> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;

@@ -238,6 +238,23 @@ public:
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
     double FinishPresent();
     void QueuePresent();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE, PARALLEL-COMMIT-PLAN A3): QueuePresent in two
+    // steps. PreparePresent (under the mutex) takes what the present needs (the queued image, its
+    // rendered semaphore, the swapchain) and clears the pending present; IssuePresent hands it to the
+    // swapchain under its queue's mutex (Graphics::QueueGate) and writes nothing but an atomic flag
+    // for an out-of-date or suboptimal swapchain, which the next Resize consumes under the mutex.
+    // PresentsAfterHold: the device has a present queue and the switch is 1, so the presenter calls
+    // IssuePresent after releasing the mutex; otherwise QueuePresent (both steps) stays in the hold.
+    // With the switches unset QueuePresent is today's.
+    struct PresentTicket {
+        bool pending = false;
+        std::uint32_t index = 0;
+        VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+        VkSemaphore rendered = VK_NULL_HANDLE;
+    };
+    bool PresentsAfterHold() const;
+    PresentTicket PreparePresent();
+    void IssuePresent(const PresentTicket& ticket);
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
     // APS5_PROFILE_DRAW, how many in flight have not signaled (the frame record's batches_at_flip).
     void FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const;

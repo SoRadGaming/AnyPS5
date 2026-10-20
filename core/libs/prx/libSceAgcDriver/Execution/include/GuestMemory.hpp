@@ -217,6 +217,12 @@ bool OnPrepHelperThread();
 enum class HelperDestroyed : std::uint8_t { ShaderResources, Pipeline, Closure, Count };
 void NoteDestroyedOnHelper(HelperDestroyed what);
 std::uint64_t HelperDestructions(HelperDestroyed what);
+// LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3, Graphics::QueueGate): the Vulkan queue mutexes the
+// calling thread holds, one bit per QueueGate::Queue, kept by a gate that is on. The lock order is
+// GpuMutex before any queue mutex: under APS5_ASSERT_GPU_LOCK=1 a GpuMutex lock() that would
+// acquire it (not a holder's nested one) while a bit is set aborts with a [lock] line.
+std::uint8_t QueueMutexesHeld();
+void SetQueueMutexesHeld(std::uint8_t held);
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS=1, PARALLEL-COMMIT-PLAN S0): the switch of the [stream] line
 // (DrawPipeline prints it every 10 s; counters in StreamStats.hpp), read once: 0 when unset. With
 // it on, threads carry a role for the per-role counters (the tracker lock, GpuMutex waits, submits):

@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/QueueGate.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <cstdarg>
@@ -61,6 +62,15 @@ struct StreamTotals {
     std::uint64_t queuePresentNs = 0;
     std::uint64_t latePresents = 0;
     std::uint64_t lateQueuePresentNs = 0;
+    std::uint64_t issuedPresents = 0;
+    std::uint64_t issuePresentNs = 0;
+    std::uint64_t submitterSubmits = 0;
+    std::uint64_t submitterSubmitNs = 0;
+    std::uint64_t waitedAwaits = 0;
+    std::uint64_t awaitNs = 0;
+    std::uint64_t waitedDrains = 0;
+    std::uint64_t drainNs = 0;
+    std::uint64_t unissuedPolls = 0;
     std::array<std::array<std::uint64_t, Stream::Sites>, Stream::Roles> submits{};
     std::array<std::array<std::uint64_t, Stream::Sites>, Stream::Roles> submitNs{};
     std::array<std::array<std::uint64_t, Stream::Sites>, Stream::Roles> endNs{};
@@ -92,6 +102,15 @@ StreamTotals takeStreamTotals() {
     totals.queuePresentNs = Stream::Take(counters.queuePresentNs);
     totals.latePresents = Stream::Take(counters.latePresents);
     totals.lateQueuePresentNs = Stream::Take(counters.lateQueuePresentNs);
+    totals.issuedPresents = Stream::Take(counters.issuedPresents);
+    totals.issuePresentNs = Stream::Take(counters.issuePresentNs);
+    totals.submitterSubmits = Stream::Take(counters.submitterSubmits);
+    totals.submitterSubmitNs = Stream::Take(counters.submitterSubmitNs);
+    totals.waitedAwaits = Stream::Take(counters.waitedAwaits);
+    totals.awaitNs = Stream::Take(counters.awaitNs);
+    totals.waitedDrains = Stream::Take(counters.waitedDrains);
+    totals.drainNs = Stream::Take(counters.drainNs);
+    totals.unissuedPolls = Stream::Take(counters.unissuedPolls);
     totals.submits = takeCounters(counters.submits);
     totals.submitNs = takeCounters(counters.submitNs);
     totals.endNs = takeCounters(counters.endNs);
@@ -1041,6 +1060,9 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
     }
     // 3. The presenter's second hold and its parts; the late (third-hold) presents apart.
     appendStream(line, "; presenter: %llu presents, lock wait %.1f ms, second hold %.1f ms: PresentDisplayBuffer %.1f ms, QueuePresent %.1f ms (%.0f%% of the hold); late QueuePresent %llu, %.1f ms", count(totals.presents), streamMs(totals.holdLockWaitNs), streamMs(totals.holdNs), streamMs(totals.presentBufferNs), streamMs(totals.queuePresentNs), streamPercent(totals.queuePresentNs, totals.holdNs), count(totals.latePresents), streamMs(totals.lateQueuePresentNs));
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PRESENT_QUEUE=1, PARALLEL-COMMIT-PLAN A3): the presents
+    // issued after the hold (their PreparePresent is the QueuePresent above).
+    if (Graphics::QueueGate::PresentQueueMode() != 0) appendStream(line, "; after the hold: IssuePresent %llu, %.1f ms", count(totals.issuedPresents), streamMs(totals.issuePresentNs));
     // Contended GpuMutex waits by waiter and holder role (counted under the holder seen first, the
     // time split over every holder the wait sat behind), and the committer's wait behind the
     // presenter per present (the A3 gate).
@@ -1070,6 +1092,12 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
             cell();
             appendStream(line, " %s/%s %llu %.1f %.1f %.1f", Stream::RoleNames[role], GuestMemory::GpuLockSiteName(static_cast<GuestMemory::GpuLockSite>(site)), count(totals.submits[role][site]), streamMs(totals.submitNs[role][site]), streamMs(totals.endNs[role][site]), streamMs(totals.queueSubmitNs[role][site]));
         }
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SUBMIT_THREAD, PARALLEL-COMMIT-PLAN A4): the vkQueueSubmit
+    // column above is the seal then; the submitter's own submits, and the waits on it.
+    if (Graphics::QueueGate::SubmitThreadMode() != 0) {
+        appendStream(line, "; submitter (APS5_EXPERIMENT_SUBMIT_THREAD=%d): vkQueueSubmit %llu, %.1f ms; awaits that waited %llu, %.1f ms; drains that waited %llu, %.1f ms", Graphics::QueueGate::SubmitThreadMode(), count(totals.submitterSubmits), streamMs(totals.submitterSubmitNs), count(totals.waitedAwaits), streamMs(totals.awaitNs), count(totals.waitedDrains), streamMs(totals.drainNs));
+        appendStream(line, ", polls of unissued batches %llu", count(totals.unissuedPolls));
     }
     // 6. CompareSpansFrom by span count and total bytes, and by how it ran.
     appendStream(line, "; CompareSpansFrom (spans/bytes n, ms, committer ms):");
@@ -1116,6 +1144,20 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         const auto closedReady = PrepHelpers::Get(prep, Counter::ClosedReady);
         appendStream(line, "; prep helpers (%u): jobs %llu, slots closed ready %llu, empty %llu (%.1f%% ready), tickets wasted %llu (%llu parts)", PrepHelpers::Threads(), get(Counter::Published), count(closedReady), get(Counter::ClosedEmpty), streamPercent(closedReady, closedReady + PrepHelpers::Get(prep, Counter::ClosedEmpty)), get(Counter::Wasted), get(Counter::WastedParts));
         appendStream(line, ", lead ready to commit %.1f us, push to commit %.1f us ready, %.1f us empty", averageUs(Counter::ReadyLeadNs, Counter::TimedReady), averageUs(Counter::ReadyItemLeadNs, Counter::TimedReady), averageUs(Counter::EmptyItemLeadNs, Counter::TimedEmpty));
+    }
+    // 10. LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue gate, cumulative: operations checked,
+    // device-wide waits and violations; presents by APS5_EXPERIMENT_PRESENT_QUEUE arm and outcome
+    // (success/suboptimal/out of date/failed).
+    {
+        const auto gate = Graphics::QueueGate::CountsSoFar();
+        if (gate.ops != 0 || gate.deviceWaits != 0) appendStream(line, "; queue gate: %llu ops, %llu device-wide waits, violations %llu unheld/%llu overlapped/%llu misordered/%llu ordering", count(gate.ops), count(gate.deviceWaits), count(gate.unheld), count(gate.overlapped), count(gate.misordered), count(gate.ordering));
+        if (gate.seals != 0) appendStream(line, ", %llu seals, %llu failed submits", count(gate.seals), count(gate.submitFailures));
+        appendStream(line, "; presents by arm (ok/suboptimal/out of date/failed):");
+        for (std::size_t arm = 0; arm < gate.presents.size(); ++arm) {
+            const auto& outcomes = gate.presents[arm];
+            if (outcomes[0] + outcomes[1] + outcomes[2] + outcomes[3] == 0) continue;
+            appendStream(line, " %zu %llu/%llu/%llu/%llu", arm, count(outcomes[0]), count(outcomes[1]), count(outcomes[2]), count(outcomes[3]));
+        }
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }
