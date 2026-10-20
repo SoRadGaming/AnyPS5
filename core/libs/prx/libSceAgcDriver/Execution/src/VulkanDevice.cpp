@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepHelpers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -3938,7 +3939,10 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     const auto& context = graphicsContext(built);
     // References tickets left (a stopped pipeline, a commit that threw) are settled by the next
     // ticketed draw's commit, under the mutex, and the ones this draw's ticket still holds after it.
-    if (ticket != nullptr) Graphics::DrainTicketRelease(context);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0 fix N6): with prep helpers
+    // every draw drains (one acquire load when the list is empty), so the references of tickets a
+    // helper finished too late never pile up behind draws that got none.
+    if (ticket != nullptr || DriverDetail::PrepHelpers::On()) Graphics::DrainTicketRelease(context);
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, prepared, ticket);
     if (ticket != nullptr) Graphics::ReleaseTicketReferences(*ticket, context);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");

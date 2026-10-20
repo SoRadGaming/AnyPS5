@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepHelpers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -175,6 +176,11 @@ struct CurrentRunTag {};
 struct CommitterThreadTag {};
 using CommitterThread = HostThreadSlot<bool, CommitterThreadTag>;
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the push time of the item
+// the committer is committing (CurrentItemEnqueuedNs), set by commitFront around each item's commit.
+struct CurrentItemEnqueuedTag {};
+using CurrentItemEnqueued = HostThreadSlot<std::uint64_t, CurrentItemEnqueuedTag>;
+
 // How a commit ended: `failed` for an exception (a failed commit in the report), `shutdown` for
 // the process shutting down, which is not reported to the driver.
 struct CommitOutcome {
@@ -275,7 +281,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare) {
+std::uint64_t DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_REPORT") != nullptr;
     const bool streamOn = Stream::On();
     std::unique_lock lock(mutex);
@@ -283,7 +289,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (closing) {
         lock.unlock();
         commit();
-        return;
+        return 0;
     }
     // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the depth this item is enqueued behind and its room
     // wait, for the [q0prep] line; the depth also rides with the item for the committer's walks.
@@ -318,7 +324,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             if (closing) {
                 lock.unlock();
                 commit();
-                return;
+                return 0;
             }
         }
     }
@@ -354,10 +360,12 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     depthSum += items.size();
     ++enqueued;
     // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the push time and depth (a draw's lead) end an open drain
-    // episode and the gate writers kept for it.
-    const auto pushedAtNs = streamOn ? Stream::NowNs() : 0;
+    // episode and the gate writers kept for it. LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS): the
+    // push time is also the committer's CurrentItemEnqueuedNs, and the seq orders the helper jobs.
+    const auto pushedAtNs = streamOn || PrepHelpers::On() ? Stream::NowNs() : 0;
     const auto pushDepth = streamOn ? static_cast<std::uint32_t>(items.size()) : 0;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full, pushedAtNs, pushDepth});
+    const auto seq = ++lastSeq;
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full, pushedAtNs, pushDepth, seq});
     if (streamOn) {
         closeStreamEpisode(pushedAtNs);
         streamGateEpisode.store(0, std::memory_order_relaxed);
@@ -375,6 +383,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     // Last: it releases the pipeline mutex before it prints.
     if (streamOn) reportStream(lock);
+    return seq;
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -465,6 +474,10 @@ void DrawPipeline::run() {
 // Commits the front item (nothing once the pipeline stopped), then pops and retires it. Inside a
 // run it returns the item the run continues with, chosen under the pipeline mutex with the pop.
 DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the commit of this
+    // item starts now, for every item kind: a helper still building its ticket stops between parts,
+    // and one that has not taken its job yet drops it.
+    if (front != nullptr) committingSeq.store(front->seq, std::memory_order_release);
     const auto start = run != nullptr && run->started != std::chrono::steady_clock::time_point{} ? std::exchange(run->started, {}) : std::chrono::steady_clock::now();
     auto outcome = guarded([&] {
         if (front == nullptr) return;
@@ -480,6 +493,17 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
                 if (set) GuestMemory::SetWalkItemDepth(0);
             }
         } itemDepth{*front};
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS): the item's push time for its commit
+        // (CurrentItemEnqueuedNs), with helpers only.
+        struct ItemEnqueued {
+            bool set;
+            explicit ItemEnqueued(const Item& item) : set(PrepHelpers::On() && item.enqueuedAtNs != 0) {
+                if (set) CurrentItemEnqueued::Set(item.enqueuedAtNs);
+            }
+            ~ItemEnqueued() {
+                if (set) CurrentItemEnqueued::Set(0);
+            }
+        } itemEnqueued{*front};
         if (front->labels.empty()) {
             front->commit();
             return;
@@ -546,6 +570,9 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
                 streamCounts.leadDepthNs[depthBucket] += leadNs;
             }
         }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS): a stopped pipeline pops without committing;
+        // the pop still moves CommittingSeq past the item, so its helper job is dropped as stale.
+        committingSeq.store(items.front().seq, std::memory_order_release);
         done = std::move(items.front());
         items.pop_front();
         ++commits;
@@ -617,22 +644,46 @@ void DrawPipeline::retire(Item&& item) {
     if (retired.size() >= ReapBatch && reaperWaiting) reapWake.notify_one();
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0 fix N1): a helper's pin of a
+// pipelined draw's closure; the reaper drops it with the retired items, so the closure is never
+// destroyed on a helper. Always through the reaper, also under APS5_NO_COMMIT_REAPER (which only
+// keeps the items on the committer).
+void DrawPipeline::RetirePin(std::shared_ptr<void> pin) {
+    if (pin == nullptr) return;
+    constexpr std::size_t ReapBatch = 64;
+    std::lock_guard lock(retireMutex);
+    retiredPins.push_back(std::move(pin));
+    if (!reaper.joinable()) reaper = std::thread([this] { reap(); });
+    if (retired.size() + retiredPins.size() >= ReapBatch && reaperWaiting) reapWake.notify_one();
+}
+
+std::uint64_t DrawPipeline::CurrentItemEnqueuedNs() {
+    return CurrentItemEnqueued::Get();
+}
+
 void DrawPipeline::reap() {
     for (;;) {
         std::deque<Item> batch;
+        std::vector<std::shared_ptr<void>> pins;
         {
             std::unique_lock lock(retireMutex);
             reaperWaiting = true;
-            reapWake.wait_for(lock, std::chrono::milliseconds(2), [&] { return retired.size() >= 64; });
+            reapWake.wait_for(lock, std::chrono::milliseconds(2), [&] { return retired.size() + retiredPins.size() >= 64; });
             reaperWaiting = false;
-            if (retired.empty()) continue;
+            if (retired.empty() && retiredPins.empty()) continue;
             batch.swap(retired);
+            pins.swap(retiredPins);
         }
         batch.clear();
+        pins.clear();
     }
 }
 
 void DrawPipeline::Stop() {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the helpers stop first,
+    // while the committer still runs (they never wait for it); the commits after this close their
+    // slots empty and run today's code.
+    PrepHelpers::Stop();
     std::thread committer;
     {
         std::lock_guard lock(mutex);
@@ -868,6 +919,7 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         streamWake = StreamWake{};
         lock.unlock();
         static_cast<void>(takeStreamTotals());
+        if (PrepHelpers::On()) static_cast<void>(PrepHelpers::TakeWindow(PrepHelpers::Report::Stream));
         return;
     }
     if (now - streamLastReport < std::chrono::seconds(10)) return;
@@ -1043,6 +1095,19 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         // Two pieces, so neither reaches appendStream's 191-character cut.
         appendStream(line, "; local cuts verified: committed flag %llu commits, unsaved layers %llu calls (%llu lists filled)", checked(Graphics::LocalCut::Committed), checked(Graphics::LocalCut::UnsavedLayers), count(Stream::Take(cuts.layersFilled)));
         appendStream(line, ", device reads %llu template draws (%llu lists kept), disagreements %llu", checked(Graphics::LocalCut::DeviceReads), count(Stream::Take(cuts.readsKept)), count(Stream::Take(cuts.disagreed)));
+    }
+    // 9. LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the helper slots as
+    // the committer closed them (with a ticket, or empty: today's code ran), the tickets a commit
+    // that started first left unused (and their parts), and the leads: a used ticket's from ready to
+    // its commit's start, and the closed slots' items' from the push to the commit's start.
+    if (PrepHelpers::On()) {
+        const auto prep = PrepHelpers::TakeWindow(PrepHelpers::Report::Stream);
+        using Counter = PrepHelpers::Counter;
+        const auto get = [&](Counter which) { return count(PrepHelpers::Get(prep, which)); };
+        const auto averageUs = [&](Counter ns, Counter n) { return PrepHelpers::Get(prep, n) == 0 ? 0.0 : static_cast<double>(PrepHelpers::Get(prep, ns)) / 1e3 / static_cast<double>(PrepHelpers::Get(prep, n)); };
+        const auto closedReady = PrepHelpers::Get(prep, Counter::ClosedReady);
+        appendStream(line, "; prep helpers (%u): jobs %llu, slots closed ready %llu, empty %llu (%.1f%% ready), tickets wasted %llu (%llu parts)", PrepHelpers::Threads(), get(Counter::Published), count(closedReady), get(Counter::ClosedEmpty), streamPercent(closedReady, closedReady + PrepHelpers::Get(prep, Counter::ClosedEmpty)), get(Counter::Wasted), get(Counter::WastedParts));
+        appendStream(line, ", lead ready to commit %.1f us, push to commit %.1f us ready, %.1f us empty", averageUs(Counter::ReadyLeadNs, Counter::TimedReady), averageUs(Counter::ReadyItemLeadNs, Counter::TimedReady), averageUs(Counter::EmptyItemLeadNs, Counter::TimedEmpty));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }

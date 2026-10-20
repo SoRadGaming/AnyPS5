@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -703,6 +704,9 @@ bool Pipeline::Prebuild(const Context& context, const State& state, const Vertex
 }
 
 Pipeline::~Pipeline() {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): never on a prep helper
+    // (counted there, an abort under APS5_ASSERT_GPU_LOCK); elsewhere one thread-slot read.
+    GuestMemory::NoteDestroyedOnHelper(GuestMemory::HelperDestroyed::Pipeline);
     release();
 }
 

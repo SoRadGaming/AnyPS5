@@ -3,11 +3,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTicketBuild.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepHelpers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -53,13 +55,15 @@ void notePipelinePrograms(const std::vector<DrawProgram>& programs) {
 }
 
 // A pipelined draw's commit closure with its ticket (LOCAL EXPERIMENT, APS5_EXPERIMENT_Q0_TICKET):
-// the ticket rides in the item it was built for, queue 0 fills it before the push (null without
-// one), and the commit hands it to commitDraw.
+// the ticket rides in the item it was built for, in its PrepSlots: queue 0 fills it before the push
+// (null without one), or, under APS5_EXPERIMENT_PREP_HELPERS (PARALLEL-COMMIT-PLAN B0), a prep helper
+// offers it while the item is queued; the commit takes it (PrepSlots::Take) and hands it to
+// commitDraw.
 template <typename TCommit>
 struct PipelinedDraw {
     explicit PipelinedDraw(TCommit&& body) : commit(std::move(body)) {}
     TCommit commit;
-    std::unique_ptr<Graphics::DrawTicket> ticket;
+    PrepSlots slots;
 };
 
 }
@@ -692,15 +696,33 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             notePipelinePrograms(programs);
         };
         auto held = std::make_shared<PipelinedDraw<decltype(commit)>>(std::move(commit));
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): with prep helpers
+        // queue 0 passes no Prepare; after the push it publishes the draw's job (its own copy of the
+        // inputs and a pin of the closure) and walks no receipts.
+        const bool helpers = ticketed && PrepHelpers::On();
         DrawPipeline::Prepare prepare;
-        if (ticketed) {
-            ticketInputs.slot = &held->ticket;
+        if (ticketed && !helpers) {
+            ticketInputs.slot = &held->slots.cheap;
             prepare = DrawTicketPrepare(ticketInputs);
         }
-        DrawPipeline::Queue0().Enqueue([held] { held->commit(held->ticket.get()); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw, ticketed ? &prepare : nullptr);
+        held->slots.offered = helpers;
+        auto& pipeline = DrawPipeline::Queue0();
+        const auto seq = pipeline.Enqueue([held] { held->commit(held->slots.Take()); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw, ticketed && !helpers ? &prepare : nullptr);
+        if (helpers && seq != 0) {
+            PrepJob job;
+            job.seq = seq;
+            job.token = epoch;
+            job.enqueuedAtNs = PrepHelpers::Timed() ? Stream::NowNs() : 0;
+            const auto queued = pipeline.Outstanding();
+            job.depth = static_cast<std::uint32_t>(queued != 0 ? queued - 1 : 0);
+            job.pin = held;
+            job.inputs = ticketInputs;
+            job.slots = &held->slots;
+            PrepHelpers::Publish(std::move(job));
+        }
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): the receipt walks the preparation left, from
         // queue 0's own list (the committer may already be committing the closure).
-        if (ticketed) WalkTicketReceipts(ticketInputs);
+        if (ticketed && !helpers) WalkTicketReceipts(ticketInputs);
         if (GuestMemory::Q0PrepStats() != 0) reportQ0Prep();
         if (exactBatchCap()) drawCountedAtCommit() = true;
         phaseTiming.Phase(DrawRowLockWait);

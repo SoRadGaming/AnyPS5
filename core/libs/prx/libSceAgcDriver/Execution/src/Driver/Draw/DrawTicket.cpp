@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTicketBuild.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepHelpers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -120,14 +121,31 @@ void planReceipts(const Graphics::DrawTicket& ticket, TicketInputs& inputs, cons
 }
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, COMMITTER-SPLIT-PLAN Q1): queue 0 builds the draw's
-// ticket inside Enqueue, in a GuestMemory::PrepareScope and without GpuMutex. The context is the
-// device's without a recorder or copied writers, so any recorder use on this path faults at once;
-// nothing here reads guest bytes. A part whose checks throw is left out (the committer runs them).
+// ticket inside Enqueue (BuildTicket under its PrepareBudget, in a GuestMemory::PrepareScope and
+// without GpuMutex) into the closure's slot, which the push then publishes.
 void prepareTicket(void* self, const DrawPipeline::PrepareBudget& budget) {
     auto& inputs = *static_cast<TicketInputs*>(self);
+    HelperBudget queue0;
+    queue0.depth = static_cast<std::uint32_t>(budget.depth);
+    queue0.queue0 = &budget;
+    if (auto ticket = BuildTicket(inputs, queue0)) inputs.slot->store(ticket.release(), std::memory_order_relaxed);
+}
+
+void skippedTicket(void*, DrawPipeline::PrepareSkip why) {
+    Graphics::NoteTicketSkip(why == DrawPipeline::PrepareSkip::Shallow ? Graphics::TicketSkip::Shallow : Graphics::TicketSkip::Locked);
+}
+
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET, COMMITTER-SPLIT-PLAN Q1; APS5_EXPERIMENT_PREP_HELPERS,
+// PARALLEL-COMMIT-PLAN B0): the draw's ticket, built by queue 0 inside Enqueue or by a prep helper,
+// in a GuestMemory::PrepareScope and without GpuMutex. The context is the device's without a recorder
+// or copied writers, so any recorder use on this path faults at once; nothing here reads guest
+// bytes. A part whose checks throw is left out (the committer runs them).
+std::unique_ptr<Graphics::DrawTicket> BuildTicket(TicketInputs& inputs, const HelperBudget& budget) {
     // A stage without a compiled program fails VulkanDevice::Draw's first check; the checks after
     // it assume programs, so such a draw gets no ticket.
-    if (std::any_of(inputs.stages.begin(), inputs.stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program == nullptr; })) return;
+    if (std::any_of(inputs.stages.begin(), inputs.stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program == nullptr; })) return nullptr;
     try {
         auto ticket = std::make_unique<Graphics::DrawTicket>();
         auto context = inputs.device->graphicsContext();
@@ -136,7 +154,7 @@ void prepareTicket(void* self, const DrawPipeline::PrepareBudget& budget) {
         ticket->device = context.device;
         ticket->pool = context.bufferPool;
         ticket->token = inputs.token;
-        ticket->enqueueDepth = static_cast<std::uint32_t>(budget.depth);
+        ticket->enqueueDepth = budget.depth;
         ticket->shadow = Graphics::Q0Ticket() == 0;
         {
             const PartTimer timer{Graphics::DrawTicket::AbiChecked};
@@ -149,33 +167,32 @@ void prepareTicket(void* self, const DrawPipeline::PrepareBudget& budget) {
         }
         Graphics::FillDrawTicketChecks(*ticket, context, *inputs.state, inputs.parameters, inputs.stages);
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE, COMMITTER-SPLIT-PLAN Q2): the template hint
-        // and its parts, unless the committer is about to run dry.
+        // and its parts, unless the committer is about to run dry (queue 0) or already started the
+        // item's commit (a helper).
         if (Graphics::Q0TemplateParts() && !budget.Stop()) Graphics::FillDrawTicketTemplate(*ticket, context, *inputs.state, inputs.parameters, inputs.stages, inputs.prepared);
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS, COMMITTER-SPLIT-PLAN Q2b).
         if (Graphics::Q0WordParts() && !budget.Stop()) Graphics::FillDrawTicketWords(*ticket, context, inputs.stages);
-        // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, in full pipeline waits only.
-        if (Graphics::Q0ByteShadow() && budget.full && !budget.Stop()) fillByteShadow(*ticket, inputs, budget);
-        // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): the draw's
-        // first-in-token walks, after the cheap parts (the rest after the push); a failure here
-        // costs the receipts only, never the ticket.
-        if (GuestMemory::Q0Receipts() != 0) {
-            try {
-                planReceipts(*ticket, inputs, budget);
-            } catch (const std::exception&) {
-                inputs.receipts = false;
+        if (budget.queue0 != nullptr) {
+            const auto& prepare = *budget.queue0;
+            // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, in full pipeline waits only.
+            if (Graphics::Q0ByteShadow() && prepare.full && !budget.Stop()) fillByteShadow(*ticket, inputs, prepare);
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN Q3): the draw's
+            // first-in-token walks, after the cheap parts (the rest after the push); a failure here
+            // costs the receipts only, never the ticket.
+            if (GuestMemory::Q0Receipts() != 0) {
+                try {
+                    planReceipts(*ticket, inputs, prepare);
+                } catch (const std::exception&) {
+                    inputs.receipts = false;
+                }
             }
         }
         Graphics::NoteTicketBuilt(*ticket);
-        *inputs.slot = std::move(ticket);
+        return ticket;
     } catch (const std::exception&) {
         // No ticket: the committer runs today's code for every part.
+        return nullptr;
     }
-}
-
-void skippedTicket(void*, DrawPipeline::PrepareSkip why) {
-    Graphics::NoteTicketSkip(why == DrawPipeline::PrepareSkip::Shallow ? Graphics::TicketSkip::Shallow : Graphics::TicketSkip::Locked);
-}
-
 }
 
 DrawPipeline::Prepare DrawTicketPrepare(TicketInputs& inputs) {
@@ -221,6 +238,7 @@ void Driver::reportQ0Prep() {
         GuestMemory::TakeWalkStats();
         Graphics::TakeTicketCounts();
         if (GuestMemory::Q0Receipts() != 0) GuestMemory::TakeReceiptStats();
+        if (PrepHelpers::On()) static_cast<void>(PrepHelpers::TakeWindow(PrepHelpers::Report::Q0Prep));
         committedDraws.store(0, std::memory_order_relaxed);
         return;
     }
@@ -284,6 +302,20 @@ void Driver::reportQ0Prep() {
         parts += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[q0prep] tickets (10 s, %s): built %llu, skipped shallow %llu, skipped holding the GPU mutex %llu; refused at the commit: device %llu, pool %llu; parts:%s\n", Graphics::Q0Ticket() == 0 ? "shadow" : Graphics::Q0Ticket() == 2 ? "verify" : "used", count(tickets.built), count(tickets.shallow), count(tickets.locked), count(tickets.refusedDevice), count(tickets.refusedPool), parts.c_str());
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the helpers' jobs (and
+    // where they were dropped), their builds, the tickets they made ready or wasted, the slots as the
+    // committer closed them (B0's gate: ready on at least 88% of committed draws), the leads, and
+    // the destructions on helper threads (each must stay 0). The tickets line above counts the
+    // helpers' builds as built.
+    if (PrepHelpers::On()) {
+        using Counter = PrepHelpers::Counter;
+        const auto prep = PrepHelpers::TakeWindow(PrepHelpers::Report::Q0Prep);
+        const auto get = [&](Counter which) { return count(PrepHelpers::Get(prep, which)); };
+        const auto averageUs = [&](Counter ns, Counter n) { return PrepHelpers::Get(prep, n) == 0 ? 0.0 : static_cast<double>(PrepHelpers::Get(prep, ns)) / 1e3 / static_cast<double>(PrepHelpers::Get(prep, n)); };
+        const auto closedReady = PrepHelpers::Get(prep, Counter::ClosedReady);
+        const auto readyBuilds = PrepHelpers::Get(prep, Counter::Ready) + PrepHelpers::Get(prep, Counter::Wasted);
+        AgcDriver::ProfilePrint_nid_no_patch("[q0prep] prep helpers (10 s, %u threads%s): jobs published %llu, dropped: queue full %llu, commit started at the publish %llu, at the pickup %llu, after or at the stop %llu; builds %llu (no ticket %llu, cut between parts %llu), %.1f us from the publish to the pickup, %.1f us to ready; tickets ready %llu, wasted %llu (%llu parts); slots closed ready %llu, empty %llu (%.1f%% ready, %.1f%% of committed draws); lead: ready to commit start %.1f us (<5us %llu, <20us %llu, <100us %llu, >=100us %llu), push to commit start %.1f us when ready, %.1f us when empty, publish to ready %.1f us; destroyed on helpers (all time): ShaderResources %llu, Pipeline %llu, closures %llu\n", PrepHelpers::Threads(), PrepHelpers::Stress() ? ", stress" : "", get(Counter::Published), get(Counter::Overflowed), get(Counter::StaleAtPublish), get(Counter::Stale), count(PrepHelpers::Get(prep, Counter::AfterStop) + PrepHelpers::Get(prep, Counter::AtStop)), get(Counter::Builds), get(Counter::Empty), get(Counter::Cut), averageUs(Counter::PickupNs, Counter::Builds), readyBuilds == 0 ? 0.0 : static_cast<double>(PrepHelpers::Get(prep, Counter::BuildNs)) / 1e3 / static_cast<double>(readyBuilds), get(Counter::Ready), get(Counter::Wasted), get(Counter::WastedParts), count(closedReady), get(Counter::ClosedEmpty), percent(closedReady, closedReady + PrepHelpers::Get(prep, Counter::ClosedEmpty)), percent(closedReady, committed), averageUs(Counter::ReadyLeadNs, Counter::TimedReady), get(Counter::ReadyLeadUnder5), get(Counter::ReadyLeadUnder20), get(Counter::ReadyLeadUnder100), get(Counter::ReadyLeadOver100), averageUs(Counter::ReadyItemLeadNs, Counter::TimedReady), averageUs(Counter::EmptyItemLeadNs, Counter::TimedEmpty), averageUs(Counter::PushToReadyNs, Counter::Ready), count(GuestMemory::HelperDestructions(GuestMemory::HelperDestroyed::ShaderResources)), count(GuestMemory::HelperDestructions(GuestMemory::HelperDestroyed::Pipeline)), count(GuestMemory::HelperDestructions(GuestMemory::HelperDestroyed::Closure)));
+    }
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): queue 0's receipt walks (the walk time moved off
     // the committer) and what the committer's collects made of them.
     if (GuestMemory::Q0Receipts() != 0) {

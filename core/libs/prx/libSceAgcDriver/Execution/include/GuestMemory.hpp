@@ -205,6 +205,18 @@ private:
 // `where` when the calling thread is inside a PrepareScope (a thread that must never take GpuMutex
 // nor do what only its holders do). Off, one predictable branch.
 void AssertOutsidePrepareScope(const char* where);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the prep helper threads
+// (DriverDetail::PrepHelpers) mark themselves for their whole life (a TEB slot, read through these
+// functions, so a test executable sees the driver's slot). Nothing cache-owned and no draw closure
+// may be destroyed there: ~ShaderResources, ~Pipeline and a closure's PrepSlots call
+// NoteDestroyedOnHelper, which on a helper counts one (HelperDestructions, never reset; the
+// [q0prep] helpers line prints them) and aborts with a [lock] line under APS5_ASSERT_GPU_LOCK=1. On
+// any other thread, and always without helpers, it reads the slot and returns.
+void SetPrepHelperThread(bool helper);
+bool OnPrepHelperThread();
+enum class HelperDestroyed : std::uint8_t { ShaderResources, Pipeline, Closure, Count };
+void NoteDestroyedOnHelper(HelperDestroyed what);
+std::uint64_t HelperDestructions(HelperDestroyed what);
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS=1, PARALLEL-COMMIT-PLAN S0): the switch of the [stream] line
 // (DrawPipeline prints it every 10 s; counters in StreamStats.hpp), read once: 0 when unset. With
 // it on, threads carry a role for the per-role counters (the tracker lock, GpuMutex waits, submits):

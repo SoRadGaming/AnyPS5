@@ -189,6 +189,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTicket.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/PrepHelpers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
@@ -2462,7 +2463,13 @@ if(BUILD_TESTING)
             # and used as the play build uses them (=2 computes each cut but runs today's answer, so
             # only =1 runs the flag's return, the scratch list and the kept-list copy).
             "local_cuts|APS5_EXPERIMENT_LOCAL_CUTS=2"
-            "local_cuts_on|APS5_EXPERIMENT_LOCAL_CUTS=1")
+            "local_cuts_on|APS5_EXPERIMENT_LOCAL_CUTS=1"
+            # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN B0): three prep helpers build the queue-0 tickets
+            # after the push (every used part verified at the commit, GpuMutex and HostImportFor
+            # asserted off the helpers, a destruction on a helper aborts), and the same with random
+            # helper delays, so tickets land early, late (wasted) and not at all.
+            "prep_helpers|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
+            "prep_helpers_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
@@ -2509,6 +2516,37 @@ if(BUILD_TESTING)
     set_tests_properties(${committerExperimentTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
     if(WIN32)
         set_tests_properties(${committerExperimentTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the prep helpers' hand-off
+    # without a device (tests/execution/PrepHelpers.cpp, its builders stand in for BuildTicket): the
+    # claim protocol, the scheduling and the lifetimes, with three helpers and with random helper
+    # delays; a stopped pipeline and the stop each in their own process (both end the pipeline for
+    # good); and the switch unset, where the slots work as queue 0's tickets did. Each case is
+    # name|argument|environment.
+    set(prepHelperTests)
+    foreach(prepHelperCase IN ITEMS
+            "prep_helpers|none|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
+            "prep_helpers_stress|none|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1"
+            "prep_helpers_stopped|--stopped|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
+            "prep_helpers_closing|--closing|APS5_EXPERIMENT_Q0_TICKET=1,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_ASSERT_GPU_LOCK=1"
+            "prep_helpers_off|none|APS5_EXPERIMENT_Q0_TICKET=1")
+        string(REPLACE "|" ";" prepHelperCase "${prepHelperCase}")
+        list(GET prepHelperCase 0 prepHelperName)
+        list(GET prepHelperCase 1 prepHelperArgument)
+        list(GET prepHelperCase 2 prepHelperEnvironment)
+        string(REPLACE "," ";" prepHelperEnvironment "${prepHelperEnvironment}")
+        if(prepHelperArgument STREQUAL "none")
+            add_test(NAME agc_driver_${prepHelperName} COMMAND agc_driver_prep_helpers_tests)
+        else()
+            add_test(NAME agc_driver_${prepHelperName} COMMAND agc_driver_prep_helpers_tests ${prepHelperArgument})
+        endif()
+        set_tests_properties(agc_driver_${prepHelperName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${prepHelperEnvironment}")
+        list(APPEND prepHelperTests agc_driver_${prepHelperName})
+    endforeach()
+    set_tests_properties(${prepHelperTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+    if(WIN32)
+        set_tests_properties(${prepHelperTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     # LOCAL DEBUG (APS5_ASSERT_GPU_LOCK, PARALLEL-COMMIT-PLAN S0): death tests. Inside a

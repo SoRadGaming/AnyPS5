@@ -29,7 +29,10 @@ struct PreparedDraw;
 // pipelined draw while it waited for room in DrawPipeline::Enqueue, before the push. The ticket
 // rides in the draw's commit closure (never in a thread slot) and is complete before the push,
 // whose pipeline mutex publishes it to the committer; after the push only the committer touches
-// it. Each part has its bit in `parts`, set only when queue 0 filled it and every check in it
+// it. LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): a prep helper builds
+// it after the push instead, complete before its compare-exchange into the closure's slot
+// publishes it; the commit's exchange takes it, or closes the slot first (the helper then
+// destroys it, and its references go to the release list). Each part has its bit in `parts`, set only when queue 0 filled it and every check in it
 // passed: the committer uses a part at the place today's code computes it, after the part's own
 // check, and runs today's code for any part whose bit is clear, so a failure is raised at its
 // own place after the same side effects. Every part is derived from the draw's own closure
@@ -116,7 +119,8 @@ struct DrawTicket {
     DrawTicket(const DrawTicket&) = delete;
     DrawTicket& operator=(const DrawTicket&) = delete;
     // Hands the strong references the committer did not take to the ticket release list
-    // (ReleaseTicketReferences), so nothing a ticket holds is destroyed on queue 0 or the reaper.
+    // (ReleaseTicketReferences), so nothing a ticket holds is destroyed on queue 0, a prep helper or
+    // the reaper.
     ~DrawTicket();
 };
 
@@ -218,10 +222,11 @@ void TicketChecks(TicketUse use, DrawTicket::Part part, TChecks&& checks) {
     }
 }
 
-// Strong references a ticket held that must not be dropped on queue 0 or on the reaper: the
-// committer drains them under GuestMemory::GpuMutex (DrainTicketRelease, at a draw's start) and
-// keeps a last reference with the open batch, so its destruction runs on the release thread once
-// the batch completed; another device's are never destroyed (its objects went with it).
+// Strong references a ticket held that must not be dropped on queue 0, a prep helper or the
+// reaper: the committer drains them under GuestMemory::GpuMutex (DrainTicketRelease, at a ticketed
+// draw's start, at every draw's under APS5_EXPERIMENT_PREP_HELPERS) and keeps a last reference with
+// the open batch, so its destruction runs on the release thread once the batch completed; another
+// device's are never destroyed (its objects went with it).
 struct TicketReference {
     VkDevice device = VK_NULL_HANDLE;
     std::shared_ptr<ShaderResources> resources;
