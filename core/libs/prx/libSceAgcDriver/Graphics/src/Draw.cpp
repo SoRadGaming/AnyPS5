@@ -1222,6 +1222,15 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0) return nullptr;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1|2): the switch binds a copy of every range
+    // except a vertex range a pending GPU write produces (below), so only the checks that decide
+    // that run; the rest, whose answer the switch would discard, does not. An index range is always
+    // copied (one under a pending write is refused as before): refused before any check, its copy
+    // (CopyDrawInput) runs the flush hook first itself. A vertex range runs the storage flush and
+    // the pending-write test; one without a pending write is refused there, one with it goes on
+    // through today's checks, which decide between in place behind its producer and a copy.
+    const bool copies = DrawInputsVram() != 0;
+    if (copies && behindGpuWrite == nullptr) return nullptr;
     bool behind = false;
     if (behindGpuWrite == nullptr) {
         GuestMemory::FlushGpuWrites(address, bytes);
@@ -1229,6 +1238,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     } else {
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
+        if (copies && !behind) return nullptr;
     }
     if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
@@ -1239,8 +1249,9 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1|2): the draw binds a copy instead
     // (CopyDrawInput), except a vertex range a pending GPU write produces, which stays in place
-    // behind its producer. An index range with a pending write was refused above.
-    if (DrawInputsVram() != 0 && !behind) return nullptr;
+    // behind its producer. An index range with a pending write was refused above. (Every range
+    // this refuses was refused at the top already; kept as the rule's statement.)
+    if (copies && !behind) return nullptr;
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
     return import;
