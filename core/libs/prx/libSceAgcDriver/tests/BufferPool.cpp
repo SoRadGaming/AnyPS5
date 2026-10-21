@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "AllocationFailure.hpp"
+#include "SlabReturn.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
@@ -175,6 +178,17 @@ VKAPI_ATTR void VKAPI_CALL mockMemoryProperties2(VkPhysicalDevice, VkPhysicalDev
     auto* reported = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(properties->pNext);
     reported->heapBudget[0] = reportedBudget;
     reported->heapUsage[0] = reportedUsage;
+}
+
+std::uint64_t diagnosticBudgetQueries = 0;
+
+VKAPI_ATTR void VKAPI_CALL mockDiagnosticMemoryProperties2(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    ++diagnosticBudgetQueries;
+    auto* reported = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(properties->pNext);
+    reported->heapUsage[0] = 1500 * MiB;
+    reported->heapBudget[0] = 2000 * MiB;
+    reported->heapUsage[1] = 2500 * MiB;
+    reported->heapBudget[1] = 3000 * MiB;
 }
 
 Context budgetContext() {
@@ -776,6 +790,48 @@ void ImageCacheReclaim() {
     Expect(mock.liveBytes == 0, "a texture allocation leaked memory");
 }
 
+void AllocationFailureReportsHeapBudgets() {
+    mock = MockDevice{};
+    diagnosticBudgetQueries = 0;
+    std::string failure;
+    std::uint64_t allocationPathBudgetQueries = 0;
+    {
+        auto context = mockContext();
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
+        context.memoryProperties2 = mockDiagnosticMemoryProperties2;
+        context.memory.memoryHeapCount = 2;
+        context.bufferPool = std::make_shared<BufferPool>(context);
+        const auto beforeAllocation = diagnosticBudgetQueries;
+        mock.results = {VK_ERROR_DEVICE_LOST};
+        try {
+            DeviceBuffer buffer(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        allocationPathBudgetQueries = diagnosticBudgetQueries - beforeAllocation;
+    }
+    Expect(failure.find("heap 0 1500/2000 MiB") != std::string::npos, "allocation failure omitted the first heap's memory budget");
+    Expect(failure.find("heap 1 2500/3000 MiB") != std::string::npos, "allocation failure omitted a later heap's memory budget");
+    Expect(allocationPathBudgetQueries == 2, "allocation failure did not query the memory budget for both type selection and its diagnostic");
+
+    mock = MockDevice{};
+    diagnosticBudgetQueries = 0;
+    failure.clear();
+    {
+        auto context = mockContext();
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{1});
+        context.memory.memoryHeapCount = 2;
+        mock.results = {VK_ERROR_DEVICE_LOST};
+        try {
+            DeviceBuffer buffer(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+    }
+    Expect(failure.find("heap 0") == std::string::npos && failure.find("heap 1") == std::string::npos, "allocation failure emitted heap data when VK_EXT_memory_budget was unavailable");
+    Expect(diagnosticBudgetQueries == 0, "missing-extension fallback attempted a memory budget query");
+}
+
 void SuccessfulAllocationKeepsPool() {
     mock = MockDevice{};
     {
@@ -841,12 +897,126 @@ void DeviceBindingFailures() {
 
 }
 
+VkDeviceMemory reclaimImage = VK_NULL_HANDLE;
+const Context* reclaimImageContext = nullptr;
+
+VkDeviceSize mockImageReclaim(VkDeviceSize) {
+    if (reclaimImage == VK_NULL_HANDLE) return 0;
+    ReleaseImageMemory(*reclaimImageContext, reclaimImage, 10 * MiB, 0);
+    reclaimImage = VK_NULL_HANDLE;
+    return 10 * MiB;
+}
+
+void ImageMemoryReclaim() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    context.cacheReclaim = mockImageReclaim;
+    reclaimImageContext = &context;
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 10 * MiB;
+    allocation.memoryTypeIndex = 0;
+    std::uint32_t type = 0;
+    reclaimImage = AllocateImageMemory(context, allocation, 1u, "test image", &type);
+    mock.limit = 12 * MiB;
+    auto request = allocation;
+    request.allocationSize = 4 * MiB;
+    const auto before = mock.attempts;
+    try {
+        const auto recovered = AllocateImageMemory(context, request, 1u, "test image", &type);
+        Expect(recovered != VK_NULL_HANDLE && mock.attempts == before + 2 && mock.liveBytes == 4 * MiB && context.bufferPool->RetainedImages() == 0, "the image memory a cache release returns to the pool is freed before the retry");
+        ReleaseImageMemory(context, recovered, 4 * MiB, 0);
+    } catch (const std::exception& error) {
+        Expect(false, std::string("the cache release of an image did not permit recovery: ") + error.what());
+    }
+    reclaimImageContext = nullptr;
+}
+
+void ImageMemoryOverBudget() {
+    mock = MockDevice{};
+    auto context = budgetContext();
+    reportedBudget = 1000 * MiB;
+    reportedUsage = 500 * MiB;
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 4 * MiB;
+    allocation.memoryTypeIndex = 0;
+    std::uint32_t type = 0;
+    const auto first = AllocateImageMemory(context, allocation, 1u, "test image", &type);
+    ReleaseImageMemory(context, first, 4 * MiB, 0);
+    Expect(mock.frees == 0 && context.bufferPool->RetainedImages() == 1, "image memory is retained while the heap is under its reported budget");
+    reportedUsage = 1100 * MiB;
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const auto second = AllocateImageMemory(context, allocation, 1u, "test image", &type);
+    Expect(second == first && mock.allocations == 1, "a retained allocation is still handed out over the budget");
+    ReleaseImageMemory(context, second, 4 * MiB, 0);
+    Expect(mock.frees == 1 && context.bufferPool->RetainedImages() == 0, "image memory released while the heap is over its reported budget is freed");
+    const auto third = AllocateImageMemory(context, allocation, 1u, "test image", &type);
+    ReleaseImageMemory(context, third, 4 * MiB, 0);
+    reportedUsage = 500 * MiB;
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const auto fourth = AllocateImageMemory(context, allocation, 1u, "test image", &type);
+    ReleaseImageMemory(context, fourth, 4 * MiB, 0);
+    Expect(mock.frees == 2 && context.bufferPool->RetainedImages() == 1, "the pool retains image memory again once the heap is under its budget");
+}
+
+void ImageMemoryReuse() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = 4 * MiB;
+    allocation.memoryTypeIndex = 0;
+    std::uint32_t type = 99;
+    const auto first = AllocateImageMemory(context, allocation, 1u, "test image", &type);
+    Expect(type == 0 && mock.allocations == 1, "the first image allocates device memory of its type");
+    ReleaseImageMemory(context, first, 4 * MiB, 0);
+    Expect(mock.frees == 0 && context.bufferPool->RetainedImages() == 1, "a released device-local image allocation is retained");
+    const auto again = AllocateImageMemory(context, allocation, 1u, "test image", &type);
+    Expect(again == first && type == 0 && mock.allocations == 1 && context.bufferPool->RetainedImages() == 0, "the next image of the same type and size takes the retained allocation");
+    auto smaller = allocation;
+    smaller.allocationSize = 2 * MiB;
+    const auto other = AllocateImageMemory(context, smaller, 1u, "test image", &type);
+    Expect(other != again && mock.allocations == 2, "an image of another size allocates");
+    ReleaseImageMemory(context, other, 2 * MiB, 0);
+    ReleaseImageMemory(context, again, 4 * MiB, 0);
+    auto host = allocation;
+    host.memoryTypeIndex = 1;
+    const auto placed = AllocateImageMemory(context, host, 2u, "test image", &type);
+    Expect(type == 1 && mock.allocations == 3, "a host-visible image allocation is made");
+    ReleaseImageMemory(context, placed, 4 * MiB, 1);
+    Expect(mock.frees == 1 && context.bufferPool->RetainedImages() == 2, "a host-visible image allocation is freed when released");
+    const auto unsized = AllocateImageMemory(context, smaller, 1u, "test image", &type);
+    Expect(unsized == other && mock.allocations == 3 && context.bufferPool->RetainedImages() == 1, "an image of a retained size takes that allocation");
+    ReleaseImageMemory(context, unsized, 0, 0);
+    Expect(mock.frees == 2 && context.bufferPool->RetainedImages() == 1, "an allocation of unknown size is freed");
+    std::vector<VkDeviceMemory> many;
+    for (int i = 0; i < 33; ++i) many.push_back(AllocateImageMemory(context, allocation, 1u, "test image", &type));
+    Expect(many.front() == again && mock.allocations == 35, "a burst takes the retained allocation first and allocates the rest");
+    for (const auto memory : many) ReleaseImageMemory(context, memory, 4 * MiB, 0);
+    Expect(context.bufferPool->RetainedImages() == 32 && mock.frees == 3 && !mock.memoryBytes.contains(many.front()) && mock.memoryBytes.contains(many.back()), "retained image memory is evicted least recently used under its budget");
+    mock.results.push_back(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    auto third = allocation;
+    third.allocationSize = 3 * MiB;
+    const auto recovered = AllocateImageMemory(context, third, 1u, "test image", &type);
+    Expect(recovered != VK_NULL_HANDLE && mock.allocations == 36 && mock.frees == 35 && context.bufferPool->RetainedImages() == 0, "an allocation failure frees the retained image memory");
+    ReleaseImageMemory(context, recovered, 3 * MiB, 0);
+    Expect(mock.frees == 35 && context.bufferPool->RetainedImages() == 1, "the pool retains image memory again after a trim");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--small-device-retention") {
             SmallDeviceRetention();
             return failures == 0 ? 0 : 1;
         }
+        if (argc == 2) {
+            const bool host = std::strcmp(argv[1], "--slab-return-host") == 0;
+            Expect(host || std::strcmp(argv[1], "--slab-return-device") == 0, "unknown slab return test mode");
+            AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), host ? 1u : 0u);
+            Expect(mock.liveBytes == 0, "slab return test leaked memory");
+            return failures == 0 ? 0 : 1;
+        }
+        AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), 0);
+        AgcDriver::Tests::SlabReturnWithoutAllocation(mockContext(), 1);
+        Expect(mock.liveBytes == 0, "slab return test leaked memory");
         SizeClassesAndDirections();
         LargerClass();
         KeptUntilFence();
@@ -868,10 +1038,14 @@ int main(int argc, char** argv) {
         ReclaimSlabs();
         AllocationFailure(VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST, true);
         AllocationFailure(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_DEVICE_LOST, true);
+        AllocationFailureReportsHeapBudgets();
         SuccessfulAllocationKeepsPool();
         PartialSlabDoesNotRetry();
         CacheReclaimRecovery();
         ImageCacheReclaim();
+        ImageMemoryReuse();
+        ImageMemoryReclaim();
+        ImageMemoryOverBudget();
         HostPlacement();
         RefusedDevicePlacement();
         AttachmentReclaim();

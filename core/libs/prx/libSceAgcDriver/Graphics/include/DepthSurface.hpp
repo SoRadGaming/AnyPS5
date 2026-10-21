@@ -8,13 +8,17 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
 class Texture;
 class StorageTexture;
 
-VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target);
+VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes);
+bool DepthPlanesStale();
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
 std::uint64_t DepthSurfacesReleased();
@@ -26,6 +30,15 @@ void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes)
 void RequireNoNativeDepthFeedback_nid_no_patch(const Context& context, const DepthTarget& target, std::span<const std::shared_ptr<Texture>> sampled);
 void ClearDepthSurfaces(VkDevice device);
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes);
+struct WrittenStorageExtent {
+    std::uint64_t address;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t bytesPerElement;
+    std::array<std::uint32_t, 3> block;
+    std::uint32_t blocksPerRow;
+};
+void RetireCoveredDepthSurfaces(VkDevice device, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::span<const WrittenStorageExtent> extents);
 bool DepthSurfaceAt(std::uint64_t address);
 bool DepthSurfaceOverlaps(VkDevice device, std::uint64_t address, std::uint64_t bytes);
 bool DepthSurfaceAt(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource);

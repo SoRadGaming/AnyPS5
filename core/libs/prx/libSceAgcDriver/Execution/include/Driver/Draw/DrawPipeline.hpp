@@ -67,7 +67,14 @@ public:
     // Returns the item's seq (LOCAL EXPERIMENT APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0:
     // assigned under the pipeline mutex at the push, from 1 up, in queue order), or 0 for a commit run
     // inline because the pipeline is closing (no item, so no helper job).
-    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
+    // `reads` are the guest ranges the commit reads (a draw's vertex and index data, a DMA copy's
+    // source) that a deferred store must not change while the item is queued (HeldReads).
+    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
+    // An item without held reads that names its kind (label enqueues, the pipelined CPU-path
+    // indirect draw).
+    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare = nullptr) {
+        return Enqueue(std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), {}, kind, prepare);
+    }
     // `site` names the caller for the [stream] drain sites (APS5_DEBUG_STREAM_STATS); unused otherwise.
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100, std::source_location site = std::source_location::current());
     // Stops the prep helpers first (PrepHelpers::Stop: their queued jobs' pins go to RetirePin), then
@@ -178,6 +185,8 @@ public:
     bool StreamCuttable() const { return streamCuttable.load(std::memory_order_relaxed); }
     void NoteDrainClass(std::uint64_t before, std::uint8_t dispatchClass, std::uint64_t shadowNs, StreamPoint drain);
     void NoteWouldDrain(DrainReason reason, std::uint32_t opcode);
+    static bool HeldReads(std::uint64_t address, std::size_t bytes);
+    void ReleaseRunningReads();
 
 private:
     struct Item {
@@ -185,6 +194,7 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        std::vector<Range> reads;
         ItemKind kind = ItemKind::Other;
         // Appended labels, in the order they were queued; only the producer adds them, under the
         // mutex and only while the item is not the front, so the committer reads them unlocked.

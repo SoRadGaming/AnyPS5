@@ -6,6 +6,7 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/VideoOutDriver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/DisplayWindow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/PadInput.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/MouseInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ImeTextInput.cpp
@@ -19,7 +20,9 @@ target_include_directories(libSceVideoOut PRIVATE
         ${LIBS_INCLUDE_DIR}
         ${ANYPS5_SDL2_INCLUDE_DIR}
         ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+        ${CMAKE_BINARY_DIR}/core/libs/prx/libSceAgcDriver/generated
 )
+add_dependencies(libSceVideoOut agc_trace_revision)
 target_link_libraries(libSceVideoOut PRIVATE libSceAgcDriver libScePad libSceMouse libSceKeyboard libSceIme libc libkernel decoder_png SDL2-static)
 if(WIN32)
     target_link_libraries(libSceVideoOut PRIVATE comctl32 dxgi)
@@ -146,6 +149,15 @@ if(BUILD_TESTING)
         set_tests_properties(pad_input_mapping PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(pad_output_pacing_tests tests/PadOutputPacing.cpp)
+    target_include_directories(pad_output_pacing_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(pad_output_pacing_tests PRIVATE libc)
+    configure_windows_unwind(pad_output_pacing_tests)
+    add_test(NAME pad_output_pacing COMMAND pad_output_pacing_tests)
+    if(WIN32)
+        set_tests_properties(pad_output_pacing PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 if(BUILD_TESTING)
@@ -228,6 +240,9 @@ if(BUILD_TESTING)
     add_test_executable(video_out_hdr_probe_tests tests/HdrProbe.cpp)
     target_include_directories(video_out_hdr_probe_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
     target_link_libraries(video_out_hdr_probe_tests PRIVATE libSceVideoOut libSceAgcDriver libc SDL2-static)
+    if(WIN32)
+        target_link_libraries(video_out_hdr_probe_tests PRIVATE dxgi)
+    endif()
     set_target_properties(video_out_hdr_probe_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(video_out_hdr_probe_tests)
     add_test(NAME video_out_hdr_probe COMMAND video_out_hdr_probe_tests)
@@ -260,4 +275,15 @@ if(BUILD_TESTING)
         set_tests_properties(guest_buffer_reuse PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+if(BUILD_TESTING AND NOT WIN32)
+    add_test_executable(video_out_telemetry_tests tests/Telemetry.cpp)
+    target_include_directories(video_out_telemetry_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
+    target_link_libraries(video_out_telemetry_tests PRIVATE libSceVideoOut libSceAgcDriver libkernel libc SDL2-static)
+    set_target_properties(video_out_telemetry_tests PROPERTIES CXX_EXTENSIONS OFF)
+    add_test(NAME video_out_telemetry COMMAND video_out_telemetry_tests)
+    add_test(NAME video_out_telemetry_caption COMMAND video_out_telemetry_tests caption)
+    set_tests_properties(video_out_telemetry PROPERTIES TIMEOUT 30)
+    set_tests_properties(video_out_telemetry_caption PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 RESOURCE_LOCK videoout_app0 ENVIRONMENT "SDL_VIDEODRIVER=${ANYPS5_VIDEO_OUT_TEST_DRIVER}")
 endif()

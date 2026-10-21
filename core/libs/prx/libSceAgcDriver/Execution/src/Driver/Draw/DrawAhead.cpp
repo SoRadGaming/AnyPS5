@@ -153,6 +153,11 @@ bool DrawScan::Next(const std::function<bool(const Draw&)>& draw) {
         if (Pm4::IndirectRegisterOpcode(opcode)) {
             const auto found = registerLists.find(at);
             if (found == registerLists.end()) throw std::runtime_error("draw-ahead scan found an indirect register packet without its register list");
+            if (!Pm4::IndirectRegistersValid(found->second)) {
+                // The queue worker reads an invalid list again where the packet executes, so the registers it writes are unknown here.
+                lost = true;
+                continue;
+            }
             Pm4::ExecuteIndirectRegisters(packet, found->second, state);
             track(packet, opcode, maybe, &found->second);
             continue;

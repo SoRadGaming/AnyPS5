@@ -101,6 +101,13 @@ class SelectTests(unittest.TestCase):
                 self.assertIsNone(selected)
                 self.assertIn(changed, output)
 
+    def test_changed_list_with_a_byte_order_mark_and_crlf_keeps_its_first_path(self):
+        listed = self.build / "changed bom.txt"
+        listed.write_bytes(b"\xef\xbb\xbfCMakeLists.txt\r\nalpha/alpha.h\r\n")
+        output = self.tool("select", self.build, self.graph, listed)
+        self.assertIn("CMakeLists.txt", output)
+        self.assertFalse((self.build / "select.tests").exists())
+
     def test_missing_graph_runs_everything(self):
         self.assertIsNone(self.select("alpha/alpha.h", graph=self.build / "missing.json")[1])
 
@@ -118,6 +125,110 @@ class SelectTests(unittest.TestCase):
         built = {p.stem for p in self.build.rglob("*_tests*") if p.is_file() and os.access(p, os.X_OK)}
         subprocess.run(["cmake", "--build", str(self.build)], check=True, capture_output=True)
         self.assertEqual(built, {"alpha_tests"})
+
+    def test_explain_reports_input_and_fixture_reasons_without_a_build_cache(self):
+        changed = self.build / "explain-changed.txt"
+        cache = self.build / "CMakeCache.txt"
+        saved = self.build / "CMakeCache.saved"
+        cache.rename(saved)
+        try:
+            for path in ("alpha/alpha.h", "beta/main.c", "CMakeLists.txt"):
+                with self.subTest(path=path):
+                    changed.write_text(path + "\n", encoding="utf-8")
+                    report = json.loads(self.tool("explain", self.graph, changed))
+                    picked, full = select_tests.select(json.loads(self.graph.read_text(encoding="utf-8")), [path])
+                    self.assertEqual(report["tests"], sorted(picked) if picked is not None else None)
+                    self.assertEqual(report["full_run_paths"], full)
+                    if path == "alpha/alpha.h":
+                        self.assertIn("input: alpha/alpha.h", report["reasons"]["alpha"])
+                        self.assertIn("no build executable", report["reasons"]["script"])
+                    elif path == "beta/main.c":
+                        self.assertIn("fixture setup for: beta", report["reasons"]["beta_setup"])
+        finally:
+            saved.rename(cache)
+
+
+
+@unittest.skipUnless(shutil.which("ninja") and (shutil.which("gcc") or shutil.which("cc")), "needs ninja and a C compiler")
+class FixtureBuildTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        root = Path(cls.directory.name)
+        cls.source, cls.build, cls.graph = root / "source", root / "build", root / "graph.json"
+        project = dict(PROJECT)
+        project["CMakeLists.txt"] += "add_subdirectory(cleanup)\n"
+        project["cleanup/CMakeLists.txt"] = (
+            "add_executable(cleanup_tests main.c)\nadd_test(NAME beta_cleanup COMMAND cleanup_tests)\n"
+            "set_tests_properties(beta_cleanup PROPERTIES FIXTURES_CLEANUP beta_fixture)\n")
+        project["cleanup/main.c"] = ('#include <stdio.h>\nint main(void) { FILE *f = fopen("cleanup.ran", "w"); '
+                                     'if (!f) return 1; return fclose(f) != 0; }\n')
+        for name, content in project.items():
+            (cls.source / name).parent.mkdir(parents=True, exist_ok=True)
+            (cls.source / name).write_text(content, encoding="utf-8")
+        compiler = shutil.which("gcc") or shutil.which("cc")
+        subprocess.run(["cmake", "-S", str(cls.source), "-B", str(cls.build), "-G", "Ninja", f"-DCMAKE_C_COMPILER={compiler}"],
+                       check=True, capture_output=True)
+        subprocess.run(["cmake", "--build", str(cls.build)], check=True, capture_output=True)
+        SelectTests.tool("dump", cls.build, cls.graph)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def run_selected(self, changed, graph):
+        subprocess.run(["cmake", "--build", str(self.build)], check=True, capture_output=True)
+        marker = self.build / "cleanup/cleanup.ran"
+        marker.unlink(missing_ok=True)
+        listed = self.build / "changed.txt"
+        listed.write_text(changed + "\n", encoding="utf-8")
+        SelectTests.tool("select", self.build, graph, listed)
+        subprocess.run(["ninja", "-C", str(self.build), "-t", "clean"], check=True, capture_output=True)
+        subprocess.run(["ninja", "-C", str(self.build), "-f", "select.ninja", "selected"], check=True, capture_output=True)
+        result = subprocess.run([sys.executable, str(TOOL), "ctest", str(self.build), "--output-on-failure"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(marker.is_file(), "CTest did not execute the fixture cleanup")
+        return result.stdout
+
+    def test_cleanup_executable_is_built_when_ctest_adds_it(self):
+        output = self.run_selected("beta/main.c", self.graph)
+        self.assertIn("beta_cleanup", output)
+        self.assertNotIn("alpha", output)
+        self.assertFalse(any(path.is_file() for path in (self.build / "alpha").glob("alpha_tests*")))
+
+    def test_new_test_gets_its_current_setup_and_cleanup(self):
+        graph = json.loads(self.graph.read_text(encoding="utf-8"))
+        del graph["tests"]["beta"]
+        older = self.build / "older.json"
+        older.write_text(json.dumps(graph), encoding="utf-8")
+        output = self.run_selected("alpha/main.c", older)
+        for name in ("alpha", "alpha_data", "beta", "beta_setup", "beta_cleanup"):
+            self.assertIn(name, output)
+
+
+class BuildErrorTests(unittest.TestCase):
+    def run_tool(self, *args):
+        return subprocess.run([sys.executable, "-I", str(TOOL), *map(str, args)], capture_output=True, text=True, timeout=60)
+
+    def test_missing_build_directory_is_reported_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for command in (("dump", root / "no build", root / "graph.json"),
+                            ("select", root / "no build", root / "graph.json", root / "changed.txt")):
+                with self.subTest(command[0]):
+                    result = self.run_tool(*command)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("not a configured CMake build directory", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    def test_cache_without_the_build_locations_is_reported_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "CMakeCache.txt").write_text("# empty\n", encoding="utf-8")
+            result = self.run_tool("dump", directory, Path(directory) / "graph.json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("CMAKE_CACHEFILE_DIR", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 class CaseInsensitivePathTests(unittest.TestCase):
@@ -144,6 +255,20 @@ class CaseInsensitivePathTests(unittest.TestCase):
             self.assertEqual(build.output(os.path.join("tests", "MemoryPoolTest.exe")), "tests/MemoryPoolTest.exe")
             self.assertEqual(build.repo(os.path.join(os.sep, "work", "source", "core", "libSceAgc", "Driver.cpp")), "core/libSceAgc/Driver.cpp")
             self.assertIsNone(build.repo(os.path.join(os.sep, "WORK", "SOURCE", "BUILD", "Generated.h")))
+
+
+class PlanTests(unittest.TestCase):
+    def test_plan_empty_run_avoids_invoking_ctest(self):
+        build = mock.Mock()
+        build.tests.return_value = ({}, [{"name": "alpha", "command": ["/build/alpha_tests"]}])
+        build.leaves.return_value = ["tests/alpha_tests"]
+        build.target.side_effect = lambda t: "tests/alpha_tests"
+        graph = {"tests": {"alpha": {}}}
+        run, leaves, count = select_tests.plan(build, graph, set())
+        self.assertEqual(run, [])
+        self.assertEqual(leaves, [])
+        self.assertEqual(count, 1)
+        build.tests.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -96,6 +96,7 @@ private:
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
     bool sampleLocationsEnabled = false;
+    VkExtent2D sampleLocationGrid{1, 1};
     std::vector<CachedFramebuffer> framebuffers;
 };
 

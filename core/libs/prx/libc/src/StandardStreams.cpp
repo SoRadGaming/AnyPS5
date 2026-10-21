@@ -140,6 +140,16 @@ int APS5_VABI ferror_nid_postfix(FileStream* stream) {
     stream->SyncStatus();
     return (stream->GuestState().flags & 0x40) != 0;
 }
+
+int APS5_VABI feof_unlocked_nid_postfix(FileStream* stream) {
+    stream->SyncUnlockedStatus();
+    return (stream->GuestState().flags & 0x20) != 0;
+}
+
+int APS5_VABI ferror_unlocked_nid_postfix(FileStream* stream) {
+    stream->SyncUnlockedStatus();
+    return (stream->GuestState().flags & 0x40) != 0;
+}
 void APS5_VABI clearerr_nid_postfix(FileStream* stream) {
     stream->ClearError();
 }
@@ -171,7 +181,7 @@ int APS5_VABI setvbuf_nid_postfix(FileStream* stream, char* buffer, int mode, st
         buffer = nullptr;
         size = BUFSIZ;
     }
-    return std::setvbuf(GetNativeStream(stream), buffer, native, size);
+    return std::setvbuf(GetStreamHandle(stream), buffer, native, size);
 }
 void APS5_VABI setbuf_nid_postfix(FileStream* stream, char* buffer) {
     setvbuf_nid_postfix(stream, buffer, buffer ? 0 : 2, buffer ? 1024 : 0);

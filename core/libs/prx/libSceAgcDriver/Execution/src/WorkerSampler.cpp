@@ -28,6 +28,7 @@ namespace {
 
 std::jthread processSamplerThread;
 std::jthread workerSamplerThread;
+std::jthread committerSamplerThread;
 
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
@@ -286,10 +287,7 @@ void StartProcessSampler() {
     });
 }
 
-}
-
-void startThreadSampler(const char* variable, std::jthread& slot) {
-    const char* path = std::getenv(variable);
+void StartCallingThreadSampler(const char* path, std::jthread& slot) {
     if (path == nullptr) return;
     auto sampler = std::make_unique<Sampler>();
     sampler->path = path;
@@ -316,25 +314,24 @@ void startThreadSampler(const char* variable, std::jthread& slot) {
     });
 }
 
-std::jthread committerSamplerThread;
+}
 
 void StartWorkerSampler() {
     StartProcessSampler();
-    startThreadSampler("APS5_SAMPLE_WORKER", workerSamplerThread);
+    StartCallingThreadSampler(std::getenv("APS5_SAMPLE_WORKER"), workerSamplerThread);
 }
 
-// LOCAL DEBUG: APS5_SAMPLE_COMMITTER=<file> samples the pipelined draw committer like APS5_SAMPLE_WORKER.
 void StartCommitterSampler() {
-    startThreadSampler("APS5_SAMPLE_COMMITTER", committerSamplerThread);
+    StartCallingThreadSampler(std::getenv("APS5_SAMPLE_COMMITTER"), committerSamplerThread);
 }
 
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
     committerSamplerThread.request_stop();
-    if (committerSamplerThread.joinable()) committerSamplerThread.join();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
+    if (committerSamplerThread.joinable()) committerSamplerThread.join();
 }
 #else
 void StartWorkerSampler() {}

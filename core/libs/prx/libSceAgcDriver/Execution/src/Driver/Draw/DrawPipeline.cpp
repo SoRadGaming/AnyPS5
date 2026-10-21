@@ -32,6 +32,10 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+std::atomic<std::uint64_t> heldReadRanges{0};
+std::atomic<std::uint64_t> heldReadQueries{0};
+std::atomic<std::uint64_t> heldReadHits{0};
+
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the [stream] line's helpers. StreamTotals is what the
 // report takes from Stream::counters (each counter exchanged with 0).
 static_assert(Stream::DispatchClasses < 16, "DrawPipeline::StreamClassSlots holds every dispatch class and the later-drains slot");
@@ -301,7 +305,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-std::uint64_t DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare) {
+std::uint64_t DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, ItemKind kind, const Prepare* prepare) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_REPORT") != nullptr;
     const bool streamOn = Stream::On();
     std::unique_lock lock(mutex);
@@ -385,7 +389,8 @@ std::uint64_t DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, st
     const auto pushedAtNs = streamOn || PrepHelpers::On() ? Stream::NowNs() : 0;
     const auto pushDepth = streamOn ? static_cast<std::uint32_t>(items.size()) : 0;
     const auto seq = ++lastSeq;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full, pushedAtNs, pushDepth, seq});
+    heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full, pushedAtNs, pushDepth, seq});
     if (streamOn) {
         closeStreamEpisode(pushedAtNs);
         streamGateEpisode.store(0, std::memory_order_relaxed);
@@ -437,7 +442,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::snprintf(item, sizeof(item), "; %llu labels appended to queued commits", static_cast<unsigned long long>(labelsAppended));
         drainText += item;
     }
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
+    char reads[64];
+    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)));
+    drainText += reads;
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = runs = runCommits = labelsAppended = 0;
     drains = {};
     drainWaitNs = {};
@@ -449,8 +457,8 @@ DrawPipeline::PrepStats DrawPipeline::TakePrepStats() {
 }
 
 void DrawPipeline::run() {
-    StartCommitterSampler();
     PerformanceTrace::BindThread("draw committer");
+    StartCommitterSampler();
     if (GuestMemory::Q0Receipts() != 0) CommitterThread::Set(true);
     // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the loop's idle (top to the item taken; a wait when the
     // queue was empty at the top) and busy (the front's commit or run) spans; a busy span is added
@@ -758,6 +766,27 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode, std::source_l
 
 std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
+}
+
+bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
+    const auto end = address + bytes;
+    auto& pipeline = Queue0();
+    std::lock_guard lock(pipeline.mutex);
+    heldReadQueries.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& item : pipeline.items) {
+        for (const auto& [begin, limit] : item.reads) {
+            if (address >= limit || begin >= end) continue;
+            heldReadHits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+void DrawPipeline::ReleaseRunningReads() {
+    std::lock_guard lock(mutex);
+    if (!items.empty()) items.front().reads.clear();
 }
 
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, PARALLEL-COMMIT-PLAN S0): drain episodes (see the header).
