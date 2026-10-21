@@ -3900,12 +3900,17 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         // APS5_EXPERIMENT_MOVED_RECIPES: a depth surface made over the target's memory since the
-        // recipe was built is retired before the target is proved, as Draw does before its lookup.
+        // recipe was built is retired before the target is proved, as Draw does before its lookup:
+        // its stale depth plane is stored first (FlushDepthPlanes), because retiring it drops the
+        // plane and the target's Refresh would then no longer flush it.
         // Draw also attaches a linear target's resident image only while the target has a host
         // import, and copies the target without one, so such a hit misses then.
         const auto& color = state.colors[index];
         const std::size_t colorBytes = movedRecipes != 0 ? ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes() : 0;
-        if (movedRecipes != 0 && color.samples <= 1) RetireDepthSurfaces(context.device, color.address, colorBytes);
+        if (movedRecipes != 0 && color.samples <= 1) {
+            static_cast<void>(FlushDepthPlanes(color.address, colorBytes));
+            RetireDepthSurfaces(context.device, color.address, colorBytes);
+        }
         timer.phase(PhaseSetup);
         if (movedRecipes != 0 && color.tileMode == ColorTileMode::Linear && ExistingHostImportFor(context, color.address, colorBytes) == nullptr) return miss(DrawRecipeMiss::TargetGone);
         auto stored = recipe.targets[index].lock();
