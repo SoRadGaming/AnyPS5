@@ -64,6 +64,24 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // keys surfaces under (StorageSurface); moves only when a chain is recorded or grows, so while it
 // holds a surface maps to the same storage key.
 std::uint64_t StorageLevelsSerial();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache asks
+// a surface's size and storage key of two 8-entry memos per thread, keyed on every field of the
+// resource (and the context, for the key). Unset or 0: today's calls. 1: memos used. 2: verify: a
+// hit computes the value too and uses it, and a difference aborts with a [target-memos] line.
+// TargetMemoTotals counts while the switch is set (cumulative; the [proofs] line prints 10 s
+// deltas); TargetMemoBytes and TargetMemoKey answer as cachedStorageTexture's lookups do (tests).
+int TargetMemos();
+struct TargetMemoCounts {
+    std::uint64_t bytesHits = 0;
+    std::uint64_t bytesMisses = 0;
+    std::uint64_t keyHits = 0;
+    std::uint64_t keyMisses = 0;
+    std::uint64_t verified = 0;
+    bool operator==(const TargetMemoCounts&) const = default;
+};
+TargetMemoCounts TargetMemoTotals();
+std::uint64_t TargetMemoBytes(const GuestTextureResource& resource);
+std::array<std::uint32_t, 8> TargetMemoKey(const Context& context, const GuestTextureResource& resource);
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);

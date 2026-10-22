@@ -1069,6 +1069,113 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
     return {static_cast<std::uint32_t>(resource.baseAddress | resource.pipeBankXor), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): cachedStorageTexture's
+// surface size (DescribeSurface(...).guestBytes) and storage key (SurfaceKey) from two 8-entry
+// memos per thread (ThreadScratch). Both are pure: DescribeSurface reads only its argument, and
+// SurfaceKey reads the resource and the context's fixed format support (StorageFormatOrUndefined's
+// answer per physical device). So the bytes memo keys on every GuestTextureResource field and the
+// key memo on the context's address, device and physical device as well, each compared field by
+// field, and a hit returns what the call would. An answer is stored only after the call returned:
+// a call that throws (DescribeSurface's and StorageFormatFor's Requires) throws again every time.
+// Counted while the switch is set (relaxed; the [proofs] line prints 10 s deltas). =2: a hit
+// computes the value too and uses it, and a difference aborts with a [target-memos] line.
+enum TargetMemoCount : std::size_t { MemoBytesHits, MemoBytesMisses, MemoKeyHits, MemoKeyMisses, MemoVerified, TargetMemoCountCount };
+constinit std::array<std::atomic<std::uint64_t>, TargetMemoCountCount> targetMemoCounts{};
+
+void countTargetMemo(TargetMemoCount kind) {
+    targetMemoCounts[kind].fetch_add(1, std::memory_order_relaxed);
+}
+
+// The memo keys hold every field; a field added by a merge fails the size check until it is compared here.
+static_assert(sizeof(GuestTextureResource) == 88, "a GuestTextureResource field was added: compare it in sameResource (the D4-A memos key on every field)");
+bool sameResource(const GuestTextureResource& a, const GuestTextureResource& b) {
+    return a.baseAddress == b.baseAddress && a.width == b.width && a.height == b.height && a.depthOrLastArray == b.depthOrLastArray && a.baseArray == b.baseArray && a.mipCount == b.mipCount && a.baseLevel == b.baseLevel && a.tileMode == b.tileMode && a.dimension == b.dimension && a.format == b.format && a.dstSelX == b.dstSelX && a.dstSelY == b.dstSelY && a.dstSelZ == b.dstSelZ && a.dstSelW == b.dstSelW && a.pipeBankXor == b.pipeBankXor && a.bcSwizzle == b.bcSwizzle && a.lastLevel == b.lastLevel && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.iterate256 == b.iterate256 && a.minLod == b.minLod && a.allocatedMipCount == b.allocatedMipCount && a.samples == b.samples;
+}
+
+constexpr std::size_t TargetMemoEntries = 8;
+struct TargetMemoTable {
+    struct Bytes {
+        GuestTextureResource resource{};
+        std::uint64_t guestBytes = 0;
+    };
+    struct Key {
+        const Context* context = nullptr;
+        VkDevice device = VK_NULL_HANDLE;
+        VkPhysicalDevice physical = VK_NULL_HANDLE;
+        GuestTextureResource resource{};
+        std::array<std::uint32_t, 8> words{};
+    };
+    std::array<Bytes, TargetMemoEntries> bytes{};
+    std::array<Key, TargetMemoEntries> keys{};
+    std::size_t bytesUsed = 0;
+    std::size_t nextBytes = 0;
+    std::size_t keysUsed = 0;
+    std::size_t nextKey = 0;
+};
+struct TargetMemoTag {};
+
+[[noreturn]] void targetMemoDisagrees(const GuestTextureResource& resource, const char* what, const std::string& memoized, const std::string& computed) {
+    std::fprintf(stderr, "[target-memos] APS5_EXPERIMENT_TARGET_MEMOS=2: the %s memo of surface 0x%llx (%ux%u, format %u, tile %d, dimension %d, mips %u, array %u..%u, dcc 0x%llx) answered %s where the call answers %s\n", what, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension), resource.mipCount, resource.baseArray, resource.depthOrLastArray, static_cast<unsigned long long>(resource.dccAddress), memoized.c_str(), computed.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
+std::string keyWords(const std::array<std::uint32_t, 8>& words) {
+    std::string text;
+    char word[16];
+    for (const auto value : words) {
+        std::snprintf(word, sizeof(word), "%s%08x", text.empty() ? "" : " ", value);
+        text += word;
+    }
+    return text;
+}
+
+// DescribeSurface(resource).guestBytes.
+std::uint64_t SurfaceBytes(const GuestTextureResource& resource) {
+    const int mode = TargetMemos();
+    if (mode == 0) return DescribeSurface(resource).guestBytes;
+    auto& memo = ThreadScratch<TargetMemoTable, TargetMemoTag>();
+    for (std::size_t back = 1; back <= memo.bytesUsed; ++back) {
+        const auto& entry = memo.bytes[(memo.nextBytes + TargetMemoEntries - back) % TargetMemoEntries];
+        if (!sameResource(entry.resource, resource)) continue;
+        countTargetMemo(MemoBytesHits);
+        if (mode != 2) return entry.guestBytes;
+        const auto computed = DescribeSurface(resource).guestBytes;
+        if (computed != entry.guestBytes) targetMemoDisagrees(resource, "surface bytes", std::to_string(entry.guestBytes), std::to_string(computed));
+        countTargetMemo(MemoVerified);
+        return computed;
+    }
+    countTargetMemo(MemoBytesMisses);
+    const auto guestBytes = DescribeSurface(resource).guestBytes;
+    memo.bytes[memo.nextBytes] = {resource, guestBytes};
+    memo.nextBytes = (memo.nextBytes + 1) % TargetMemoEntries;
+    memo.bytesUsed = std::min(memo.bytesUsed + 1, TargetMemoEntries);
+    return guestBytes;
+}
+
+// SurfaceKey(context, resource).
+std::array<std::uint32_t, 8> MemoSurfaceKey(const Context& context, const GuestTextureResource& resource) {
+    const int mode = TargetMemos();
+    if (mode == 0) return SurfaceKey(context, resource);
+    auto& memo = ThreadScratch<TargetMemoTable, TargetMemoTag>();
+    for (std::size_t back = 1; back <= memo.keysUsed; ++back) {
+        const auto& entry = memo.keys[(memo.nextKey + TargetMemoEntries - back) % TargetMemoEntries];
+        if (entry.context != &context || entry.device != context.device || entry.physical != context.physical || !sameResource(entry.resource, resource)) continue;
+        countTargetMemo(MemoKeyHits);
+        if (mode != 2) return entry.words;
+        const auto computed = SurfaceKey(context, resource);
+        if (computed != entry.words) targetMemoDisagrees(resource, "storage key", keyWords(entry.words), keyWords(computed));
+        countTargetMemo(MemoVerified);
+        return computed;
+    }
+    countTargetMemo(MemoKeyMisses);
+    const auto words = SurfaceKey(context, resource);
+    memo.keys[memo.nextKey] = {&context, context.device, context.physical, resource, words};
+    memo.nextKey = (memo.nextKey + 1) % TargetMemoEntries;
+    memo.keysUsed = std::min(memo.keysUsed + 1, TargetMemoEntries);
+    return words;
+}
+
 struct ExtendedSurfaces {
     AgcDriver::Mutex mutex;
     std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
@@ -1093,7 +1200,7 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
     if (!extended && !surfaces.any.load(std::memory_order_acquire)) return viewed;
     auto surface = viewed;
     surface.mipCount = AllocatedLevels(viewed);
-    const auto identity = SurfaceKey(context, surface);
+    const auto identity = MemoSurfaceKey(context, surface);
     std::lock_guard lock(surfaces.mutex);
     if (extended) {
         auto& levels = surfaces.levels[identity];
@@ -1142,7 +1249,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
     RequireNoMultisampleTarget(viewed.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a storage image access");
     if (auto depth = DepthSurfaceStorage(context, words, viewed, mip)) return depth;
-    const auto viewedBytes = guestBytes != 0 ? guestBytes : DescribeSurface(viewed).guestBytes;
+    const auto viewedBytes = guestBytes != 0 ? guestBytes : SurfaceBytes(viewed);
     if (viewedBytes >= (1ull << 30u)) {
         static std::atomic<std::uint64_t> large{0};
         const auto count = large.fetch_add(1) + 1;
@@ -1164,7 +1271,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& counters = TextureCounts();
     const auto resource = StorageSurface(context, viewed);
-    const StorageKey key{context.device, SurfaceKey(context, resource)};
+    const StorageKey key{context.device, MemoSurfaceKey(context, resource)};
     auto& cache = StorageTextures();
     std::vector<std::shared_ptr<StorageTexture>> evicted;
     std::shared_ptr<StorageTexture> texture;
@@ -1189,7 +1296,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             counters.storageHits.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
         } else {
-            if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+            if (guestBytes == 0) guestBytes = SurfaceBytes(resource);
             if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
             CachedStorageTexture entry{key, mip, StorageTexture::Create(context, *context.detiler, resource, mip)};
             static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
@@ -1471,6 +1578,29 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 
 std::uint64_t StorageLevelsSerial() {
     return ExtendedChains().serial.load(std::memory_order_acquire);
+}
+
+int TargetMemos() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_TARGET_MEMOS");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+TargetMemoCounts TargetMemoTotals() {
+    const auto load = [](TargetMemoCount kind) { return targetMemoCounts[kind].load(std::memory_order_relaxed); };
+    return {load(MemoBytesHits), load(MemoBytesMisses), load(MemoKeyHits), load(MemoKeyMisses), load(MemoVerified)};
+}
+
+std::uint64_t TargetMemoBytes(const GuestTextureResource& resource) {
+    return SurfaceBytes(resource);
+}
+
+std::array<std::uint32_t, 8> TargetMemoKey(const Context& context, const GuestTextureResource& resource) {
+    return MemoSurfaceKey(context, resource);
 }
 
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress) {

@@ -240,6 +240,16 @@ void reportProofs() {
             reported[i] = now;
         }
     }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's
+    // surface size and key memos (ShaderResources.cpp), as 10 s deltas.
+    if (const int memos = TargetMemos(); memos != 0) {
+        static TargetMemoCounts reported;
+        const auto now = TargetMemoTotals();
+        char memoText[320];
+        std::snprintf(memoText, sizeof(memoText), "; D4-A (APS5_EXPERIMENT_TARGET_MEMOS=%d): bytes hits %llu, misses %llu; key hits %llu, misses %llu; =2: verified %llu", memos, static_cast<unsigned long long>(now.bytesHits - reported.bytesHits), static_cast<unsigned long long>(now.bytesMisses - reported.bytesMisses), static_cast<unsigned long long>(now.keyHits - reported.keyHits), static_cast<unsigned long long>(now.keyMisses - reported.keyMisses), static_cast<unsigned long long>(now.verified - reported.verified));
+        line += memoText;
+        reported = now;
+    }
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter's would-hits
     // and misses (TargetLease.cpp).
     line += TargetLeaseReport();

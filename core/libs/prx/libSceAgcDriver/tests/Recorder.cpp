@@ -11464,6 +11464,151 @@ int submitThreadTests(const Device& device, int mode) {
     return 0;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's
+// surface size and key memos answer what DescribeSurface and SurfaceKey answer; every field of the
+// resource is in their keys (each changed alone misses), the key memo keys the context's address,
+// device and physical device too, and a call that throws throws again (it is never memoized). At 0
+// nothing is counted, at 2 every hit is verified. The mode comes from the environment; no device:
+// the context's format support is a stub that stores every format.
+VKAPI_ATTR void VKAPI_CALL targetMemoFormatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
+    *properties = {};
+    properties->optimalTilingFeatures = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+}
+
+void targetMemoTests() {
+    const int mode = TargetMemos();
+    const auto start = TargetMemoTotals();
+    Context context{};
+    context.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x7d4a0010});
+    context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x7d4a0020});
+    context.formatProperties = targetMemoFormatProperties;
+    GuestTextureResource base{};
+    base.baseAddress = 0x7d4a00000000ull;
+    base.width = 256;
+    base.height = 64;
+    base.mipCount = 1;
+    base.tileMode = TextureTileMode::kLinear;
+    base.dimension = TextureDimension::k2D;
+    base.format = 56;
+    base.dstSelX = 4;
+    base.dstSelY = 5;
+    base.dstSelZ = 6;
+    base.dstSelW = 7;
+    const auto expectCounts = [&](const TargetMemoCounts& from, std::uint64_t bytesHits, std::uint64_t bytesMisses, std::uint64_t keyHits, std::uint64_t keyMisses, const std::string& what) {
+        const auto now = TargetMemoTotals();
+        const std::uint64_t counted = mode != 0 ? 1 : 0;
+        const bool expected = now.bytesHits - from.bytesHits == counted * bytesHits && now.bytesMisses - from.bytesMisses == counted * bytesMisses && now.keyHits - from.keyHits == counted * keyHits && now.keyMisses - from.keyMisses == counted * keyMisses && now.verified - from.verified == (mode == 2 ? bytesHits + keyHits : 0);
+        Require(expected, "target memos (APS5_EXPERIMENT_TARGET_MEMOS=" + std::to_string(mode) + "): " + what + ": bytes hits " + std::to_string(now.bytesHits - from.bytesHits) + ", misses " + std::to_string(now.bytesMisses - from.bytesMisses) + "; key hits " + std::to_string(now.keyHits - from.keyHits) + ", misses " + std::to_string(now.keyMisses - from.keyMisses) + "; verified " + std::to_string(now.verified - from.verified));
+    };
+    // Eight surfaces never asked before miss and push every earlier entry out of both memos (eight
+    // entries each, replaced in turn), so the next ask of a surface calls DescribeSurface and SurfaceKey.
+    std::uint64_t fresh = 0;
+    const auto churn = [&] {
+        for (int other = 0; other < 8; ++other) {
+            auto surface = base;
+            surface.baseAddress = base.baseAddress + (++fresh << 24u);
+            static_cast<void>(TargetMemoBytes(surface));
+            static_cast<void>(TargetMemoKey(context, surface));
+        }
+    };
+    const auto cold = [&](const GuestTextureResource& resource) {
+        churn();
+        return std::pair{TargetMemoBytes(resource), TargetMemoKey(context, resource)};
+    };
+
+    const auto baseAnswer = cold(base);
+    Require(baseAnswer.first == DescribeSurface(base).guestBytes, "target memos: the surface bytes of a computed ask differ from DescribeSurface's");
+    auto mark = TargetMemoTotals();
+    Require(std::pair{TargetMemoBytes(base), TargetMemoKey(context, base)} == baseAnswer, "target memos: a second ask of a surface answered differently");
+    expectCounts(mark, 1, 0, 1, 0, "a second ask of a surface");
+
+    using Change = void (*)(GuestTextureResource&);
+    const std::array<std::pair<const char*, Change>, 24> fields{{
+        {"baseAddress", [](GuestTextureResource& resource) { resource.baseAddress += 0x10000; }},
+        {"width", [](GuestTextureResource& resource) { resource.width += 64; }},
+        {"height", [](GuestTextureResource& resource) { resource.height += 64; }},
+        {"depthOrLastArray", [](GuestTextureResource& resource) { resource.depthOrLastArray += 1; }},
+        {"baseArray", [](GuestTextureResource& resource) { resource.baseArray += 1; }},
+        {"mipCount", [](GuestTextureResource& resource) { resource.mipCount = 2; }},
+        {"baseLevel", [](GuestTextureResource& resource) { resource.baseLevel = 1; }},
+        {"tileMode", [](GuestTextureResource& resource) { resource.tileMode = TextureTileMode::kR64KBX; }},
+        {"dimension", [](GuestTextureResource& resource) { resource.dimension = TextureDimension::k2DArray; }},
+        {"format", [](GuestTextureResource& resource) { resource.format = 22; }},
+        {"dstSelX", [](GuestTextureResource& resource) { resource.dstSelX = 0; }},
+        {"dstSelY", [](GuestTextureResource& resource) { resource.dstSelY = 0; }},
+        {"dstSelZ", [](GuestTextureResource& resource) { resource.dstSelZ = 0; }},
+        {"dstSelW", [](GuestTextureResource& resource) { resource.dstSelW = 0; }},
+        {"pipeBankXor", [](GuestTextureResource& resource) { resource.pipeBankXor = 0x100; }},
+        {"bcSwizzle", [](GuestTextureResource& resource) { resource.bcSwizzle = 1; }},
+        {"lastLevel", [](GuestTextureResource& resource) { resource.lastLevel = 1; }},
+        {"dccAddress", [](GuestTextureResource& resource) { resource.dccAddress = resource.baseAddress + 0x100000; }},
+        {"dccAlphaOnMsb", [](GuestTextureResource& resource) { resource.dccAlphaOnMsb = true; }},
+        {"dccPipeAligned", [](GuestTextureResource& resource) { resource.dccPipeAligned = true; }},
+        {"iterate256", [](GuestTextureResource& resource) { resource.iterate256 = true; }},
+        {"minLod", [](GuestTextureResource& resource) { resource.minLod = 1; }},
+        {"allocatedMipCount", [](GuestTextureResource& resource) { resource.allocatedMipCount = 1; }},
+        {"samples", [](GuestTextureResource& resource) { resource.samples = 2; }},
+    }};
+    for (const auto& [name, change] : fields) {
+        auto changed = base;
+        change(changed);
+        const auto want = cold(changed);
+        Require(want.first == DescribeSurface(changed).guestBytes, std::string("target memos: the surface bytes of a computed ask with ") + name + " changed differ from DescribeSurface's");
+        // Only the unchanged surface (and the other surfaces) in the memos: the changed one must miss.
+        churn();
+        static_cast<void>(TargetMemoBytes(base));
+        static_cast<void>(TargetMemoKey(context, base));
+        mark = TargetMemoTotals();
+        Require(std::pair{TargetMemoBytes(changed), TargetMemoKey(context, changed)} == want, std::string("target memos: a surface with ") + name + " changed answered as the memoized surface it differs from");
+        expectCounts(mark, 0, 1, 0, 1, std::string("a surface with ") + name + " changed after the unchanged one");
+    }
+
+    // The key memo keys the context: another context object, then that object with another device,
+    // then with another physical device, each miss; restored, it hits its first entry.
+    churn();
+    static_cast<void>(TargetMemoKey(context, base));
+    auto other = context;
+    mark = TargetMemoTotals();
+    Require(TargetMemoKey(other, base) == baseAnswer.second, "target memos: another context object answered another key");
+    expectCounts(mark, 0, 0, 0, 1, "the same surface through another context object");
+    other.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x7d4a0030});
+    mark = TargetMemoTotals();
+    Require(TargetMemoKey(other, base) == baseAnswer.second, "target memos: another device answered another key");
+    expectCounts(mark, 0, 0, 0, 1, "the same surface and context object with another device");
+    other.device = context.device;
+    other.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x7d4a0040});
+    mark = TargetMemoTotals();
+    Require(TargetMemoKey(other, base) == baseAnswer.second, "target memos: another physical device with the same format support answered another key");
+    expectCounts(mark, 0, 0, 0, 1, "the same surface and context object with another physical device");
+    other.physical = context.physical;
+    mark = TargetMemoTotals();
+    Require(TargetMemoKey(other, base) == baseAnswer.second, "target memos: the restored context object answered another key");
+    expectCounts(mark, 0, 0, 1, 0, "the same surface and context object restored");
+
+    // No guest format 3: DescribeSurface and SurfaceKey throw on every ask, and nothing is kept.
+    auto broken = base;
+    broken.format = 3;
+    for (int ask = 0; ask < 2; ++ask) {
+        mark = TargetMemoTotals();
+        bool bytesThrew = false;
+        bool keyThrew = false;
+        try {
+            static_cast<void>(TargetMemoBytes(broken));
+        } catch (const std::exception&) {
+            bytesThrew = true;
+        }
+        try {
+            static_cast<void>(TargetMemoKey(context, broken));
+        } catch (const std::exception&) {
+            keyThrew = true;
+        }
+        Require(bytesThrew && keyThrew, "target memos: a surface of an unknown format did not throw on ask " + std::to_string(ask + 1));
+        expectCounts(mark, 0, 1, 0, 1, "a surface of an unknown format, ask " + std::to_string(ask + 1));
+    }
+    Require(mode != 0 || TargetMemoTotals() == start, "target memos: the switch is off but the memos counted");
+    std::cout << "target memo tests passed (APS5_EXPERIMENT_TARGET_MEMOS=" << mode << ")\n";
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -11486,6 +11631,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--device-selection-only") {
             deviceSelectionTests();
             std::cout << "recorder device selection tests passed\n";
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's
+        // surface size and key memos, without a device; the mode comes from the environment.
+        if (argc == 2 && std::string_view(argv[1]) == "--target-memos-only") {
+            targetMemoTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {

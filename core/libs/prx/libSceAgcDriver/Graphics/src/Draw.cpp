@@ -3510,7 +3510,19 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter.
             std::optional<TargetLeaseUse> lease;
             if (profile) lease.emplace(TargetLeaseUse{&color, context.device, colorLayout.Bytes(), color.tileMode != ColorTileMode::Linear && context.detiler != nullptr, dumpLimit != 0});
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            // LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A, item 4; behaviour-identical, so not switched):
+            // the lookup reaches its inputs through one reference, so its closure (8 bytes, where four
+            // captured references took 32) fits libstdc++'s 16-byte std::function buffer and the lookup
+            // allocates nothing. The body and its order are unchanged.
+            struct LookupInputs {
+                const ColorTarget& color;
+                const decltype(targetSurface)& targetSurface;
+                const Context& context;
+                const ColorTargetLayout& colorLayout;
+            };
+            const LookupInputs inputs{color, targetSurface, context, colorLayout};
+            const auto lookup = [&inputs] {
+                const auto& [color, targetSurface, context, colorLayout] = inputs;
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = targetSurface(true);
@@ -3527,7 +3539,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
-            }, lease ? &*lease : nullptr);
+            };
+            static_assert(sizeof(lookup) <= 16, "the target lookup's closure must fit std::function's local buffer (one reference)");
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, lookup, lease ? &*lease : nullptr);
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
