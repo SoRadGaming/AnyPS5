@@ -1691,6 +1691,260 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Clear0001 && KeyProofCounts().proved == before.proved + 1, "(9) the proof did not hold after the batch finished");
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): case 9 of keyPinProofTests, a
+// live unit shadow over pinned keys (the shadowed-key-store fixture: the keys in the first 64 KiB
+// unit of an imported, watched block). Today's key read publishes the shadow, so the pin refuses
+// (Shadowed) and the read runs as today; at 2 nothing is verified, so nothing aborts. False when
+// not tested.
+bool keyPinShadowTests(const Device& device, Recorder& recorder, int mode) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    if (!UnitShadowEnabled() || context.hostImportAlignment == 0) {
+        std::cout << "unit shadows or host imports unavailable: a pinned key proof under a unit shadow not tested\n";
+        return false;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 2 * unit;
+    constexpr std::size_t surfaceBytes = 65536;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, unit);
+    Require(block != nullptr, "cannot reserve the pinned shadowed key block");
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create the pinned shadowed key block");
+    GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+#else
+    void* block = AllocateWatched(bytes, unit);
+    Require(block != nullptr, "cannot allocate the pinned shadowed key block");
+#endif
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0xff, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "the key block is not imported and watched: a pinned key proof under a unit shadow not tested\n";
+        return false;
+    }
+    recorder.Sync();
+    CollectWritesUncached(address, bytes);
+    GuestTextureResource resource{};
+    resource.baseAddress = address + unit;
+    resource.format = 56;
+    resource.dccAddress = address;
+    DccKeyProof proof;
+    recorder.NotePendingFill(address, keyCount, 0xff);
+    MarkWritten(address, keyCount);
+    NoteKeysFillOnGpu(address, keyCount, DccKeys::Uncompressed);
+    Require(ProvedClearKeys(resource, surfaceBytes, proof) == DccKeys::Uncompressed, "K1 (9): the keys of a pending driver store over imported keys did not read as uncompressed");
+    if (mode != 0) Require(proof.pinNote != 0, "K1 (9): the pending driver store over imported keys was not pinned");
+    auto destination = ShadowDestinationFor(context, *import, address, address + unit);
+    Require(destination.has_value() && destination->seedUnits.empty(), "K1 (9): the key unit has no unit shadow destination");
+    auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    std::memset(pattern->Bytes().data(), 0x40, pattern->Bytes().size());
+    const auto commands = recorder.Commands();
+    recorder.Keep(pattern);
+    recorder.Keep(destination->slab);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const VkBufferCopy piece{0, destination->offset, unit};
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, pattern->Handle(), destination->buffer, 1, &piece);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const ShadowedRange range{address, address + unit, destination->slab};
+    MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    Require(AnyShadowedOverlaps(address, keyCount), "K1 (9): the key unit is not shadowed");
+    const auto before = KeyPinTotals();
+    static_cast<void>(ProvedClearKeys(resource, surfaceBytes, proof));
+    if (mode != 0) Require(KeyPinTotals()[KeyPin::Shadowed] == before[KeyPin::Shadowed] + 1, "K1 (9): a pin answered under a live unit shadow over the keys");
+    Require(!AnyShadowedOverlaps(address, keyCount), "K1 (9): today's key read did not publish the unit shadow over the keys");
+    recorder.Sync();
+    return true;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): pinned key proofs over a 64 KiB
+// watched block of keys (0x00, a 0000 clear). The driver's key store is played as
+// StoreUncompressedOnGpu makes it (a 0xff fill noted in the open batch, the keys stamped, the memo
+// entry with the fill's note) without a command, so the bytes keep what the test wrote: today's key
+// read answers Uncompressed from the memo until the batch is reaped and never keeps that scan. The
+// mode follows the switch: unset or 0 takes no pin, 1 answers from pins, 2 takes and keeps them but
+// runs today's scan wherever a pin held and checks it. Under the GPU mutex with `recorder` active.
+// False when nothing could be tested.
+bool keyPinProofTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    if (!KeyFastPath()) {
+        std::cout << "key fast path off: pinned key proofs not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, bytes);
+    if (block == nullptr) {
+        std::cout << "no write watching: pinned key proofs not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    constexpr std::size_t keyCount = 1024;
+    constexpr std::uint64_t surfaceBytes = keyCount * 256;
+    auto* keys = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    GuestTextureResource resource{};
+    resource.baseAddress = address + 8192;
+    resource.width = 256;
+    resource.height = 256;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dccAddress = address;
+    const char* text = std::getenv("APS5_EXPERIMENT_KEY_PIN");
+    const auto value = text != nullptr ? std::strtol(text, nullptr, 10) : 0;
+    const int mode = value == 0 ? 0 : value == 2 ? 2 : 1;
+    const bool pinning = mode != 0;
+    const auto start = KeyPinTotals();
+    const auto delta = [](const KeyPinCounts& before, KeyPin kind) { return KeyPinTotals()[kind] - before[kind]; };
+    DccKeyProof proof;
+    const auto read = [&] { return ProvedClearKeys(resource, surfaceBytes, proof); };
+    const auto store = [&] {
+        recorder.NotePendingFill(address, keyCount, 0xff);
+        MarkWritten(address, keyCount);
+        NoteKeysFillOnGpu(address, keyCount, DccKeys::Uncompressed);
+    };
+    recorder.Sync();
+    std::memset(keys, 0x00, keyCount);
+
+    // 1. Bytes nothing writes: a stable proof, no pin.
+    Require(read() == DccKeys::Clear0000 && proof.generation != 0 && proof.pinNote == 0, "K1 (1): 0x00 keys did not give a stable 0000 proof");
+
+    // 2. The driver's store: every mode answers Uncompressed from the memo; 1 and 2 pin it.
+    store();
+    auto before = KeyPinTotals();
+    Require(read() == DccKeys::Uncompressed, "K1 (2): the keys of a pending driver store did not read as uncompressed");
+    if (pinning) Require(proof.pinNote != 0 && proof.generation != 0 && proof.keys == DccKeys::Uncompressed && delta(before, KeyPin::Taken) == 1, "K1 (2): the pending driver store was not pinned");
+    else Require(proof.generation == 0 && proof.pinNote == 0, "K1 (2): a key proof was kept under a pending driver store with the switch off");
+    // The pin a take would hold, at every mode ([dcc]'s pinnable count).
+    Require(DccKeyPinNote(address, keyCount) != 0 && (!pinning || DccKeyPinNote(address, keyCount) == proof.pinNote), "K1 (2): the pending driver store is not pinnable");
+
+    // 3. The next read: 1 answers from the pin, 2 scans and verifies it, 0 scans.
+    auto proofs = KeyProofCounts();
+    before = KeyPinTotals();
+    Require(read() == DccKeys::Uncompressed, "K1 (3): the pending store's keys did not read as uncompressed again");
+    const auto scans = KeyProofCounts();
+    if (mode == 1) Require(scans.proved == proofs.proved + 1 && scans.scanned == proofs.scanned && delta(before, KeyPin::KeyAnswer) == 1, "K1 (3) 1: the pin did not answer");
+    else Require(scans.scanned == proofs.scanned + 1 && scans.proved == proofs.proved, "K1 (3): the second read did not scan");
+    if (mode == 2) Require(delta(before, KeyPin::KeysVerified) == 1 && delta(before, KeyPin::KeyAnswer) == 0, "K1 (3) 2: the pin's prediction was not verified against today's scan");
+
+    // 4. A CPU store into the keys under the pin: today still answers from the memo, and the pin is
+    // taken again at the new collect.
+    const auto generation = proof.generation;
+    const auto note = proof.pinNote;
+    std::memset(keys, 0x40, keyCount);
+    before = KeyPinTotals();
+    Require(read() == DccKeys::Uncompressed, "K1 (4): a CPU store into the keys changed the pending store's answer");
+    if (pinning) Require(delta(before, KeyPin::Taken) == 1 && proof.pinNote == note && proof.generation > generation, "K1 (4): the pin was not taken again after a CPU store into the keys");
+
+    // 5. A newer 0000 fill nothing stamped: the pinned store is not the newest writer any more.
+    recorder.NotePendingFill(address, keyCount, 0x00);
+    before = KeyPinTotals();
+    Require(read() == DccKeys::Clear0000, "K1 (5): the keys under a newer 0000 fill did not read as 0000");
+    if (pinning) Require(delta(before, KeyPin::NotNewest) == 1, "K1 (5): the pin was not refused under a newer writer");
+    Require(proof.pinNote == 0 && proof.generation == 0 && DccKeyPinNote(address, keyCount) == 0, "K1 (5): a key proof was kept, or is pinnable, under a newer writer");
+
+    // 6. The batch runs and is reaped: a stable proof from the bytes (0x40).
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    Require(read() == DccKeys::Clear0001 && proof.generation != 0 && proof.pinNote == 0, "K1 (6): the reaped keys gave no stable proof from their bytes");
+
+    // 7. A pin whose batch ran but was not reaped still answers at 1; the reap ends it.
+    store();
+    Require(read() == DccKeys::Uncompressed && (!pinning || proof.pinNote != 0), "K1 (7): the pending driver store was not read or pinned");
+    recorder.Submit();
+    device.WaitQueue();
+    before = KeyPinTotals();
+    Require(read() == DccKeys::Uncompressed, "K1 (7): the keys of a store whose batch ran but was not reaped did not read as uncompressed");
+    if (mode == 1) Require(delta(before, KeyPin::KeyAnswer) == 1, "K1 (7) 1: the pin did not answer before the reap");
+    if (mode == 2) Require(delta(before, KeyPin::KeysVerified) == 1, "K1 (7) 2: the pin was not verified before the reap");
+    recorder.Sync();
+    before = KeyPinTotals();
+    Require(read() == DccKeys::Clear0001 && proof.generation != 0 && proof.pinNote == 0, "K1 (7): the keys after the reap gave no stable proof from their bytes");
+    if (pinning) Require(delta(before, KeyPin::NotPending) == 1, "K1 (7): the reap did not end the pin");
+
+    // 8. A pin over a signaled batch whose memo entry a key read dropped (MemoizedKeys): today's read
+    // answers from the pending fill's value instead, which no pin follows.
+    store();
+    Require(read() == DccKeys::Uncompressed && (!pinning || proof.pinNote != 0), "K1 (8): the pending driver store was not read or pinned");
+    recorder.Submit();
+    device.WaitQueue();
+    static_cast<void>(ReadDccKeys(address, surfaceBytes));
+    before = KeyPinTotals();
+    Require(read() == DccKeys::Uncompressed, "K1 (8): the keys of a signaled store after the memo dropped its entry did not read as uncompressed");
+    if (pinning) Require(delta(before, KeyPin::MemoMoved) == 1 && proof.pinNote == 0, "K1 (8): a pin answered after the memo dropped its entry");
+    recorder.Sync();
+
+    // 10. Another recorder active: the pin refuses without MemoRecorder's clear (the entries are
+    // still there for the first recorder), and today's read under the other recorder clears them.
+    store();
+    Require(read() == DccKeys::Uncompressed && (!pinning || proof.pinNote != 0), "K1 (10): the pending driver store was not read or pinned");
+    {
+        const auto pinned = proof.pinNote;
+        Recorder other(device.GetContext());
+        other.Activate();
+        if (pinning) Require(DccKeyPinRefusal(address, keyCount, pinned) == KeyPin::MemoMoved, "K1 (10): a pin held under another recorder");
+        recorder.Activate();
+        if (pinning) Require(DccKeyPinRefusal(address, keyCount, pinned) == KeyPin::Holds, "K1 (10): the pin check under another recorder dropped the memo's entries");
+        other.Activate();
+        before = KeyPinTotals();
+        static_cast<void>(read());
+        if (pinning) Require(delta(before, KeyPin::MemoMoved) == 1 && proof.pinNote == 0, "K1 (10): a pin answered under another recorder");
+        recorder.Activate();
+    }
+    recorder.Sync();
+
+    // 11. A pending 0000 fill with a note (NoteKeysFillOnGpu): today answers 0000 from the memo, which
+    // no pin holds.
+    recorder.NotePendingFill(address, keyCount, 0x00);
+    MarkWritten(address, keyCount);
+    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0000);
+    before = KeyPinTotals();
+    Require(read() == DccKeys::Clear0000, "K1 (11): the keys of a pending 0000 fill did not read as 0000");
+    if (pinning) Require(delta(before, KeyPin::FillNotPinned) == 1 && delta(before, KeyPin::Taken) == 0, "K1 (11): a pending fill of other keys was pinned or not counted");
+    Require(proof.pinNote == 0 && proof.generation == 0 && DccKeyPinNote(address, keyCount) == 0, "K1 (11): a key proof was kept, or is pinnable, under a pending fill of other keys");
+    recorder.Sync();
+
+    // 9. A live unit shadow over pinned keys.
+    const bool shadowed = keyPinShadowTests(device, recorder, mode);
+
+    // 12. Nothing counted with the switch off; no answer at 2, no verify at 1, no race.
+    const auto end = KeyPinTotals();
+    if (mode == 0) Require(end.target == start.target && end.other == start.other, "K1: a pin was taken or counted with the switch off");
+    if (mode == 1) Require(end[KeyPin::KeysVerified] == start[KeyPin::KeysVerified] && end[KeyPin::RefreshVerified] == start[KeyPin::RefreshVerified], "K1 1: a pin was verified");
+    if (mode == 2) Require(end[KeyPin::KeyAnswer] == start[KeyPin::KeyAnswer] && end[KeyPin::RefreshHit] == start[KeyPin::RefreshHit], "K1 2: a pin answered");
+    Require(end[KeyPin::Raced] == start[KeyPin::Raced], "K1: a pinned prediction was overtaken in a single-threaded test");
+    std::cout << "Pinned key proofs (APS5_EXPERIMENT_KEY_PIN=" << mode << (shadowed ? "" : ", no unit shadow case") << "): passed\n";
+    return true;
+}
+
 void targetKeyProofTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t bytes = 65536;
@@ -6896,6 +7150,270 @@ bool refreshProofUnitTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): refresh proofs over pinned key
+// proofs. The refresh proof fixture with its keys a 0000 clear, in a 1 MiB watched host import (a
+// smaller import of private memory is compared instead of watched on a device that settles imports,
+// such as this one): T is a 256 KiB R64KBX surface at 0 with its keys at 256 KiB. A draw into T
+// makes the driver store its uncompressed keys on the GPU (MarkDirty), pending in the open batch.
+// With the switch unset or 0 no refresh of T is proved meanwhile (key proof empty); 1 proves them
+// from the pin, moving the layer generations as today's refresh does; 2 hands each to today's
+// refresh, which must agree. C10 (hand-over lists) has no case: they are filled only by
+// clearHandOver inside a refresh whose overlapping pending images have units inside the surface,
+// which then takes no proof (other pending), and the next refresh clears them before it takes one.
+// C7 (a stale depth plane) needs a depth surface in the harness, as P1's refusal does. False when
+// nothing could be tested.
+bool refreshKeyPinTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: pinned refresh proofs not tested\n";
+        return false;
+    }
+    if (!KeyFastPath()) {
+        std::cout << "key fast path off: pinned refresh proofs not tested\n";
+        return false;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+    constexpr std::size_t bytes = std::size_t{1} << 20;
+    // A 64 KiB block neither T nor its keys touch: a stamp there only moves the tracker generation.
+    constexpr std::size_t elsewhere = 6 * 65536;
+    // The two-layer variant V of case 6, and its keys.
+    constexpr std::size_t variantOffset = 8 * 65536;
+    constexpr std::size_t variantKeyOffset = 15 * 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: pinned refresh proofs not tested\n";
+        return false;
+    }
+    auto* texels = static_cast<std::uint8_t*>(block);
+    auto* keys = texels + surfaceBytes;
+    std::memset(texels, 0x55, bytes);
+    std::memset(keys, 0x00, keyCount);
+    std::memset(texels + variantKeyOffset, 0x00, 65536);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "no watched host import: pinned refresh proofs not tested\n";
+        return false;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    resource.dccAddress = address + surfaceBytes;
+    const char* text = std::getenv("APS5_EXPERIMENT_KEY_PIN");
+    const auto value = text != nullptr ? std::strtol(text, nullptr, 10) : 0;
+    const int mode = value == 0 ? 0 : value == 2 ? 2 : 1;
+    const auto proved = [] { return StorageTexture::RefreshesProved(); };
+    const auto delta = [](const KeyPinCounts& before, KeyPin kind) { return KeyPinTotals()[kind] - before[kind]; };
+    const auto start = KeyPinTotals();
+    recorder.Sync();
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        const auto draw = [&](const std::shared_ptr<StorageTexture>& target) {
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
+            const VkClearColorValue color{{1.0f, 0.0f, 0.0f, 1.0f}};
+            const auto commands = recorder.Commands();
+            recorder.Keep(target);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            target->MarkDirty();
+        };
+        // The driver's key store as StoreUncompressedOnGpu makes it, without the command: a 0xff fill
+        // noted in the open batch, the keys stamped, the memo entry with the fill's note.
+        const auto store = [&] {
+            recorder.NotePendingFill(resource.dccAddress, keyCount, 0xff);
+            AgcDriver::GuestMemory::MarkWritten(resource.dccAddress, keyCount);
+            NoteKeysFillOnGpu(resource.dccAddress, keyCount, DccKeys::Uncompressed);
+        };
+        const auto settle = [&] {
+            image->Refresh();
+            image->Refresh();
+        };
+        const auto expectProved = [&](bool expected, const char* what) {
+            const auto before = proved();
+            image->Refresh();
+            Require(proved() == before + (expected ? 1 : 0), what);
+        };
+        // Today's unchanged exit moves every unit to the surface's collect, made during the refresh (a
+        // pinned hit's in refreshProved): after a stamp elsewhere moved the tracker generation, every
+        // unit lies between the generations read before and after the refresh, and all are equal.
+        const auto expectAdvanced = [&](const char* what) {
+            AgcDriver::GuestMemory::MarkWritten(address + elsewhere, 4096);
+            const auto before = AgcDriver::GuestMemory::TrackerGeneration();
+            image->Refresh();
+            const auto after = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto first = image->LayerGeneration(0);
+            Require(first >= before && first <= after, what);
+            for (std::uint32_t unit = 1; unit < image->TrackedUnits(); ++unit) Require(image->LayerGeneration(unit) == first, what);
+        };
+
+        // 1. 0000 keys: proved as today. A draw makes the driver store uncompressed keys on the GPU.
+        settle();
+        expectProved(true, "K1 refresh (1): the cleared target was not proved");
+        draw(image);
+        Require(image->UploadedKeys() == DccKeys::Uncompressed, "K1 refresh (1): the first draw did not store the keys uncompressed");
+        if (!recorder.PendingWriteOverlaps(resource.dccAddress, keyCount)) {
+            std::cout << "the first draw stored the keys on the CPU: pinned refresh proofs not tested\n";
+            recorder.Sync();
+            return false;
+        }
+
+        // 2. The next refresh pins the keys (1 and 2), then three more: 1 proves each from the pin, 2
+        // verifies each against today's refresh, 0 proves none. Each leaves today's generations.
+        auto before = KeyPinTotals();
+        image->Refresh();
+        if (mode != 0) Require(delta(before, KeyPin::Taken) == 1 && image->KeyProof().pinNote != 0, "K1 refresh (2): the refresh after the draw did not pin the keys");
+        else Require(image->KeyProof().generation == 0 && image->KeyProof().pinNote == 0, "K1 refresh (2): a key proof was kept under the pending store with the switch off");
+        before = KeyPinTotals();
+        const auto provedBefore = proved();
+        for (int round = 0; round < 3; ++round) expectAdvanced("K1 refresh (2): a refresh left a unit off the generation of the surface's collect");
+        Require(proved() == provedBefore + (mode == 1 ? 3 : 0), mode == 1 ? "K1 refresh (2) 1: the pinned target was not proved" : "K1 refresh (2): the target was proved under a pending key store");
+        if (mode == 1) Require(delta(before, KeyPin::RefreshHit) == 3, "K1 refresh (2) 1: the pinned hits were not counted");
+        if (mode == 2) Require(delta(before, KeyPin::RefreshVerified) == 3 && delta(before, KeyPin::RefreshHit) == 0, "K1 refresh (2) 2: the pinned predictions were not verified against today's refresh");
+
+        // 3. A CPU store into T: no mode proves it; once settled, 1 proves again.
+        texels[0] = 0x11;
+        expectProved(false, "K1 refresh (3): a CPU store into the surface was answered from a pinned proof");
+        settle();
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (3) 1: the pinned target was not proved after a CPU store" : "K1 refresh (3): the target was proved under a pending key store");
+
+        // 4. A CPU store into the keys: today still reads them from the memo (no upload) and the pin is
+        // taken again at the new collect; 1 proves after.
+        keys[0] = 0x40;
+        before = KeyPinTotals();
+        Require(image->Refresh(), "K1 refresh (4): a CPU store into the keys under the pending store uploaded the surface");
+        if (mode != 0) Require(delta(before, KeyPin::Taken) == 1, "K1 refresh (4): the pin was not taken again after a CPU store into the keys");
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (4) 1: the target was not proved after the pin was taken again" : "K1 refresh (4): the target was proved under a pending key store");
+
+        // 5. Another image of T's surface pending: no mode proves the refresh (its flush stores it).
+        // The driver's store is played again after (the flush may have run the batch).
+        auto other = resource;
+        other.dccAddress = 0;
+        auto pending = StorageTexture::Create(context, detiler, other, 0);
+        recorder.Keep(pending);
+        pending->MarkDirty();
+        expectProved(false, "K1 refresh (5): another image's pending results over the target were answered from a pinned proof");
+        store();
+        settle();
+        settle();
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (5) 1: the target was not proved from a new pin" : "K1 refresh (5): the target was proved under a pending key store");
+
+        // 6. RefreshLayers of a two-layer DCC variant V: a DCC surface's layer refresh is never scoped
+        // (RefreshLayers refreshes it whole), so its pin answers (1) and C9 never refuses.
+        auto variantResource = resource;
+        variantResource.baseAddress = address + variantOffset;
+        variantResource.width = 128;
+        variantResource.height = 128;
+        variantResource.dimension = TextureDimension::k2DArray;
+        variantResource.depthOrLastArray = 1;
+        variantResource.dccAddress = address + variantKeyOffset;
+        const auto variantBytes = DescribeSurface(variantResource).guestBytes;
+        Require(variantBytes != 0 && variantBytes <= variantKeyOffset - variantOffset && variantBytes / 256 <= 65536, "K1 refresh (6): the two-layer variant does not fit its fixture");
+        auto variant = StorageTexture::Create(context, detiler, variantResource, 0);
+        Require(variant->ImageLayers() == 2, "K1 refresh (6): the variant is not two layers");
+        variant->Refresh();
+        variant->Refresh();
+        draw(variant);
+        Require(variant->UploadedKeys() == DccKeys::Uncompressed, "K1 refresh (6): the variant's first draw did not store its keys uncompressed");
+        variant->Refresh();
+        before = KeyPinTotals();
+        const auto variantProved = proved();
+        Require(variant->RefreshLayers(0, 1), "K1 refresh (6): the variant's first layer was not current");
+        Require(delta(before, KeyPin::Scoped) == 0, "K1 refresh (6): a DCC surface's layer refresh was refused as scoped");
+        if (mode == 1) Require(proved() == variantProved + 1 && delta(before, KeyPin::RefreshHit) == 1, "K1 refresh (6) 1: the variant's layer refresh was not proved from its pin");
+        if (mode != 1) Require(proved() == variantProved, "K1 refresh (6): the variant's layer refresh was proved under a pending key store");
+
+        // 7. The batch runs (1 still proves: not reaped); the reap ends the pin, after which the bytes
+        // (0xff, as the store left them) give a stable key proof and every mode proves.
+        std::memset(keys, 0xff, keyCount);
+        image->Refresh();
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (7) 1: the target was not proved after a CPU store into the keys" : "K1 refresh (7): the target was proved under a pending key store");
+        recorder.Submit();
+        device.WaitQueue();
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (7) 1: the target was not proved before the batch was reaped" : "K1 refresh (7): the target was proved under a key store not reaped");
+        recorder.Sync();
+        before = KeyPinTotals();
+        image->Refresh();
+        if (mode != 0) Require(delta(before, KeyPin::NotPending) >= 1, "K1 refresh (7): the reap did not end the pin");
+        // Once as the refresh's refusal; its slow path's key read counts its own apart.
+        if (mode != 0) Require(KeyPinTotals().Refreshes(KeyPin::NotPending) == before.Refreshes(KeyPin::NotPending) + 1, "K1 refresh (7): the refresh's refusal at the reap was not counted once as a refresh's");
+        Require(image->KeyProof().generation != 0 && image->KeyProof().pinNote == 0, "K1 refresh (7): the reaped keys gave no stable key proof");
+        expectProved(true, "K1 refresh (7): the target was not proved with a stable key proof");
+
+        // 8. A newer writer nothing stamped over the keys after a new pin: not the newest any more.
+        store();
+        image->Refresh();
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (8) 1: the target was not proved from a new pin" : "K1 refresh (8): the target was proved under a pending key store");
+        recorder.NotePendingFill(resource.dccAddress, keyCount, 0xff);
+        before = KeyPinTotals();
+        expectProved(false, "K1 refresh (8): a refresh was proved from a pin under a newer writer");
+        if (mode != 0) Require(delta(before, KeyPin::NotNewest) >= 1, "K1 refresh (8): the pin was not refused under a newer writer");
+        if (mode != 0) Require(KeyPinTotals().Refreshes(KeyPin::NotNewest) == before.Refreshes(KeyPin::NotNewest) + 1, "K1 refresh (8): the refresh's refusal under a newer writer was not counted once as a refresh's");
+        recorder.Sync();
+
+        // 9. A pin another key read replaced with a stable proof at the same generation: the refresh
+        // proof is taken over a new pin, the batch is reaped with nothing stamped, and a key read
+        // through the image's key proof (fastRevalidate's or ServesKeysAt's) refuses the pin (not
+        // pending) and keeps the bytes' stable proof at the pin's generation. Today took no refresh
+        // proof under the pin, so its next refresh runs the slow path and moves every unit to the
+        // surface's collect; no mode may answer it from the proof taken over the pin (a plain hit
+        // would leave the units at the pin's generation).
+        store();
+        image->Refresh();
+        if (mode != 0) Require(image->KeyProof().pinNote != 0, "K1 refresh (9): the refresh after the store did not pin the keys");
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (9) 1: the target was not proved from the pin" : "K1 refresh (9): the target was proved under a pending key store");
+        const auto pinGeneration = image->KeyProof().generation;
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        Require(ProvedClearKeys(resource, surfaceBytes, image->KeyProof()) == DccKeys::Uncompressed && image->KeyProof().generation != 0 && image->KeyProof().pinNote == 0, "K1 refresh (9): the reaped keys gave no stable key proof");
+        if (mode != 0) Require(image->KeyProof().generation == pinGeneration, "K1 refresh (9): something was stamped between the pin and the stable proof (the case needs the pin's generation)");
+        const auto provedReplaced = proved();
+        expectAdvanced("K1 refresh (9): the refresh after a stable proof replaced the pin left a unit off the generation of the surface's collect");
+        Require(proved() == provedReplaced, "K1 refresh (9): the refresh proof taken over a pin answered after a stable proof replaced the pin");
+        expectProved(true, "K1 refresh (9): the target was not proved after today's refresh took the stable proof");
+        recorder.Sync();
+    }
+    recorder.Sync();
+    // Nothing counted with the switch off; no answer at 2, no verify at 1, no race.
+    const auto end = KeyPinTotals();
+    if (mode == 0) Require(end.target == start.target && end.other == start.other && end.refreshTarget == start.refreshTarget && end.refreshOther == start.refreshOther, "K1 refresh: a pin was taken or counted with the switch off");
+    if (mode == 1) Require(end[KeyPin::KeysVerified] == start[KeyPin::KeysVerified] && end[KeyPin::RefreshVerified] == start[KeyPin::RefreshVerified], "K1 refresh 1: a pin was verified");
+    if (mode == 2) Require(end[KeyPin::KeyAnswer] == start[KeyPin::KeyAnswer] && end[KeyPin::RefreshHit] == start[KeyPin::RefreshHit], "K1 refresh 2: a pin answered");
+    Require(end[KeyPin::Raced] == start[KeyPin::Raced], "K1 refresh: a pinned prediction was overtaken in a single-threaded test");
+    std::cout << "Pinned refresh proofs (APS5_EXPERIMENT_KEY_PIN=" << mode << "): passed\n";
+    return true;
+}
+
 
 void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
@@ -11612,6 +12130,17 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): both pinned key proof
+        // suites, for the switch's rows; skipped (77) when either could not test (no write watching,
+        // or no watched host import for the refresh suite).
+        if (argc == 2 && std::string_view(argv[1]) == "--key-pin-only") {
+            const bool keys = keyPinProofTests(device, recorder);
+            if (!refreshKeyPinTests(device, recorder) || !keys) {
+                std::cout << "skipped, the device watches no memory or imports no watched host memory for the pinned key proofs\n";
+                return 77;
+            }
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
@@ -11893,9 +12422,11 @@ int main(int argc, char** argv) {
         unchangedSinceTests();
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
+        keyPinProofTests(device, recorder);
         targetKeyProofTests(device, recorder);
         refreshProofTests(device, recorder);
         refreshProofUnitTests(device, recorder);
+        refreshKeyPinTests(device, recorder);
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);

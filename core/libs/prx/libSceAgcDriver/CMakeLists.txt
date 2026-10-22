@@ -1564,6 +1564,24 @@ if(BUILD_TESTING)
         set_tests_properties(agc_storage_refresh_proof agc_storage_refresh_proof_units1 agc_storage_refresh_proof_units2 agc_storage_refresh_proof_units1_no_pretest PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): the pinned key proofs and the
+    # refresh proofs over them, with the switch off, on, verified (=2: every pin that holds hands its
+    # key read and its refresh to today's path, which must agree), verified beside P1's verify, and
+    # the refresh proof suites with pins on.
+    add_test(NAME agc_storage_key_pin COMMAND agc_driver_recorder_tests --key-pin-only)
+    add_test(NAME agc_storage_key_pin1 COMMAND agc_driver_recorder_tests --key-pin-only)
+    add_test(NAME agc_storage_key_pin2 COMMAND agc_driver_recorder_tests --key-pin-only)
+    add_test(NAME agc_storage_key_pin2_units2 COMMAND agc_driver_recorder_tests --key-pin-only)
+    add_test(NAME agc_storage_refresh_proof_keypin1 COMMAND agc_driver_recorder_tests --refresh-proof-only)
+    set_tests_properties(agc_storage_key_pin agc_storage_key_pin1 agc_storage_key_pin2 agc_storage_key_pin2_units2 agc_storage_refresh_proof_keypin1 PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_storage_key_pin1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_KEY_PIN=1")
+    set_tests_properties(agc_storage_key_pin2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_KEY_PIN=2")
+    set_tests_properties(agc_storage_key_pin2_units2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_KEY_PIN=2;APS5_EXPERIMENT_PROOF_UNITS=2")
+    set_tests_properties(agc_storage_refresh_proof_keypin1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_KEY_PIN=1")
+    if(WIN32)
+        set_tests_properties(agc_storage_key_pin agc_storage_key_pin1 agc_storage_key_pin2 agc_storage_key_pin2_units2 agc_storage_refresh_proof_keypin1 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_storage_integer_clear COMMAND agc_driver_recorder_tests --integer-clear-only)
     set_tests_properties(agc_storage_integer_clear PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
@@ -2449,6 +2467,16 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): the first-write key stores and
+    # their pending reads (tests/execution/DccKeysFirstWrite.cpp) with pins on and verified.
+    add_test(NAME agc_driver_dcc_keys_first_write_key_pin1 COMMAND agc_driver_dcc_keys_first_write_tests)
+    add_test(NAME agc_driver_dcc_keys_first_write_key_pin2 COMMAND agc_driver_dcc_keys_first_write_tests)
+    set_tests_properties(agc_driver_dcc_keys_first_write_key_pin1 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_KEY_PIN=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_dcc_keys_first_write_key_pin2 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_KEY_PIN=2" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_dcc_keys_first_write_key_pin1 agc_driver_dcc_keys_first_write_key_pin2 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_guarded_direct_root COMMAND agc_driver_guarded_null_pointer_tests --direct-root-only)
     set_tests_properties(agc_driver_guarded_direct_root PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -3122,7 +3150,12 @@ if(BUILD_TESTING)
             # predicted hit runs today's refresh, which must agree, and every unit scan is checked
             # against the loop over every unit) and on.
             "proof_units|APS5_EXPERIMENT_PROOF_UNITS=2"
-            "proof_units_on|APS5_EXPERIMENT_PROOF_UNITS=1")
+            "proof_units_on|APS5_EXPERIMENT_PROOF_UNITS=1"
+            # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.3, K1): pinned DCC key proofs, verified (=2: every pin
+            # that holds hands its key read and its refresh to today's path, which must agree) and on,
+            # each with P1 on as the play arms run them.
+            "key_pin|APS5_EXPERIMENT_KEY_PIN=2,APS5_EXPERIMENT_PROOF_UNITS=1"
+            "key_pin_on|APS5_EXPERIMENT_KEY_PIN=1,APS5_EXPERIMENT_PROOF_UNITS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

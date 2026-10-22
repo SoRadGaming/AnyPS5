@@ -128,9 +128,11 @@ thread_local bool inTargetLookup = false;
 // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): why refreshProved did not answer (b), and
 // why a refresh that reached the unchanged exit took no proof (c), per caller (0 a target lookup,
 // 1 any other), with each "other pending" case split by StorageTexture::otherPendingReason; per
-// 10 s on the [proofs] line (reportStorageTraffic), counted only while profiling.
-enum ProofFailure : std::size_t { FailNoProof, FailMoved, FailCollect, FailKeyProof, FailStamped, FailOtherPending, ProofFailureCount };
-constexpr std::array<const char*, ProofFailureCount> ProofFailureNames{"no proof", "generation/keys moved or no GPU lock", "collect 0", "key proof moved", "stamped", "other pending"};
+// 10 s on the [proofs] line (reportStorageTraffic), counted only while profiling. FailKeyPin (LOCAL
+// EXPERIMENT, APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): a pinned key proof refused the
+// refresh (checked after the stamps, before the other pending images; its reason is on K1's part).
+enum ProofFailure : std::size_t { FailNoProof, FailMoved, FailCollect, FailKeyProof, FailStamped, FailOtherPending, FailKeyPin, ProofFailureCount };
+constexpr std::array<const char*, ProofFailureCount> ProofFailureNames{"no proof", "generation/keys moved or no GPU lock", "collect 0", "key proof moved", "stamped", "other pending", "key pin"};
 enum ProofRefusal : std::size_t { RefuseLayersBehind, RefuseAliased, RefuseGeneration, RefuseNoLock, RefuseKeyProofEmpty, RefuseKeyProofKeys, RefuseOtherPending, ProofRefusalCount };
 constexpr std::array<const char*, ProofRefusalCount> ProofRefusalNames{"layers behind", "aliased", "generation 0", "no GPU lock", "key proof empty (K1)", "key proof keys", "other pending"};
 constexpr std::size_t OtherPendingCount = static_cast<std::size_t>(StorageTexture::OtherPending::Count);
@@ -228,6 +230,38 @@ void reportProofs() {
             line += text;
             reported[i] = now;
         }
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): K1's counts while its switch is
+    // set, as 10 s deltas per caller (target lookups/other callers). Refusals per refresh and per key
+    // read apart: a refresh refused for C1-C5 is counted once in each, its slow path reading the keys
+    // through the same pin.
+    if (const int pins = KeyPins(); pins != 0) {
+        static KeyPinCounts reported{};
+        const auto now = KeyPinTotals();
+        const auto add = [&](const char* separator, KeyPin kind, bool refreshes) {
+            const auto i = static_cast<std::size_t>(kind);
+            const auto target = refreshes ? now.refreshTarget[i] - reported.refreshTarget[i] : now.target[i] - reported.target[i];
+            const auto other = refreshes ? now.refreshOther[i] - reported.refreshOther[i] : now.other[i] - reported.other[i];
+            std::snprintf(text, sizeof(text), "%s %s %llu/%llu", separator, KeyPinName(kind), static_cast<unsigned long long>(target), static_cast<unsigned long long>(other));
+            line += text;
+        };
+        std::snprintf(text, sizeof(text), "; K1 (APS5_EXPERIMENT_KEY_PIN=%d):", pins);
+        line += text;
+        add("", KeyPin::Taken, false);
+        add(",", KeyPin::FillNotPinned, false);
+        add(";", KeyPin::KeyAnswer, false);
+        add(";", KeyPin::RefreshHit, false);
+        line += "; refreshes refused:";
+        add("", KeyPin::Unlocked, true);
+        for (const auto kind : {KeyPin::NotPending, KeyPin::MemoMoved, KeyPin::Shadowed, KeyPin::NotNewest, KeyPin::DepthPlane, KeyPin::FilledKeys, KeyPin::Scoped, KeyPin::HandOver}) add(",", kind, true);
+        line += "; key reads refused:";
+        add("", KeyPin::Unlocked, false);
+        for (const auto kind : {KeyPin::NotPending, KeyPin::MemoMoved, KeyPin::Shadowed, KeyPin::NotNewest}) add(",", kind, false);
+        line += "; =2:";
+        add("", KeyPin::KeysVerified, false);
+        add(",", KeyPin::RefreshVerified, false);
+        add(",", KeyPin::Raced, false);
+        reported = now;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[proofs] storage refresh proofs per 10 s (target lookups/other callers): %s\n", line.c_str());
 }
@@ -2177,7 +2211,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved(profile)) {
+    if (refreshProved(profile, scoped)) {
         layerBehind.clear();
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
@@ -2191,6 +2225,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (unitProofPredicted) {
         unitProofPredicted = false;
         witness = {true, false, false, generation, keyProof.generation, KeyWaitCounts().synced};
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN=2, GPU-OWNED-PLAN 9.3, K1): refreshProved found a pinned
+    // key proof holding and handed the refresh to today's path below, which must agree
+    // (verifyKeyPinRefresh, with P1's difference and captures).
+    KeyPinWitness keyPinWitness;
+    if (keyPinPredicted) {
+        keyPinPredicted = false;
+        keyPinWitness = {true, keyProof.pinNote, keyProof.generation, KeyWaitCounts().synced, generation, filledKeys};
     }
     refreshProof = {};
     struct Exempt {
@@ -2209,7 +2251,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = scoped ? std::shared_ptr<StorageTexture>{} : pendingAlias();
-    if (witness.predicted) witness.aliasSeen = alias != nullptr;
+    if (witness.predicted || keyPinWitness.predicted) witness.aliasSeen = alias != nullptr;
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
@@ -2231,7 +2273,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1): the depth planes FlushPending stores
     // first, stored here instead with the same range, so the check learns whether any were
     // (FlushPending's own call then finds none stale).
-    if (witness.predicted && !handOverKeys.has_value()) witness.depthStored = !FlushDepthPlanes(scopeBegin, scopeBytes).empty();
+    if ((witness.predicted || keyPinWitness.predicted) && !handOverKeys.has_value()) witness.depthStored = !FlushDepthPlanes(scopeBegin, scopeBytes).empty();
     const bool flushed = !handOverKeys.has_value() && FlushPending(scopeBegin, scopeBytes, alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
@@ -2404,10 +2446,11 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (outsideChanged) return "layers outside the scope changed";
         return upload ? "the refresh reached the upload path" : nullptr;
     };
-    if (witness.predicted) {
+    if (witness.predicted || keyPinWitness.predicted) {
         bool structural = false;
         const auto* why = unitProofDifference(!unchanged, structural);
-        verifyUnitProof(witness, why, structural);
+        if (witness.predicted) verifyUnitProof(witness, why, structural);
+        if (keyPinWitness.predicted) verifyKeyPinRefresh(keyPinWitness, why, structural);
     }
     if (unchanged) {
         ++Profile().storageReused;
@@ -2590,7 +2633,11 @@ void StorageTexture::TargetLookupScope::Leave(bool previous) {
     inTargetLookup = previous;
 }
 
-bool StorageTexture::refreshProved(bool profile) {
+bool InTargetLookup() {
+    return inTargetLookup;
+}
+
+bool StorageTexture::refreshProved(bool profile, bool scoped) {
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): each refusal names its reason on the
     // [proofs] line.
     const auto fail = [&](ProofFailure failure) {
@@ -2602,16 +2649,65 @@ bool StorageTexture::refreshProved(bool profile) {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return fail(FailCollect);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1): the surface's collect is kept for a pinned
+    // hit's generation advance below.
+    const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, bytes);
+    if (current == 0) return fail(FailCollect);
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return fail(FailKeyProof);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1): a proof taken over a pin also needs the key
+        // proof still a pin (RefreshProof::keyPinned).
+        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || (refreshProof.keyPinned && keyProof.pinNote == 0)) return fail(FailKeyProof);
         if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return fail(FailCollect);
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
     if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return fail(FailStamped);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): the key proof is a pin (the
+    // keys read Uncompressed from the pending-store memo, not from bytes), which answers a refresh
+    // only where today's path would end at its unchanged exit having done nothing else: an unscoped
+    // refresh (C9: the exit's advance below covers every layer), no hand-over lists for it to clear
+    // (C10), no stale depth plane over the surface for FlushPending to store (C7), no filled clear
+    // keys for ProvedKeys to reset (C8), and today's key read still taking the memo's note (C1-C5).
+    // A refusal is counted as a refresh's (today's path then reads the keys through the same pin and
+    // counts a C1-C5 refusal again, as a key read's).
+    const bool pinned = descriptor.dccAddress != 0 && keyProof.pinNote != 0;
+    if (pinned) {
+        auto refusal = KeyPin::Holds;
+        if (scoped) refusal = KeyPin::Scoped;
+        else if (!handedOver.empty() || !handedUnits.empty()) refusal = KeyPin::HandOver;
+        else if (DepthPlanesStaleOver(descriptor.baseAddress, bytes)) refusal = KeyPin::DepthPlane;
+        else if (IsDccClear(filledKeys) && !anyLayerPending()) refusal = KeyPin::FilledKeys;
+        else refusal = DccKeyPinRefusal(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256), keyProof.pinNote);
+        if (refusal != KeyPin::Holds) {
+            CountKeyPin(refusal, inTargetLookup, true);
+            return fail(FailKeyPin);
+        }
+    }
     const auto serial = PendingSerial();
+    // Both answering exits. LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1; APS5_EXPERIMENT_KEY_PIN=2,
+    // K1): a unit-checked or pinned hit under its verify mode is handed to today's path, which
+    // refresh() checks against it. LOCAL EXPERIMENT (K1): a pinned hit does what today's path does
+    // in that state at its unchanged exit, the generation advance: every layer to the surface's
+    // collect (a reading of the same clock as today's, earlier only by the checks between them),
+    // then the proof follows the new generation (its pending serial is set as by the plain exits).
+    const auto answer = [&](bool unitChecked) {
+        const bool unitPredicted = unitChecked && ProofUnits() == 2;
+        const bool pinPredicted = pinned && KeyPins() == 2;
+        if (unitPredicted || pinPredicted) {
+            if (unitPredicted) unitProofPredicted = true;
+            if (pinPredicted) keyPinPredicted = true;
+            return false;
+        }
+        if (unitChecked) countProofUnits(UnitHits);
+        if (pinned) {
+            layerGeneration.assign(trackedLayers, current);
+            refreshGeneration();
+            refreshProof.generation = generation;
+            CountKeyPin(KeyPin::RefreshHit, inTargetLookup);
+        }
+        return true;
+    };
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): a unit-checked proof
     // holds while no other pending image has a pending unit inside the surface or its keys, none
     // is being stored and none is of this surface, checked on every use (markLayersPending on an
@@ -2619,12 +2715,7 @@ bool StorageTexture::refreshProved(bool profile) {
     // path, which refresh() checks against it.
     const auto unitHit = [&] {
         refreshProof.pendingSerial = serial;
-        if (ProofUnits() == 2) {
-            unitProofPredicted = true;
-            return false;
-        }
-        countProofUnits(UnitHits);
-        return true;
+        return answer(true);
     };
     if (refreshProof.unitChecked) {
         const auto reason = otherPendingReason();
@@ -2650,7 +2741,7 @@ bool StorageTexture::refreshProved(bool profile) {
         }
         refreshProof.pendingSerial = serial;
     }
-    return true;
+    return answer(false);
 }
 
 bool StorageTexture::otherPendingInside() const {
@@ -2704,6 +2795,67 @@ void StorageTexture::verifyUnitProof(const UnitProofWitness& witness, const char
     std::abort();
 }
 
+void StorageTexture::verifyKeyPinRefresh(const KeyPinWitness& witness, const char* why, bool structural) const {
+    const auto keyBytes = DccKeyBytes(guestBytes);
+    const bool keysStamped = !GuestMemory::UnchangedSince(descriptor.dccAddress, keyBytes, witness.keyGeneration);
+    static std::atomic<int> reports{0};
+    if (why == nullptr) {
+        // ProvedKeys left the filled keys alone, as C8 found it would: on a path with no structural
+        // difference nothing else writes them (this image's, under the GPU mutex), so a change is a
+        // disagreement whatever was stamped.
+        if (filledKeys != witness.filledKeys) {
+            std::fprintf(stderr, "[key-pin] APS5_EXPERIMENT_KEY_PIN=2: today's refresh of image 0x%llx+0x%llx (keys 0x%llx+0x%zx, pin note %llu) agreed with the pinned key proof but its key read changed the filled keys %s -> %s\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), keyBytes, static_cast<unsigned long long>(witness.pinNote), DccKeysName(witness.filledKeys), DccKeysName(filledKeys));
+            std::fflush(stderr);
+            std::abort();
+        }
+        // Today's key read (ProvedKeys) answered from the same pin: no sync, and the proof kept.
+        const bool synced = KeyWaitCounts().synced != witness.keySyncs;
+        if (keyProof.pinNote == witness.pinNote && keyProof.generation == witness.keyGeneration && !synced) {
+            CountKeyPin(KeyPin::RefreshVerified, inTargetLookup);
+            return;
+        }
+        if (keysStamped) {
+            CountKeyPin(KeyPin::Raced, inTargetLookup);
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[key-pin] image 0x%llx+0x%llx: today's key read took another proof after a store into the keys that landed after the pinned prediction (not a disagreement)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes));
+            return;
+        }
+        std::fprintf(stderr, "[key-pin] APS5_EXPERIMENT_KEY_PIN=2: today's refresh of image 0x%llx+0x%llx (keys 0x%llx+0x%zx) agreed with the pinned key proof but its key read did not (pin note %llu -> %llu, key proof generation %llu -> %llu, key writers synced %s)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), keyBytes, static_cast<unsigned long long>(witness.pinNote), static_cast<unsigned long long>(keyProof.pinNote), static_cast<unsigned long long>(witness.keyGeneration), static_cast<unsigned long long>(keyProof.generation), synced ? "yes" : "no");
+        std::fflush(stderr);
+        std::abort();
+    }
+    // A store into the surface or its keys after the prediction is what the pinned hit would answer
+    // alike (its own checks would refuse it at the next use).
+    if (!structural && (keysStamped || !GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), witness.generation))) {
+        CountKeyPin(KeyPin::Raced, inTargetLookup);
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[key-pin] image 0x%llx+0x%llx: %s after a store that landed after the pinned prediction (not a disagreement)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), why);
+        return;
+    }
+    std::string others;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const auto describe = [&](const StorageTexture* texture, const char* list) {
+            if (texture == this || !(texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) || texture->overlaps(descriptor.dccAddress, keyBytes))) return;
+            char text[160];
+            std::snprintf(text, sizeof(text), " [%s 0x%llx+0x%llx, units", list, static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes));
+            others += text;
+            std::size_t listed = 0;
+            for (std::uint32_t unit = 0; unit < texture->trackedLayers && listed < 32; ++unit) {
+                if (!texture->layerPending[unit]) continue;
+                std::snprintf(text, sizeof(text), " %u", unit);
+                others += text;
+                ++listed;
+            }
+            others += "]";
+        };
+        for (const auto* texture : pending.textures) describe(texture, "pending");
+        for (const auto* texture : pending.flushing) describe(texture, "flushing");
+    }
+    std::fprintf(stderr, "[key-pin] APS5_EXPERIMENT_KEY_PIN=2: today's refresh of image 0x%llx+0x%llx (keys 0x%llx+0x%zx, pin note %llu) disagrees with the pinned refresh proof: %s; other pending images over it:%s\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), keyBytes, static_cast<unsigned long long>(witness.pinNote), why, others.empty() ? " none" : others.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
 StorageTexture::ProofUnitCounts StorageTexture::ProofUnitTotals() {
     const auto load = [](ProofUnitCount kind) { return proofUnitCounts[kind].load(std::memory_order_relaxed); };
     return {load(UnitTaken), load(UnitConverted), load(UnitHits), load(UnitRefusedFlushing), load(UnitRefusedSameRange), load(UnitRefusedInside), load(UnitRefusedKeyRange), load(UnitRefusedDepthPlane), load(UnitVerified), load(UnitKeysOnly), load(UnitRaced), load(UnitScansChecked)};
@@ -2735,7 +2887,7 @@ void StorageTexture::takeRefreshProof(bool aliased, bool profile) {
         unitChecked = true;
         countProofUnits(UnitTaken);
     }
-    refreshProof = {generation, serial, keyProof.generation, uploadedKeys, unitChecked};
+    refreshProof = {generation, serial, keyProof.generation, uploadedKeys, unitChecked, keyProof.pinNote != 0};
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {
