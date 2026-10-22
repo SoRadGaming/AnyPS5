@@ -23,6 +23,9 @@ DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const D
 enum class DepthPlaneScope { Overlapped, Whole };
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope = DepthPlaneScope::Overlapped);
 bool DepthPlanesStale();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1): a stale depth plane may lie over
+// [address, address + bytes), so FlushDepthPlanes over that range may store one.
+bool DepthPlanesStaleOver(std::uint64_t address, std::size_t bytes);
 struct DepthPlaneStoreStatistics {
     std::uint64_t stores = 0;
     std::uint64_t units = 0;

@@ -134,7 +134,7 @@ constexpr std::array<const char*, ProofFailureCount> ProofFailureNames{"no proof
 enum ProofRefusal : std::size_t { RefuseLayersBehind, RefuseAliased, RefuseGeneration, RefuseNoLock, RefuseKeyProofEmpty, RefuseKeyProofKeys, RefuseOtherPending, ProofRefusalCount };
 constexpr std::array<const char*, ProofRefusalCount> ProofRefusalNames{"layers behind", "aliased", "generation 0", "no GPU lock", "key proof empty (K1)", "key proof keys", "other pending"};
 constexpr std::size_t OtherPendingCount = static_cast<std::size_t>(StorageTexture::OtherPending::Count);
-constexpr std::array<const char*, OtherPendingCount> OtherPendingNames{"outside only", "flushing", "same range", "unit inside", "key range only"};
+constexpr std::array<const char*, OtherPendingCount> OtherPendingNames{"outside only", "flushing", "same range", "unit inside", "key range only", "depth plane stale"};
 using CallerCounts = std::array<std::array<std::atomic<std::uint64_t>, OtherPendingCount>, 2>;
 struct ProofCounts {
     std::array<std::array<std::atomic<std::uint64_t>, ProofFailureCount>, 2> failed{};
@@ -181,10 +181,10 @@ int ProofUnits() {
 }
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, P1): StorageTexture::ProofUnitCounts, counted while
-// the switch is set (relaxed, cumulative; the [proofs] line prints 10 s deltas). The four refusals
+// the switch is set (relaxed, cumulative; the [proofs] line prints 10 s deltas). The five refusals
 // follow OtherPending's order from Flushing.
-enum ProofUnitCount : std::size_t { UnitTaken, UnitConverted, UnitHits, UnitRefusedFlushing, UnitRefusedSameRange, UnitRefusedInside, UnitRefusedKeyRange, UnitVerified, UnitKeysOnly, UnitRaced, UnitScansChecked, ProofUnitCountCount };
-constexpr std::array<const char*, ProofUnitCountCount> ProofUnitCountNames{"unit-checked proofs taken", "converted", "hits", "refused per use: flushing", "same range", "unit inside", "key range", "=2: verified", "keys only", "raced", "unit scans checked"};
+enum ProofUnitCount : std::size_t { UnitTaken, UnitConverted, UnitHits, UnitRefusedFlushing, UnitRefusedSameRange, UnitRefusedInside, UnitRefusedKeyRange, UnitRefusedDepthPlane, UnitVerified, UnitKeysOnly, UnitRaced, UnitScansChecked, ProofUnitCountCount };
+constexpr std::array<const char*, ProofUnitCountCount> ProofUnitCountNames{"unit-checked proofs taken", "converted", "hits", "refused per use: flushing", "same range", "unit inside", "key range", "depth plane", "=2: verified", "keys only", "raced", "unit scans checked"};
 constinit std::array<std::atomic<std::uint64_t>, ProofUnitCountCount> proofUnitCounts{};
 
 void countProofUnits(ProofUnitCount kind) {
@@ -2555,6 +2555,10 @@ StorageTexture::OtherPending StorageTexture::otherPendingReason() const {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     const auto keys = descriptor.dccAddress;
     const auto keyBytes = keys != 0 ? DccKeyBytes(guestBytes) : 0;
+    // A refresh's FlushPending first stores the stale depth planes over the surface
+    // (FlushDepthPlanes), which no stamp or PendingSerial shows: while one may lie there, the
+    // proof is left to today's path.
+    if (DepthPlanesStaleOver(base, bytes)) return OtherPending::DepthPlane;
     auto& pending = Pending();
     // Lock-free first, as overlappingPending: no pending image over either range, then none being
     // stored (an image leaves `textures` for `flushing` under the registry mutex, so a clear
@@ -2702,7 +2706,7 @@ void StorageTexture::verifyUnitProof(const UnitProofWitness& witness, const char
 
 StorageTexture::ProofUnitCounts StorageTexture::ProofUnitTotals() {
     const auto load = [](ProofUnitCount kind) { return proofUnitCounts[kind].load(std::memory_order_relaxed); };
-    return {load(UnitTaken), load(UnitConverted), load(UnitHits), load(UnitRefusedFlushing), load(UnitRefusedSameRange), load(UnitRefusedInside), load(UnitRefusedKeyRange), load(UnitVerified), load(UnitKeysOnly), load(UnitRaced), load(UnitScansChecked)};
+    return {load(UnitTaken), load(UnitConverted), load(UnitHits), load(UnitRefusedFlushing), load(UnitRefusedSameRange), load(UnitRefusedInside), load(UnitRefusedKeyRange), load(UnitRefusedDepthPlane), load(UnitVerified), load(UnitKeysOnly), load(UnitRaced), load(UnitScansChecked)};
 }
 
 void StorageTexture::takeRefreshProof(bool aliased, bool profile) {

@@ -2016,6 +2016,11 @@ bool DepthPlanesStale() {
     return planes.begin.load(std::memory_order_acquire) < planes.end.load(std::memory_order_acquire);
 }
 
+bool DepthPlanesStaleOver(std::uint64_t address, std::size_t bytes) {
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    return overlapsStalePlane(address, end);
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope) {
     struct FlushingTag {};
     using Flushing = HostThreadSlot<bool, FlushingTag>;

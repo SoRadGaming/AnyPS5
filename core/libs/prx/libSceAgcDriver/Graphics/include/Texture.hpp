@@ -402,8 +402,10 @@ public:
     // first of: one a FlushPending is storing right now (Flushing), one of exactly this surface
     // (SameRange: pendingAlias's candidates), one with a pending unit inside the surface (Inside:
     // FlushPending's own pretest) or inside the keys only (KeyRange); else Outside (no pending unit
-    // of theirs inside either range: a refresh's FlushPending would store nothing).
-    enum class OtherPending : std::uint8_t { Outside, Flushing, SameRange, Inside, KeyRange, Count };
+    // of theirs inside either range: a refresh's FlushPending would store nothing). Checked before
+    // all of them, DepthPlane: a stale depth plane may lie over the surface, which FlushPending's
+    // FlushDepthPlanes would store (a plane goes stale without a stamp or a PendingSerial move).
+    enum class OtherPending : std::uint8_t { Outside, Flushing, SameRange, Inside, KeyRange, DepthPlane, Count };
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): cumulative counts,
     // kept while the switch is set: unit-checked refresh proofs taken at the unchanged exit and
     // converted from a plain proof (refreshProved), refreshes they answered, their per-use refusals
@@ -418,6 +420,7 @@ public:
         std::uint64_t refusedSameRange = 0;
         std::uint64_t refusedInside = 0;
         std::uint64_t refusedKeyRange = 0;
+        std::uint64_t refusedDepthPlane = 0;
         std::uint64_t verified = 0;
         std::uint64_t keysOnly = 0;
         std::uint64_t raced = 0;
