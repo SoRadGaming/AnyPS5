@@ -326,6 +326,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Screenshot.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawTicket.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TargetLease.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleTarget.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetLayout.cpp
@@ -720,12 +721,17 @@ if(BUILD_TESTING)
     add_test(NAME agc_write_tracking_host_write_count COMMAND agc_write_tracking_tests --host-write-count)
     set_tests_properties(agc_write_tracking_host_write_count PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
         ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_Q0_RECEIPTS=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_LAZY_GENERATION=1")
+    # LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): the collect memo key a target lease holds, with the epoch
+    # coverage on (the full run checks it stays zero without): it moves with the epoch, an unwatch
+    # and an allocation change, each alone.
+    add_test(NAME agc_write_tracking_collect_memo_key COMMAND agc_write_tracking_tests --collect-memo-key)
+    set_tests_properties(agc_write_tracking_collect_memo_key PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1580,6 +1586,18 @@ if(BUILD_TESTING)
     set_tests_properties(agc_storage_refresh_proof_keypin1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_KEY_PIN=1")
     if(WIN32)
         set_tests_properties(agc_storage_key_pin agc_storage_key_pin1 agc_storage_key_pin2 agc_storage_key_pin2_units2 agc_storage_refresh_proof_keypin1 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's
+    # surface size and key memos, without a device, with the switch off, on and verified (=2: every
+    # hit computed too).
+    add_test(NAME agc_storage_target_memos COMMAND agc_driver_recorder_tests --target-memos-only)
+    add_test(NAME agc_storage_target_memos1 COMMAND agc_driver_recorder_tests --target-memos-only)
+    add_test(NAME agc_storage_target_memos2 COMMAND agc_driver_recorder_tests --target-memos-only)
+    set_tests_properties(agc_storage_target_memos1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_MEMOS=1")
+    set_tests_properties(agc_storage_target_memos2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_MEMOS=2")
+    if(WIN32)
+        set_tests_properties(agc_storage_target_memos agc_storage_target_memos1 agc_storage_target_memos2 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_storage_integer_clear COMMAND agc_driver_recorder_tests --integer-clear-only)
@@ -2477,6 +2495,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_dcc_keys_first_write_key_pin1 agc_driver_dcc_keys_first_write_key_pin2 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS=2, GPU-OWNED-PLAN 9.4.2 D4-A): fast-cleared linear
+    # and tiled targets drawn through the slot loop's resident lookups with every memo hit verified.
+    add_test(NAME agc_driver_cmask_fast_clear_target_memos2 COMMAND agc_driver_cmask_fast_clear_tests)
+    set_tests_properties(agc_driver_cmask_fast_clear_target_memos2 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_TARGET_MEMOS=2" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_cmask_fast_clear_target_memos2 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_guarded_direct_root COMMAND agc_driver_guarded_null_pointer_tests --direct-root-only)
     set_tests_properties(agc_driver_guarded_direct_root PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -3155,7 +3181,15 @@ if(BUILD_TESTING)
             # that holds hands its key read and its refresh to today's path, which must agree) and on,
             # each with P1 on as the play arms run them.
             "key_pin|APS5_EXPERIMENT_KEY_PIN=2,APS5_EXPERIMENT_PROOF_UNITS=1"
-            "key_pin_on|APS5_EXPERIMENT_KEY_PIN=1,APS5_EXPERIMENT_PROOF_UNITS=1")
+            "key_pin_on|APS5_EXPERIMENT_KEY_PIN=1,APS5_EXPERIMENT_PROOF_UNITS=1"
+            # LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter counting (profiling, with
+            # the epoch coverage that gives the committer's lookups a collect memo key); it changes no draw.
+            "target_lease_counter|APS5_PROFILE_DRAW=1,APS5_DEBUG_COVERAGE=1"
+            # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's surface size and key memos
+            # verified (=2: every hit computed too, a difference fatal) and on; their own cases are in
+            # agc_storage_target_memos*.
+            "target_memos|APS5_EXPERIMENT_TARGET_MEMOS=2"
+            "target_memos_on|APS5_EXPERIMENT_TARGET_MEMOS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

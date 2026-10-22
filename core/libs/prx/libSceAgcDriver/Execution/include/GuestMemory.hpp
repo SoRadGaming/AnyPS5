@@ -181,6 +181,20 @@ std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): what the calling thread's memoized
+// collects are keyed on now: its collect epoch, UnwatchSerial and the guest allocation generation. A
+// range a collect walked under one key answers from the epoch coverage while the key holds. All zero
+// (not Valid) unless the memo is on, per thread (not APS5_SHARED_COLLECT_MEMO), keeps its epoch
+// coverage (APS5_DEBUG_COVERAGE=1), and the thread has bumped its epoch: the thread's slot is read,
+// never the fresh epoch an unbumped thread's collect takes.
+struct CollectMemoKey {
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t mapping = 0;
+    bool Valid() const { return epoch != 0; }
+    bool operator==(const CollectMemoKey&) const = default;
+};
+CollectMemoKey CurrentCollectMemoKey();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it; under
 // APS5_EXPERIMENT_LAZY_GENERATION a collect bumps it only when it stamps): a stamp taken after
