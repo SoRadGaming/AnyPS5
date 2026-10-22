@@ -204,6 +204,9 @@ public:
     std::vector<VkRect2D> UnitRects(const std::vector<bool>& units) const;
     bool BlockUnits() const { return blockUnits; }
     std::uint32_t TrackedUnits() const { return trackedLayers; }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1; tests): the write generation
+    // a tracked unit's guest bytes were last known to match the image at.
+    std::uint64_t LayerGeneration(std::uint32_t unit) const { return layerGeneration.at(unit); }
     void MarkSliceDirty(std::uint32_t slice, std::uint32_t count = 1);
     void Flush();
     bool Dirty() const;
@@ -541,7 +544,9 @@ private:
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
     // `profile`: LookupOutcomes::Profiled(), for the [proofs] line's reasons (LOCAL DEBUG, L2-0).
-    bool refreshProved(bool profile);
+    // `scoped`: the refresh covers only some tracked layers (refresh()'s own test; LOCAL EXPERIMENT,
+    // APS5_EXPERIMENT_KEY_PIN, K1: a pinned key proof answers unscoped refreshes only).
+    bool refreshProved(bool profile, bool scoped);
     void takeRefreshProof(bool aliased, bool profile);
     bool otherPendingOverlaps() const;
     OtherPending otherPendingReason() const;
@@ -565,6 +570,19 @@ private:
         std::uint64_t keySyncs = 0;
     };
     void verifyUnitProof(const UnitProofWitness& witness, const char* why, bool structural) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN=2, GPU-OWNED-PLAN 9.3, K1): what refresh() saw when it
+    // took over a refresh refreshProved would have answered from a pinned key proof (the pin's note,
+    // the key proof's generation, WaitForKeyWriters' syncs and the image's generation then), and the
+    // check of today's path against it, with the difference P1's check names (`why`, `structural`;
+    // the depth-plane and alias captures are shared with UnitProofWitness). Agreeing, today's key
+    // read must have kept the pin as it was with no sync, unless the keys were stamped since (raced);
+    // a structural difference aborts, another one counts as raced after a store into the surface or
+    // its keys and aborts otherwise.
+    struct KeyPinWitness {
+        bool predicted = false;
+        std::uint64_t pinNote = 0, keyGeneration = 0, keySyncs = 0, generation = 0;
+    };
+    void verifyKeyPinRefresh(const KeyPinWitness& witness, const char* why, bool structural) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -707,6 +725,10 @@ private:
     // holding and left the refresh to today's path, which refresh() checks against it. Written under
     // GuestMemory::GpuMutex only, as refreshProof is.
     bool unitProofPredicted = false;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN=2, K1): refreshProved found a pinned key proof holding
+    // and left the refresh to today's path, which refresh() checks against it (verifyKeyPinRefresh).
+    // GuestMemory::GpuMutex only, as refreshProof is.
+    mutable bool keyPinPredicted = false;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;

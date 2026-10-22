@@ -6,6 +6,7 @@
 #endif
 #include <vulkan/vulkan.h>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -70,6 +71,11 @@ DccKeys TextureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
 struct DccKeyProof {
     DccKeys keys = DccKeys::Uncompressed;
     std::uint64_t generation = 0;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): nonzero for a pinned proof,
+    // whose keys are Uncompressed by construction: the note of the driver's own pending key store
+    // that today's key read answers from (the pending-store memo, not the bytes). It answers only
+    // while every use finds that still so (DccKeyPinRefusal). Never set while the switch is unset.
+    std::uint64_t pinNote = 0;
 };
 // TextureClearKeys with the scan skipped while the key range is unchanged since `proof` was taken
 // (CollectWrites over the keys, then UnchangedSince its generation), so a surface's keys are scanned
@@ -81,6 +87,45 @@ struct DccKeyProof {
 // APS5_NO_KEY_FAST_PATH=1 scans on every call and stores nothing.
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof);
 bool KeyFastPath();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): pinned key proofs. While the
+// driver's own "uncompressed" key store over a surface's keys is pending, today's key read answers
+// Uncompressed from the pending-store memo without reading the bytes, so its scan is never kept
+// (and a refresh proof is refused: "key proof empty"). A pin keeps that answer as the proof, taken
+// by ProvedClearKeys after such a scan, and it answers only while today's read would still take the
+// memo's note branch (C1-C5): the GPU mutex held with a recorder active (C1); a write of that
+// recorder pending over the keys (C2); the memo's recorder that one, and its first entry with a note
+// covering the keys holding the pinned note and Uncompressed (C3); no unit shadow over the keys
+// (C4); the pinned note the newest writer of the keys (C5). Every use also needs today's
+// UnchangedSince over the keys first (C6), and a refresh answered from a pinned proof C7-C10
+// (StorageTexture::refreshProved). Unset or 0: today's code (no pin is taken; [dcc]'s pinnable
+// count under APS5_PROFILE_DRAW only). 1: on. 2: verify: pins are taken and kept, but every answer
+// comes from today's path, which must agree; a disagreement aborts with a [key-pin] line.
+int KeyPins();
+// Why a pin does not answer (Holds: it does; Unlocked .. NotNewest: C1, C2, C3, C4, C5; DepthPlane ..
+// HandOver: a refresh's C7, C8, C9, C10), and the counted events: pins taken, memoized scans whose
+// memo entry holds fill keys other than Uncompressed (not pinned), key reads and refreshes answered,
+// =2's verified key reads and refreshes, and verifies overtaken by a change after the prediction.
+enum class KeyPin : std::uint8_t { Holds, Unlocked, NotPending, MemoMoved, Shadowed, NotNewest, DepthPlane, FilledKeys, Scoped, HandOver, Taken, FillNotPinned, KeyAnswer, RefreshHit, KeysVerified, RefreshVerified, Raced, Count };
+// C1-C5 for the pin `pinNote` over the `count` keys at `dcc`, cheapest and most selective first;
+// Holds or the first that fails. No side effect (the memo is read, never cleared).
+KeyPin DccKeyPinRefusal(std::uint64_t dcc, std::size_t count, std::uint64_t pinNote);
+// The note a pin over the keys would hold now: that of the memo's first entry with a note covering
+// them, when its keys are Uncompressed and C1-C5 hold for it; else 0.
+std::uint64_t DccKeyPinNote(std::uint64_t dcc, std::size_t count);
+// Cumulative counts per caller (a committer target lookup, InTargetLookup, or another), kept while
+// the switch is set (relaxed; the [proofs] line prints 10 s deltas).
+void CountKeyPin(KeyPin kind, bool targetLookup);
+struct KeyPinCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(KeyPin::Count)> target{};
+    std::array<std::uint64_t, static_cast<std::size_t>(KeyPin::Count)> other{};
+    std::uint64_t operator[](KeyPin kind) const { return target[static_cast<std::size_t>(kind)] + other[static_cast<std::size_t>(kind)]; }
+};
+KeyPinCounts KeyPinTotals();
+const char* KeyPinName(KeyPin kind);
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): whether this thread's refreshes are a
+// committer target lookup's (StorageTexture::TargetLookupScope, set only while profiling; defined
+// in Texture.cpp).
+bool InTargetLookup();
 // Cumulative outcomes of ProvedClearKeys: calls answered by a proof, scans made, and scans not kept.
 struct DccKeyProofCounts {
     std::uint64_t proved;

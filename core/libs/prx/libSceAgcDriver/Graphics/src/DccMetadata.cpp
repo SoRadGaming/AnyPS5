@@ -89,6 +89,9 @@ struct ScanProfile {
     std::atomic<std::uint64_t> unstableUncollected{0};
     std::atomic<std::uint64_t> unstableMemoized{0};
     std::atomic<std::uint64_t> unstablePending{0};
+    // LOCAL DEBUG (GPU-OWNED-PLAN 9.3, K1): memoized scans of uncompressed keys a pin could hold
+    // (DccKeyPinNote would answer), at every APS5_EXPERIMENT_KEY_PIN value: K1's population.
+    std::atomic<std::uint64_t> unstablePinnable{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -130,7 +133,7 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     // LOCAL DEBUG (GPU-OWNED-PLAN L2-0): the unstable split and WaitForKeyWriters' totals
     // (cumulative, as the rest of the line).
     const auto waits = KeyWaitCounts();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable (%llu uncollected, %llu memoized, %llu pending write unsignaled); key waits: %llu calls, %llu no pending, %llu known, %llu fills leave uncompressed, %llu synced\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(profile.unstableUncollected.load()), static_cast<unsigned long long>(profile.unstableMemoized.load()), static_cast<unsigned long long>(profile.unstablePending.load()), static_cast<unsigned long long>(waits.calls), static_cast<unsigned long long>(waits.noPending), static_cast<unsigned long long>(waits.known), static_cast<unsigned long long>(waits.fillsUncompressed), static_cast<unsigned long long>(waits.synced));
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable (%llu uncollected, %llu memoized (%llu pinnable), %llu pending write unsignaled); key waits: %llu calls, %llu no pending, %llu known, %llu fills leave uncompressed, %llu synced\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(profile.unstableUncollected.load()), static_cast<unsigned long long>(profile.unstableMemoized.load()), static_cast<unsigned long long>(profile.unstablePinnable.load()), static_cast<unsigned long long>(profile.unstablePending.load()), static_cast<unsigned long long>(waits.calls), static_cast<unsigned long long>(waits.noPending), static_cast<unsigned long long>(waits.known), static_cast<unsigned long long>(waits.fillsUncompressed), static_cast<unsigned long long>(waits.synced));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -345,6 +348,8 @@ LandedKeys KeysAfterPendingWrites(const Recorder& recorder, std::uint64_t begin,
     return landed;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): keyPinCheck copies the note
+// branch below and its callers' guards; a change here must be made there too.
 std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin, std::size_t count) {
     const auto end = begin + count;
     std::uint64_t note = 0;
@@ -716,6 +721,132 @@ bool KeyFastPath() {
     return enabled;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): see DccMetadata.hpp.
+int KeyPins() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_KEY_PIN");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+namespace {
+
+constexpr std::size_t KeyPinKinds = static_cast<std::size_t>(KeyPin::Count);
+// K1's counts: [kind] for committer target lookups, [KeyPinKinds + kind] for other callers.
+constinit std::array<std::atomic<std::uint64_t>, 2 * KeyPinKinds> keyPinCounts{};
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1): the pin conditions C1-C5 over [begin, begin +
+// count), cheapest and most selective first: C1, C3 (under the memo mutex), C2, C4, then C5
+// (NewestWriteNote scans every open and in-flight write). They copy the guards of today's two key
+// reads (currentDccKeys, WaitForKeyWriters) and PendingStoreKeys' note branch, which then answer the
+// memo entry's keys with no sync, no publish and no byte read: ANY CHANGE TO PendingStoreKeys,
+// MemoRecorder, MemoizedKeys, currentDccKeys, WaitForKeyWriters OR textureClearKeys MUST BE MIRRORED
+// HERE (GPU-OWNED-PLAN 9.6). memo.recorder is read directly, without MemoRecorder's clear: a recorder
+// change refuses here as it leaves today's read no entry. `pinNote` nonzero checks that pin (the
+// entry must still hold it, with Uncompressed); 0 asks for the pin a take would hold: the first
+// covering note entry's note, returned through `pinNote`, with FillNotPinned in place of Holds when
+// that entry's keys are not Uncompressed.
+KeyPin keyPinCheck(std::uint64_t begin, std::size_t count, std::uint64_t& pinNote) {
+    if (count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return KeyPin::Unlocked;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return KeyPin::Unlocked;
+    const auto end = begin + count;
+    DccKeys keys = DccKeys::Mixed;
+    {
+        auto& memo = Memo();
+        std::lock_guard lock(memo.mutex);
+        if (memo.recorder != recorder) return KeyPin::MemoMoved;
+        std::uint64_t note = 0;
+        for (const auto& store : memo.entries) {
+            if (store.note == 0 || store.begin > begin || store.end < end) continue;
+            note = store.note;
+            keys = store.keys;
+            break;
+        }
+        if (note == 0 || (pinNote != 0 && (note != pinNote || keys != DccKeys::Uncompressed))) return KeyPin::MemoMoved;
+        pinNote = note;
+    }
+    if (!recorder->PendingWriteOverlaps(begin, count)) return KeyPin::NotPending;
+    if (AnyShadowedOverlaps(begin, count)) return KeyPin::Shadowed;
+    if (recorder->NewestWriteNote(begin, count) != pinNote) return KeyPin::NotNewest;
+    return keys == DccKeys::Uncompressed ? KeyPin::Holds : KeyPin::FillNotPinned;
+}
+
+}
+
+KeyPin DccKeyPinRefusal(std::uint64_t dcc, std::size_t count, std::uint64_t pinNote) {
+    if (pinNote == 0) return KeyPin::MemoMoved;
+    return keyPinCheck(dcc, count, pinNote);
+}
+
+std::uint64_t DccKeyPinNote(std::uint64_t dcc, std::size_t count) {
+    std::uint64_t note = 0;
+    return keyPinCheck(dcc, count, note) == KeyPin::Holds ? note : 0;
+}
+
+void CountKeyPin(KeyPin kind, bool targetLookup) {
+    keyPinCounts[(targetLookup ? 0 : KeyPinKinds) + static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+KeyPinCounts KeyPinTotals() {
+    KeyPinCounts totals;
+    for (std::size_t i = 0; i < KeyPinKinds; ++i) {
+        totals.target[i] = keyPinCounts[i].load(std::memory_order_relaxed);
+        totals.other[i] = keyPinCounts[KeyPinKinds + i].load(std::memory_order_relaxed);
+    }
+    return totals;
+}
+
+const char* KeyPinName(KeyPin kind) {
+    switch (kind) {
+        case KeyPin::Holds: return "holds";
+        case KeyPin::Unlocked: return "unlocked";
+        case KeyPin::NotPending: return "not pending";
+        case KeyPin::MemoMoved: return "memo moved";
+        case KeyPin::Shadowed: return "shadowed";
+        case KeyPin::NotNewest: return "not newest";
+        case KeyPin::DepthPlane: return "depth plane";
+        case KeyPin::FilledKeys: return "filled keys";
+        case KeyPin::Scoped: return "scoped";
+        case KeyPin::HandOver: return "hand-over";
+        case KeyPin::Taken: return "pins taken";
+        case KeyPin::FillNotPinned: return "fill keys not pinned";
+        case KeyPin::KeyAnswer: return "key answers";
+        case KeyPin::RefreshHit: return "refresh hits";
+        case KeyPin::KeysVerified: return "keys verified";
+        case KeyPin::RefreshVerified: return "refreshes verified";
+        case KeyPin::Raced: return "raced";
+        case KeyPin::Count: break;
+    }
+    return "?";
+}
+
+namespace {
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN=2, K1): today's scan of keys whose pin held at this use
+// must answer as the pin did: from the memo, Uncompressed, with no key writer synced (the GPU mutex
+// is held, so no other thread syncs one meanwhile). Otherwise either the pin no longer holds (the
+// state moved between the check and the scan: raced) or it disagrees with today's read, which aborts.
+void verifyKeyPin(std::uint64_t dcc, std::size_t count, std::uint64_t pinNote, DccKeys keys, bool memoized, std::uint64_t syncs) {
+    const auto synced = KeyWaitCounts().synced;
+    if (memoized && keys == DccKeys::Uncompressed && synced == syncs) {
+        CountKeyPin(KeyPin::KeysVerified, InTargetLookup());
+        return;
+    }
+    if (DccKeyPinRefusal(dcc, count, pinNote) != KeyPin::Holds) {
+        CountKeyPin(KeyPin::Raced, InTargetLookup());
+        return;
+    }
+    std::fprintf(stderr, "[key-pin] APS5_EXPERIMENT_KEY_PIN=2: today's key read of 0x%llx+0x%zx answered %s (memoized %d, key writers synced %llu -> %llu) where the pin (note %llu) answered uncompressed\n", static_cast<unsigned long long>(dcc), count, DccKeysName(keys), memoized ? 1 : 0, static_cast<unsigned long long>(syncs), static_cast<unsigned long long>(synced), static_cast<unsigned long long>(pinNote));
+    std::fflush(stderr);
+    std::abort();
+}
+
+}
+
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof) {
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
     auto& counters = Proofs();
@@ -727,11 +858,30 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
     // The collect precedes the scan: a write landing between them is stamped above `collected`, so
     // the proof it would invalidate is never taken as current.
     const auto collected = count == 0 ? 0 : GuestMemory::CollectWrites(resource.dccAddress, count);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN=2, GPU-OWNED-PLAN 9.3, K1): a pin held at this use and
+    // the scan below runs anyway, checked against it (verifyKeyPin); the proof is kept as at 1.
+    bool predicted = false;
     if (proof.generation != 0 && collected != 0 && GuestMemory::UnchangedSince(resource.dccAddress, count, proof.generation)) {
-        counters.proved.fetch_add(1, std::memory_order_relaxed);
-        return proof.keys;
+        if (proof.pinNote == 0) {
+            counters.proved.fetch_add(1, std::memory_order_relaxed);
+            return proof.keys;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1): a pinned proof answers only while today's
+        // read would still answer from the memo's note (C1-C5); a refusal scans as today, which
+        // takes the pin again where it can.
+        const bool targetLookup = InTargetLookup();
+        if (const auto refusal = DccKeyPinRefusal(resource.dccAddress, count, proof.pinNote); refusal != KeyPin::Holds) {
+            CountKeyPin(refusal, targetLookup);
+        } else if (KeyPins() != 2) {
+            counters.proved.fetch_add(1, std::memory_order_relaxed);
+            CountKeyPin(KeyPin::KeyAnswer, targetLookup);
+            return proof.keys;
+        } else {
+            predicted = true;
+        }
     }
     bool memoized = false;
+    const auto syncs = predicted ? KeyWaitCounts().synced : 0;
     const auto keys = textureClearKeys(resource, guestBytes, memoized);
     bool stable = collected != 0 && !memoized;
     if (stable) {
@@ -746,7 +896,25 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
             stable = !Recorder::SnapshotWriteOverlaps(resource.dccAddress, count);
         }
     }
-    proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
+    if (predicted) verifyKeyPin(resource.dccAddress, count, proof.pinNote, keys, memoized, syncs);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1) and LOCAL DEBUG (APS5_PROFILE_DRAW): after a
+    // memoized scan, whether a pin would hold now: the take (1 and 2; a predicted pin is kept as it
+    // is) and [dcc]'s pinnable count (every switch value). Only a scan that answered Uncompressed is
+    // pinned: textureClearKeys returns that answer unchanged whatever the format.
+    const int pins = KeyPins();
+    KeyPin pinState = KeyPin::Count;
+    std::uint64_t pinNote = 0;
+    if (!stable && collected != 0 && memoized && ((pins != 0 && !predicted) || ScanProfileEnabled())) pinState = keyPinCheck(resource.dccAddress, count, pinNote);
+    const bool pinnable = pinState == KeyPin::Holds && keys == DccKeys::Uncompressed;
+    if (!predicted) {
+        proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
+        if (pins != 0 && pinnable) {
+            proof = DccKeyProof{DccKeys::Uncompressed, collected, pinNote};
+            CountKeyPin(KeyPin::Taken, InTargetLookup());
+        } else if (pins != 0 && pinState == KeyPin::FillNotPinned) {
+            CountKeyPin(KeyPin::FillNotPinned, InTargetLookup());
+        }
+    }
     counters.scanned.fetch_add(1, std::memory_order_relaxed);
     if (!stable) {
         counters.unstable.fetch_add(1, std::memory_order_relaxed);
@@ -754,6 +922,7 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
         if (ScanProfileEnabled()) {
             auto& scans = Scans();
             (collected == 0 ? scans.unstableUncollected : memoized ? scans.unstableMemoized : scans.unstablePending).fetch_add(1, std::memory_order_relaxed);
+            if (pinnable) scans.unstablePinnable.fetch_add(1, std::memory_order_relaxed);
         }
     }
     return keys;
