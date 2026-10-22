@@ -111,7 +111,7 @@ static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan enc
 static_assert(sizeof(DescriptorSource) == 192, "DescriptorSource changed: update the plan encoder");
 static_assert(sizeof(TableColumn) == 112, "TableColumn changed: update the plan encoder");
 static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
-static_assert(sizeof(ResourceBlock) == 80, "ResourceBlock changed: update the plan encoder");
+static_assert(sizeof(ResourceBlock) == 104, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
 static_assert(sizeof(UniformFill) == 28, "UniformFill changed: update the plan encoder");
 static_assert(sizeof(UniformFillPlan) == 64, "UniformFillPlan changed: update the plan encoder");
@@ -151,7 +151,7 @@ static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the pl
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
 static_assert(fieldCount<TableColumn>() == 18, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
-static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
+static_assert(fieldCount<ResourceBlock>() == 5, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
 static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the plan encoder");
 static_assert(fieldCount<UniformFillPlan>() == 2, "UniformFillPlan changed: update the plan encoder");
@@ -1102,6 +1102,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Values(std::span<const std::uint32_t>(block.successors));
         out.Values(std::span<const std::uint32_t>(block.sources));
         out.Values(std::span<const std::uint32_t>(block.images));
+        out.Values(std::span<const std::uint32_t>(block.flatSlots));
     });
     writer.Values(std::span<const std::uint32_t>(plan.materializationSources));
     writer.List(plan.srtReads, [&](Writer& out, const SrtRead& read) {
@@ -1259,11 +1260,12 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.selection);
         source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
     });
-    reader.List(plan.controlFlow, 28, [&](Reader& in, ResourceBlock& block) {
+    reader.List(plan.controlFlow, 36, [&](Reader& in, ResourceBlock& block) {
         block.condition = valueAt(in.Get<std::uint32_t>());
         in.Values(block.successors);
         in.Values(block.sources);
         in.Values(block.images);
+        in.Values(block.flatSlots);
     });
     reader.Values(plan.materializationSources);
     reader.List(plan.srtReads, 8, [&](Reader& in, SrtRead& read) {
@@ -1297,7 +1299,8 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         return (block.condition == nullptr || block.successors.size() == 2u) &&
                std::ranges::all_of(block.successors, [&](std::uint32_t successor) { return successor < plan.controlFlow.size(); }) &&
                std::ranges::all_of(block.sources, knownSource) &&
-               std::ranges::all_of(block.images, [&](std::uint32_t image) { return image < plan.info.images.size(); });
+               std::ranges::all_of(block.images, [&](std::uint32_t image) { return image < plan.info.images.size(); }) &&
+               std::ranges::all_of(block.flatSlots, [&](std::uint32_t slot) { return slot < plan.srtReads.size(); });
     });
     if (!blocksValid) return false;
     ResourceMaterializer::CompactPlan(plan);
@@ -1666,6 +1669,11 @@ private:
         const auto stamp = directory / "last-used";
         std::ofstream(stamp, std::ios::binary | std::ios::trunc).close();
         std::filesystem::last_write_time(stamp, std::filesystem::file_time_type::clock::now(), error);
+#ifdef _WIN32
+        auto nativeRoot = root;
+        nativeRoot.make_preferred();
+        if (nativeRoot.native().starts_with(L"\\\\?\\") || nativeRoot.native().starts_with(L"\\\\.\\")) return;
+#endif
         const auto now = std::filesystem::file_time_type::clock::now();
         for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
             const auto name = it->path().filename().string();

@@ -848,18 +848,33 @@ constexpr std::size_t WritePagesPerBlock = WriteBlockBytes / WritePageBytes;
 
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 
-constexpr std::array<std::byte, WritePageBytes> ZeroPage{};
+std::uint64_t HashPage(const std::byte* page) {
+    constexpr std::uint64_t prime1 = 0x9E3779B185EBCA87ull;
+    constexpr std::uint64_t prime2 = 0xC2B2AE3D27D4EB4Full;
+    constexpr std::uint64_t prime3 = 0x165667B19E3779F9ull;
+    constexpr std::uint64_t prime4 = 0x85EBCA77C2B2AE63ull;
+    const auto round = [](std::uint64_t accumulator, std::uint64_t word) { return std::rotl(accumulator + word * prime2, 31) * prime1; };
+    std::array<std::uint64_t, 4> lanes{prime1 + prime2, prime2, 0, 0 - prime1};
+    for (std::size_t offset = 0; offset < WritePageBytes; offset += 4 * sizeof(std::uint64_t)) {
+        std::array<std::uint64_t, 4> words;
+        std::memcpy(words.data(), page + offset, sizeof(words));
+        for (std::size_t lane = 0; lane < 4; ++lane) lanes[lane] = round(lanes[lane], words[lane]);
+    }
+    std::uint64_t hash = std::rotl(lanes[0], 1) + std::rotl(lanes[1], 7) + std::rotl(lanes[2], 12) + std::rotl(lanes[3], 18);
+    for (const auto lane : lanes) hash = (hash ^ round(0, lane)) * prime1 + prime4;
+    hash ^= hash >> 33;
+    hash *= prime2;
+    hash ^= hash >> 29;
+    hash *= prime3;
+    return hash ^ (hash >> 32);
+}
 
 struct WindowCopy {
-    static constexpr std::uint32_t Zero = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t first;
-    std::span<const std::byte> bytes;
-    std::span<const std::uint32_t> slots;
+    std::span<const std::uint64_t> hashes;
 
     bool Holds(std::uintptr_t page) const {
-        const auto slot = slots[(page - first) / WritePageBytes];
-        const auto* expected = slot == Zero ? ZeroPage.data() : bytes.data() + static_cast<std::size_t>(slot) * WritePageBytes;
-        return std::memcmp(reinterpret_cast<const void*>(page), expected, WritePageBytes) == 0;
+        return HashPage(reinterpret_cast<const std::byte*>(page)) == hashes[(page - first) / WritePageBytes];
     }
 };
 
@@ -908,6 +923,7 @@ struct WriteTracker {
         std::uintptr_t end = 0;
         std::uint64_t epoch = 0;
         std::uint64_t unwatched = 0;
+        std::uint64_t mapping = 0;
     };
     std::array<Memo, 256> memo{};
     std::size_t nextMemo = 0;
@@ -1475,10 +1491,13 @@ std::uint32_t walkNoteDepth() {
 }
 
 // Epoch coverage (APS5_DEBUG_COVERAGE=1, local experiment): the merged page ranges this thread walked in
-// its current epoch under one unwatch serial. A collect inside them is served like a memo hit.
+// its current epoch under one unwatch serial and one guest allocation generation (the memos' key since
+// main's c19dcecfe: an allocation change expires what was collected before it). A collect inside them
+// is served like a memo hit.
 struct EpochCoverage {
     std::uint64_t epoch = 0;
     std::uint64_t serial = 0;
+    std::uint64_t mapping = 0;
     std::map<std::uintptr_t, std::uintptr_t> ranges;
 };
 EpochCoverage& epochCoverage() {
@@ -1489,20 +1508,21 @@ bool epochCoverageEnabled() {
     static const bool enabled = std::getenv("APS5_DEBUG_COVERAGE") != nullptr;
     return enabled;
 }
-bool epochCovers(std::uint64_t epoch, std::uint64_t serial, std::uintptr_t first, std::uintptr_t stop) {
+bool epochCovers(std::uint64_t epoch, std::uint64_t serial, std::uint64_t mapping, std::uintptr_t first, std::uintptr_t stop) {
     auto& coverage = epochCoverage();
-    if (coverage.epoch != epoch || coverage.serial != serial || coverage.ranges.empty()) return false;
+    if (coverage.epoch != epoch || coverage.serial != serial || coverage.mapping != mapping || coverage.ranges.empty()) return false;
     auto it = coverage.ranges.upper_bound(first);
     if (it == coverage.ranges.begin()) return false;
     --it;
     return it->first <= first && stop <= it->second;
 }
-void coverEpoch(std::uint64_t epoch, std::uint64_t serial, std::uintptr_t first, std::uintptr_t stop) {
+void coverEpoch(std::uint64_t epoch, std::uint64_t serial, std::uint64_t mapping, std::uintptr_t first, std::uintptr_t stop) {
     auto& coverage = epochCoverage();
-    if (coverage.epoch != epoch || coverage.serial != serial) {
+    if (coverage.epoch != epoch || coverage.serial != serial || coverage.mapping != mapping) {
         coverage.ranges.clear();
         coverage.epoch = epoch;
         coverage.serial = serial;
+        coverage.mapping = mapping;
     }
     auto it = coverage.ranges.upper_bound(first);
     if (it != coverage.ranges.begin() && std::prev(it)->second >= first) --it;
@@ -1516,7 +1536,8 @@ void coverEpoch(std::uint64_t epoch, std::uint64_t serial, std::uintptr_t first,
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN 1.7): walk receipts. A thread's
 // role (none, owner, follower) with the token it holds it for and the epoch it took for that token;
-// the ring's slot of a token holds the merged page ranges walked under it and one UnwatchSerial.
+// the ring's slot of a token holds the merged page ranges walked under it, one UnwatchSerial and one
+// guest allocation generation (as the collect memos since main's c19dcecfe).
 constexpr std::uint8_t ReceiptNone = 0;
 constexpr std::uint8_t ReceiptOwner = 1;
 constexpr std::uint8_t ReceiptFollower = 2;
@@ -1532,6 +1553,7 @@ ReceiptRole& receiptRole() {
 struct ReceiptSlot {
     std::uint64_t token = 0;
     std::uint64_t serial = 0;
+    std::uint64_t mapping = 0;
     std::map<std::uintptr_t, std::uintptr_t> ranges;
 };
 struct ReceiptRing {
@@ -1560,27 +1582,29 @@ void rangesInsert(std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr
     ranges.emplace(first, stop);
 }
 // Under the ring's mutex. A slot belongs to one token until a newer one takes it, and holds one
-// serial (a newer serial drops what an older one covered); a walk for an older token or under an
-// older serial is dropped.
-bool publishLocked(ReceiptRing& ring, std::uint64_t token, std::uint64_t serial, std::uintptr_t first, std::uintptr_t stop) {
+// serial and one allocation generation (a newer one of either drops what the older pair covered); a
+// walk for an older token, or under an older serial or generation, is dropped.
+bool publishLocked(ReceiptRing& ring, std::uint64_t token, std::uint64_t serial, std::uint64_t mapping, std::uintptr_t first, std::uintptr_t stop) {
     auto& slot = ring.slots[token % ring.slots.size()];
     if (slot.token > token) return false;
     if (slot.token < token) {
         slot.token = token;
         slot.serial = serial;
+        slot.mapping = mapping;
         slot.ranges.clear();
     }
-    if (slot.serial > serial) return false;
-    if (slot.serial < serial) {
+    if (slot.serial > serial || slot.mapping > mapping) return false;
+    if (slot.serial < serial || slot.mapping < mapping) {
         slot.serial = serial;
+        slot.mapping = mapping;
         slot.ranges.clear();
     }
     rangesInsert(slot.ranges, first, stop);
     return true;
 }
-bool receiptCovers(const ReceiptRing& ring, std::uint64_t token, std::uint64_t serial, std::uintptr_t first, std::uintptr_t stop) {
+bool receiptCovers(const ReceiptRing& ring, std::uint64_t token, std::uint64_t serial, std::uint64_t mapping, std::uintptr_t first, std::uintptr_t stop) {
     const auto& slot = ring.slots[token % ring.slots.size()];
-    return slot.token == token && slot.serial == serial && rangesCover(slot.ranges, first, stop);
+    return slot.token == token && slot.serial == serial && slot.mapping == mapping && rangesCover(slot.ranges, first, stop);
 }
 // The end of the run of the merged `ranges` that holds `at`, or `at` when none does.
 std::uintptr_t rangesCoveredUntil(const std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t at) {
@@ -1603,16 +1627,19 @@ std::uintptr_t rangesNextBegin(const std::map<std::uintptr_t, std::uintptr_t>& r
 struct ReceiptNoted {
     std::uint64_t token = 0;
     std::uint64_t serial = 0;
+    std::uint64_t mapping = 0;
     std::uint64_t epoch = 0;
     std::map<std::uintptr_t, std::uintptr_t> ranges;
 };
-ReceiptNoted& receiptNoted(std::uint64_t token, std::uint64_t serial, std::uint64_t epoch) {
+// Keyed on the allocation generation too: a newer one changes the key as a newer serial does.
+ReceiptNoted& receiptNoted(std::uint64_t token, std::uint64_t serial, std::uint64_t mapping, std::uint64_t epoch) {
     struct Tag {};
     auto& noted = ThreadScratch<ReceiptNoted, Tag>();
-    if (noted.token != token || noted.serial != serial || noted.epoch != epoch) {
+    if (noted.token != token || noted.serial != serial || noted.mapping != mapping || noted.epoch != epoch) {
         noted.ranges.clear();
         noted.token = token;
         noted.serial = serial;
+        noted.mapping = mapping;
         noted.epoch = epoch;
     }
     return noted;
@@ -1653,7 +1680,7 @@ ReceiptCounters& receiptCounters() {
 // The committer's consult: a follower's collect whose own memos missed. Hit (served, or counted
 // only under =2) or the reason it was not.
 enum class ReceiptAnswer : std::uint8_t { None, Hit, Miss };
-ReceiptAnswer consultReceipt(std::uint64_t epoch, std::uint64_t serial, std::uintptr_t first, std::uintptr_t stop) {
+ReceiptAnswer consultReceipt(std::uint64_t epoch, std::uint64_t serial, std::uint64_t mapping, std::uintptr_t first, std::uintptr_t stop) {
     const auto& role = receiptRole();
     if (role.kind != ReceiptFollower) return ReceiptAnswer::None;
     const bool counted = Q0PrepStats() != 0;
@@ -1669,7 +1696,8 @@ ReceiptAnswer consultReceipt(std::uint64_t epoch, std::uint64_t serial, std::uin
     if (!lock.owns_lock()) return miss(ReceiptMiss::Busy);
     const auto& slot = ring.slots[role.token % ring.slots.size()];
     if (slot.token != role.token) return miss(ReceiptMiss::Token);
-    if (slot.serial != serial) return miss(ReceiptMiss::Serial);
+    // An allocation generation that moved is counted with the serial misses (its own key part).
+    if (slot.serial != serial || slot.mapping != mapping) return miss(ReceiptMiss::Serial);
     if (!rangesCover(slot.ranges, first, stop)) return miss(ReceiptMiss::Uncovered);
     return ReceiptAnswer::Hit;
 }
@@ -1680,15 +1708,17 @@ struct ReceiptPublication {
     bool due = false;
     std::uint64_t epoch = 0;
     std::uint64_t serial = 0;
+    std::uint64_t mapping = 0;
     std::uintptr_t first = 0;
     std::uintptr_t stop = 0;
     ReceiptPublication() = default;
     ReceiptPublication(const ReceiptPublication&) = delete;
     ReceiptPublication& operator=(const ReceiptPublication&) = delete;
-    void Set(std::uint64_t walkEpoch, std::uint64_t walkSerial, std::uintptr_t walkFirst, std::uintptr_t walkStop) {
+    void Set(std::uint64_t walkEpoch, std::uint64_t walkSerial, std::uint64_t walkMapping, std::uintptr_t walkFirst, std::uintptr_t walkStop) {
         due = true;
         epoch = walkEpoch;
         serial = walkSerial;
+        mapping = walkMapping;
         first = walkFirst;
         stop = walkStop;
     }
@@ -1700,7 +1730,7 @@ struct ReceiptPublication {
         std::unique_lock lock(ring.mutex, std::try_to_lock);
         if (!lock.owns_lock()) return;
         try {
-            if (publishLocked(ring, role.token, serial, first, stop) && Q0PrepStats() != 0) receiptCounters().committerPublished.fetch_add(1, std::memory_order_relaxed);
+            if (publishLocked(ring, role.token, serial, mapping, first, stop) && Q0PrepStats() != 0) receiptCounters().committerPublished.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception&) {
         }
     }
@@ -1757,11 +1787,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // must not differ between them.
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
-        if (epochCoverageEnabled() && epochCovers(epoch, unwatched, first, stop)) {
+        if (epochCoverageEnabled() && epochCovers(epoch, unwatched, mapping, first, stop)) {
             noteCollectMemoHit();
             if (missStatsEnabled()) ++threadMissStats().memoHits;
             // Acquire (here and on the two memo hits below): a caller that collects first and then
@@ -1772,14 +1803,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
-            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+            if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
                 noteCollectMemoHit();
                 if (missStatsEnabled()) ++threadMissStats().memoHits;
                 return tracker.generation.load(std::memory_order_acquire);
             }
         }
         for (const auto& entry : threadCollectMemo().entries) {
-            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
+            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
@@ -1796,7 +1827,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // above). Before the miss statistics and the tracker lock, so the two locks never nest; under
     // =2 it only counts and walks.
     bool receiptWouldHit = false;
-    if (useMemo && !sharedCollectMemo() && Q0Receipts() != 0 && consultReceipt(epoch, unwatched, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop)) == ReceiptAnswer::Hit) {
+    if (useMemo && !sharedCollectMemo() && Q0Receipts() != 0 && consultReceipt(epoch, unwatched, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop)) == ReceiptAnswer::Hit) {
         if (Q0PrepStats() != 0) {
             auto& counters = receiptCounters();
             if (Q0Receipts() == 1) {
@@ -1808,7 +1839,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
         if (Q0Receipts() == 1) {
-            if (epochCoverageEnabled()) coverEpoch(epoch, unwatched, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+            if (epochCoverageEnabled()) coverEpoch(epoch, unwatched, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
             noteCollectMemoHit();
             if (missStatsEnabled()) ++threadMissStats().memoHits;
 #ifdef _WIN32
@@ -1877,7 +1908,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
-            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.begin <= cursor && stop <= entry.end) {
+            if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
                 noteCollectMemoHit();
                 return tracker.generation;
             }
@@ -1922,17 +1953,17 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
+        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial, mapping};
         else {
             auto& memo = threadCollectMemo();
-            memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial};
+            memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial, mapping};
             // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): a memoized walk of the committer, for
             // queue 0 to skip (published by receiptPublication once the lock is released).
-            if (useMemo && Q0Receipts() != 0 && receiptPublishEnabled() && serial == unwatched && !SpeculativeReader() && receiptRole().kind == ReceiptFollower) receiptPublication.Set(epoch, serial, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
-            if (epochCoverageEnabled()) coverEpoch(epoch, serial, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+            if (useMemo && Q0Receipts() != 0 && receiptPublishEnabled() && serial == unwatched && !SpeculativeReader() && receiptRole().kind == ReceiptFollower) receiptPublication.Set(epoch, serial, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+            if (epochCoverageEnabled()) coverEpoch(epoch, serial, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
             if (epochCollectMapEnabled()) {
                 auto& entry = epochCollectMap(epoch).ranges[first];
-                if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
+                if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
             }
         }
     }
@@ -2021,16 +2052,16 @@ bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget
     bool finished = true;
     // A ring insert that fails (allocation) only loses that receipt. True when the ring now holds the
     // range or refused it for good (its slot holds a newer serial): queue 0 notes it either way.
-    const auto publish = [&](std::uint64_t serial, std::uint64_t first, std::uint64_t end, bool own) {
+    const auto publish = [&](std::uint64_t serial, std::uint64_t mapping, std::uint64_t first, std::uint64_t end, bool own) {
         ++ringLocks;
         std::lock_guard lock(ring.mutex);
         try {
-            if (own && receiptCovers(ring, token, serial, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(end))) {
+            if (own && receiptCovers(ring, token, serial, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(end))) {
                 ++ringCovered;
                 return true;
             }
             if (own) ++ownCovered;
-            if (publishLocked(ring, token, serial, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(end))) ++published;
+            if (publishLocked(ring, token, serial, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(end))) ++published;
             return true;
         } catch (const std::exception&) {
             return false;
@@ -2043,22 +2074,25 @@ bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget
         } catch (const std::exception&) {
         }
     };
-    // This thread's epoch coverage under `serial` (what it walked in this epoch), or none.
-    const auto ownRanges = [&](std::uint64_t serial) -> const std::map<std::uintptr_t, std::uintptr_t>* {
+    // This thread's epoch coverage under `serial` and `mapping` (what it walked in this epoch), or none.
+    const auto ownRanges = [&](std::uint64_t serial, std::uint64_t mapping) -> const std::map<std::uintptr_t, std::uintptr_t>* {
         if (!epochCoverageEnabled()) return nullptr;
         const auto& coverage = epochCoverage();
-        return coverage.epoch == epoch && coverage.serial == serial ? &coverage.ranges : nullptr;
+        return coverage.epoch == epoch && coverage.serial == serial && coverage.mapping == mapping ? &coverage.ranges : nullptr;
     };
     bool abandoned = false;
     while (finished && !abandoned && !walks.Done()) {
         const auto [begin, end] = walks.ranges[walks.next];
         auto cursor = std::max(walks.cursor, begin);
-        // [cursor, walkUntil) is what the last skip tests (under walkSerial) left to walk: its chunks
-        // are walked without asking the ring again.
-        std::uint64_t walkUntil = 0, walkSerial = 0;
+        // [cursor, walkUntil) is what the last skip tests (under walkSerial and walkMapping) left to
+        // walk: its chunks are walked without asking the ring again.
+        std::uint64_t walkUntil = 0, walkSerial = 0, walkMapping = 0;
         while (cursor < end) {
             const auto serialNow = unwatchSerial.load(std::memory_order_acquire);
-            auto& noted = receiptNoted(token, serialNow, epoch);
+            // Read before the walk, as collectWrites does: a generation that moves during it leaves
+            // the walk under the older key, which no later lookup matches.
+            const auto mappingNow = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            auto& noted = receiptNoted(token, serialNow, mappingNow, epoch);
             // Published or seen in the ring by this thread under this token, serial and epoch: the
             // ring still has it. Skipped with no lock, before the budget (there is nothing to walk).
             if (const auto notedEnd = std::min<std::uint64_t>(end, rangesCoveredUntil(noted.ranges, static_cast<std::uintptr_t>(cursor))); notedEnd > cursor) {
@@ -2071,16 +2105,16 @@ bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget
                 finished = false;
                 break;
             }
-            if (cursor >= walkUntil || serialNow != walkSerial) {
+            if (cursor >= walkUntil || serialNow != walkSerial || mappingNow != walkMapping) {
                 // The skip tests, once for the run of the range up to the next noted part, not per chunk.
                 const std::uint64_t spanEnd = rangesNextBegin(noted.ranges, static_cast<std::uintptr_t>(cursor), static_cast<std::uintptr_t>(end));
-                const auto* own = ownRanges(serialNow);
+                const auto* own = ownRanges(serialNow, mappingNow);
                 if (own != nullptr) {
                     if (const auto ownEnd = std::min<std::uint64_t>(spanEnd, rangesCoveredUntil(*own, static_cast<std::uintptr_t>(cursor))); ownEnd > cursor) {
                         // Walked by this thread in this epoch (a receipt walk or one of its own
                         // collects), which began with this token: published unless the ring has it,
                         // in one hold for the whole run (the ring merges it), never walked again.
-                        if (publish(serialNow, cursor, ownEnd, true)) note(noted, cursor, ownEnd);
+                        if (publish(serialNow, mappingNow, cursor, ownEnd, true)) note(noted, cursor, ownEnd);
                         cursor = ownEnd;
                         continue;
                     }
@@ -2095,7 +2129,7 @@ bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget
                     if (lock.owns_lock()) {
                         busy = false;
                         const auto& slot = ring.slots[token % ring.slots.size()];
-                        if (slot.token == token && slot.serial == serialNow) {
+                        if (slot.token == token && slot.serial == serialNow && slot.mapping == mappingNow) {
                             ringEnd = std::min<std::uint64_t>(spanEnd, rangesCoveredUntil(slot.ranges, static_cast<std::uintptr_t>(cursor)));
                             ringNext = rangesNextBegin(slot.ranges, static_cast<std::uintptr_t>(cursor), static_cast<std::uintptr_t>(spanEnd));
                         }
@@ -2111,6 +2145,7 @@ bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget
                 walkUntil = own != nullptr ? static_cast<std::uint64_t>(rangesNextBegin(*own, static_cast<std::uintptr_t>(cursor), static_cast<std::uintptr_t>(ringNext))) : ringNext;
                 if (busy) walkUntil = std::min(walkUntil, (cursor / chunkBytes + 1) * chunkBytes);
                 walkSerial = serialNow;
+                walkMapping = mappingNow;
             }
             const auto chunkEnd = std::min(walkUntil, (cursor / chunkBytes + 1) * chunkBytes);
             const auto walkStart = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2145,8 +2180,8 @@ bool WalkReceipts(std::uint64_t token, ReceiptWalks& walks, std::uint64_t budget
                 // As collectWrites remembers a completed walk (this thread's epoch coverage), then
                 // the receipt; both only when the serial held from before the skip tests on.
                 if (serial == serialNow) {
-                    if (epochCoverageEnabled()) coverEpoch(epoch, serial, static_cast<std::uintptr_t>(cursor), static_cast<std::uintptr_t>(chunkEnd));
-                    if (publish(serial, cursor, chunkEnd, false)) note(noted, cursor, chunkEnd);
+                    if (epochCoverageEnabled()) coverEpoch(epoch, serial, mappingNow, static_cast<std::uintptr_t>(cursor), static_cast<std::uintptr_t>(chunkEnd));
+                    if (publish(serial, mappingNow, cursor, chunkEnd, false)) note(noted, cursor, chunkEnd);
                 }
             }
             cursor = chunkEnd;
@@ -2367,23 +2402,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
             begin = end;
         }
     }
-    std::vector<std::uint32_t> slots(static_cast<std::size_t>((stop - first) / page), WindowCopy::Zero);
-    std::size_t kept = 0;
+    std::vector<std::uint64_t> hashes(static_cast<std::size_t>((stop - first) / page), 0);
     for (const auto& [begin, end] : spans) {
         CheckRange(reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin), 1, false);
         for (auto cursor = begin; cursor < end; cursor += page) {
-            if (std::memcmp(reinterpret_cast<const void*>(cursor), ZeroPage.data(), page) != 0) slots[static_cast<std::size_t>((cursor - first) / page)] = static_cast<std::uint32_t>(kept++);
+            hashes[static_cast<std::size_t>((cursor - first) / page)] = HashPage(reinterpret_cast<const std::byte*>(cursor));
         }
-    }
-    std::vector<std::byte> saved;
-    saved.reserve(kept * page);
-    const auto* source = reinterpret_cast<const std::byte*>(first);
-    for (std::size_t index = 0; index < slots.size(); ++index) {
-        if (slots[index] != WindowCopy::Zero) saved.insert(saved.end(), source + index * page, source + (index + 1) * page);
     }
     std::erase_if(spans, [&](const auto& span) { return !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true); });
     if (!runImport()) return false;
-    const WindowCopy window{first, saved, slots};
+    const WindowCopy window{first, hashes};
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
         if (!walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) continue;
@@ -2629,15 +2657,16 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     tracker.initialize();
     if (!tracker.watched || !tracker.hinted(first, stop)) return 0;
     const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemo.entries.begin(), threadHintMemo.entries.end(), [&](const WriteTracker::Memo& entry) {
-        return entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end;
+        return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
         noteCollectMemoHit();
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
-        if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched};
+        if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched, mapping};
     }
     return tracker.newestHint(first, stop);
 #else

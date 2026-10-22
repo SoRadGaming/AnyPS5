@@ -19,11 +19,19 @@ bool precheckRejections() {
 }
 
 template <typename TRestart, typename TReached>
-DrawPrecheckOutcome precheckState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, std::string& rejected, std::optional<Graphics::ColorMetadataPass>& metadata, TRestart&& primitiveListRestart, TReached&& reached) {
+DrawPrecheckOutcome precheckState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, std::string& rejected, std::optional<Graphics::ColorMetadataPass>& metadata, std::optional<Graphics::DepthCopyPass>& copy, TRestart&& primitiveListRestart, TReached&& reached) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawPrecheckOutcome::Nothing;
     if (auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         metadata = std::move(pass);
+        return DrawPrecheckOutcome::MetadataPass;
+    }
+    // A DB depth copy (main's 191c8a8d2) is the other pass the driver runs in place of the draw: it
+    // shares the MetadataPass outcome (DrawAhead.hpp's enum; draw-ahead treats it the same way, as
+    // neither certain nor compiled ahead), and precheckDraw runs whichever of the two was decoded.
+    if (auto pass = Graphics::DecodeDepthCopyPass(queue)) {
+        require(!drawParameters.indirect, "indirect DB depth copies are unsupported");
+        copy = std::move(pass);
         return DrawPrecheckOutcome::MetadataPass;
     }
     if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawPrecheckOutcome::Nothing;
@@ -74,12 +82,14 @@ bool TraceIndirectDraws() {
 
 DrawPrecheckOutcome PrecheckDrawState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, bool primitiveListRestart, std::string& rejected) {
     std::optional<Graphics::ColorMetadataPass> metadata;
-    return precheckState(queue, drawParameters, rejected, metadata, [&] { return primitiveListRestart; }, [] {});
+    std::optional<Graphics::DepthCopyPass> copy;
+    return precheckState(queue, drawParameters, rejected, metadata, copy, [&] { return primitiveListRestart; }, [] {});
 }
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     std::optional<Graphics::ColorMetadataPass> metadata;
-    const auto outcome = precheckState(queue, drawParameters, rejected, metadata, [&] {
+    std::optional<Graphics::DepthCopyPass> copy;
+    const auto outcome = precheckState(queue, drawParameters, rejected, metadata, copy, [&] {
         const auto restartDevice = device.Load();
         return restartDevice != nullptr && restartDevice->PrimitiveListRestart();
     }, [&] {
@@ -94,7 +104,8 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             if (device == nullptr) device = std::make_shared<VulkanDevice>();
             const std::shared_ptr<VulkanDevice> localDevice = device;
             recordLabelsForPacket(localDevice.get(), submission.queue);
-            localDevice->ColorMetadataPass(*metadata);
+            if (metadata) localDevice->ColorMetadataPass(*metadata);
+            else localDevice->DepthCopyPass(*copy);
             return DrawVerdict::Drawn;
         }
         case DrawPrecheckOutcome::Nothing: return DrawVerdict::Nothing;

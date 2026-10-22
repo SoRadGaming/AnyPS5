@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -683,6 +684,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(state.rectList);
         add(state.topology);
         add(state.cullMode);
+        add(state.polygonMode);
         add(state.blends.size());
         add(context.subgroup.subgroupSize);
         add(context.subgroup.supportedStages);
@@ -837,10 +839,11 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
             for (std::size_t offset = 0; offset + 4 <= words.size(); offset += 4) {
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[offset], words[offset + 1], words[offset + 2], words[offset + 3]}};
                 const auto address = descriptor.Base48();
-                const auto size = descriptor.GetSize();
+                auto size = descriptor.GetSize();
                 if (size == 0 || address == 0) continue;
                 const auto element = offset / 4;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                if (const std::uint64_t stride = descriptor.Stride(); !written && stride != 0 && address < target.address && address + size > target.address && address + size - target.address < stride) size = target.address - address;
                 Require(!overlap(address, size, target.address, target.bytes), "shader buffer aliases the render target");
                 Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
             }
@@ -2313,6 +2316,9 @@ struct RecordedDraw {
     const std::array<std::byte, PipelinePushConstantBytes>* pushBytes = nullptr;
     VkShaderStageFlags pushStages = 0;
     std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
+    std::vector<SampleOrderTarget> reordered;
+    SampleOrderPass reorderPass;
+    std::optional<DepthSampleLocations> depthLocations;
 };
 
 // A remapped viewport depth range reads its scale and offset from the draw's push block (the vertex shader's
@@ -2651,6 +2657,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
+        if (!record.reordered.empty()) {
+            std::vector<std::shared_ptr<void>> kept;
+            RecordSampleOrder(context, commands, record.reorderPass, record.reordered, true, kept);
+            for (auto& object : kept) recorder->Keep(std::move(object));
+        }
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, bound);
     }
@@ -2697,11 +2708,21 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     std::function<void(VkCommandBuffer)> storeProxies;
-    if (!continued && !record.proxies.empty()) {
-        storeProxies = [proxies = record.proxies](VkCommandBuffer passCommands) {
+    if (!continued && (!record.proxies.empty() || !record.reordered.empty() || record.depthLocations)) {
+        storeProxies = [proxies = record.proxies, reordered = record.reordered, reorderPass = record.reorderPass, depthLocations = record.depthLocations, context, recorder](VkCommandBuffer passCommands) {
             for (const auto& proxy : proxies) {
                 proxy->RecordAttachmentProxyStore(passCommands, VK_IMAGE_LAYOUT_GENERAL);
                 Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+            }
+            if (!reordered.empty()) {
+                std::vector<std::shared_ptr<void>> kept;
+                RecordSampleOrder(context, passCommands, reorderPass, reordered, false, kept);
+                for (auto& object : kept) recorder->Keep(std::move(object));
+            }
+            if (depthLocations) {
+                RecordDepthSampleLocations(context, passCommands, *depthLocations);
+                Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+                recorder->Keep(depthLocations->keep);
             }
         };
     }
@@ -2732,6 +2753,14 @@ std::optional<State> maskedState(const State& state, std::uint32_t fragmentOutpu
         masked->blends[index].colorWriteMask = 0;
     }
     return masked;
+}
+
+std::optional<DepthSampleLocations> passDepthLocations(const Context& context, const State& state, const Pipeline& pipeline) {
+    if (!state.depth || state.depth->samples <= 1u || !state.customSampleLocations || !pipeline.SampleLocationsEnabled()) return std::nullopt;
+    auto locations = DepthSurfaceSampleLocations(context, *state.depth);
+    locations.grid = pipeline.HostSampleLocationGrid();
+    locations.locations = SampleLocations(state);
+    return locations;
 }
 
 // Debug aid: APS5_DUMP_TARGETS=<n> saves the first n renders of every color target as a raw file
@@ -2777,7 +2806,7 @@ void verifyRecipeHit(const Context& context, const State& state, const Pm4::Draw
             differ(color.samples > 1 || !(gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)), "the target's residency");
             differ(AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED, "the attachment proxy");
             if (disagreement != nullptr) break;
-            const auto found = CachedStorageSurface(context, color.arrayLastSlice != 0 ? ArraySurfaceForTarget(color) : SurfaceForTarget(color));
+            const auto found = color.arrayLastSlice != 0 ? CachedStorageLayers(context, ArraySurfaceForTarget(color), color.arraySlice, color.layers) : CachedStorageSurface(context, SurfaceForTarget(color));
             differ(found != targets[index], "the resident target");
             differ(found == targets[index] && found->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != recipe.targetViews[index], "the attachment view");
         }
@@ -2866,7 +2895,7 @@ std::shared_ptr<const PreparedDraw> PrepareDraw(const Context& context, const St
 // LOCAL DEBUG (APS5_DEBUG_RECIPE_REFUSALS=1): why a recorded draw builds no recipe, by the first
 // failing term of the build condition, and why queue 0 offers no recipe slot (NoteRecipeSlot).
 // Printed every 10 s as [recipe-refusals].
-enum RecipeRefusal : std::size_t { RefusalNoSlot, RefusalStencilReplay, RefusalProxied, RefusalDisabled, RefusalUncacheable, RefusalWaited, RefusalIndirect, RefusalNotReusable, RefusalMoved, RefusalMultisampled, RefusalBuilt, SlotNoRegisterKey, SlotIndirect, SlotPatched, SlotRecipesOff, SlotNoVariants, SlotOffered, LookupNoEntry, LookupNoRecords, LookupExpired, LookupMismatch, LookupHit, AttachNoEntry, AttachStored, RefusalCount };
+enum RecipeRefusal : std::size_t { RefusalNoSlot, RefusalStencilReplay, RefusalProxied, RefusalDisabled, RefusalUncacheable, RefusalWaited, RefusalIndirect, RefusalNotReusable, RefusalMoved, RefusalMultisampled, RefusalReordered, RefusalBuilt, SlotNoRegisterKey, SlotIndirect, SlotPatched, SlotRecipesOff, SlotNoVariants, SlotOffered, LookupNoEntry, LookupNoRecords, LookupExpired, LookupMismatch, LookupHit, AttachNoEntry, AttachStored, RefusalCount };
 std::atomic<std::uint64_t> recipeRefusals[RefusalCount]{};
 
 bool RecipeRefusalStats() {
@@ -2883,7 +2912,7 @@ void reportRecipeRefusals() {
         return;
     }
     if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
-    static constexpr const char* names[RefusalCount] = {"no-slot", "stencil-replay", "proxied", "disabled", "uncacheable", "waited", "indirect", "not-reusable", "moved", "multisampled", "built", "slot:no-register-key", "slot:indirect", "slot:patched", "slot:recipes-off", "slot:no-variants", "slot:offered", "lookup:no-entry", "lookup:no-records", "lookup:expired", "lookup:mismatch", "lookup:hit", "attach:no-entry", "attach:stored"};
+    static constexpr const char* names[RefusalCount] = {"no-slot", "stencil-replay", "proxied", "disabled", "uncacheable", "waited", "indirect", "not-reusable", "moved", "multisampled", "reordered", "built", "slot:no-register-key", "slot:indirect", "slot:patched", "slot:recipes-off", "slot:no-variants", "slot:offered", "lookup:no-entry", "lookup:no-records", "lookup:expired", "lookup:mismatch", "lookup:hit", "attach:no-entry", "attach:stored"};
     std::string line = "[recipe-refusals] (10 s)";
     for (std::size_t i = 0; i < RefusalCount; ++i) {
         char text[64];
@@ -3099,14 +3128,76 @@ void FillDrawTicketTemplate(DrawTicket& ticket, const Context& context, const St
     }
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDraw* prepared, DrawTicket* ticket) {
-    const bool slotOffered = recipeOut != nullptr;
-    prepared = PreparedDrawFor(prepared, context);
+namespace {
+
+struct TargetBinding {
+    ColorTarget color;
+    bool gpuTiling = false;
+    std::shared_ptr<StorageTexture> resident;
+    bool proxied = false;
+    std::unique_ptr<Buffer> transfer;
+    std::unique_ptr<Buffer> tiled;
+    std::unique_ptr<DeviceBuffer> tiledDevice;
+    std::unique_ptr<DeviceBuffer> linearDevice;
+    std::vector<std::byte> original;
+    TileMipLayout mip{};
+    std::unique_ptr<RenderTarget> target;
+    bool multisampled = false;
+    VkImage multisampleImage = VK_NULL_HANDLE;
+    std::shared_ptr<void> multisampleOwner;
+    std::unique_ptr<Buffer> dump;
+};
+
+struct PreparedDrawState {
+    explicit PreparedDrawState(bool profile) : timer(profile) {}
+    PreparedDrawState(const PreparedDrawState&) = delete;
+    PreparedDrawState& operator=(const PreparedDrawState&) = delete;
+    std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
+    // LOCAL DEBUG (APS5_DEBUG_RECIPE_REFUSALS): whether the caller offered a recipe slot at all.
+    bool slotOffered = false;
+    // The draw-ahead PreparedDraw (Draw.hpp) when it was made for this device (null otherwise).
+    const PreparedDraw* ahead = nullptr;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): the ticket queue 0 prepared for this draw, when
     // it was built for this device and pool (null otherwise, and always without the switch).
-    ticket = TicketFor(ticket, context);
-    const auto stencilUse = TicketPartUse(ticket, DrawTicket::StencilChecked);
+    DrawTicket* ticket = nullptr;
     std::vector<std::uint32_t> stencilReferences;
+    std::optional<PerformanceTimer> timing;
+    DrawTimer timer;
+    DrawOutcome outcome;
+    const ShaderResources::BuildTiming* built = nullptr;
+    double waitedBefore = 0;
+    double ownWaitedMs = 0;
+    DrawInputs inputs;
+    const Pm4::DrawParameters::IndirectDraw* args = nullptr;
+    int dumpLimit = 0;
+    std::vector<TargetBinding> targets;
+    std::vector<VkImageView> targetViews;
+    Recorder* recorder = nullptr;
+    ResolvedResources resolved;
+    IndirectRecord indirect;
+    std::vector<Pm4::DrawArguments> records;
+    bool completion = false;
+    bool listed = false;
+    bool recorded = false;
+    bool lean = false;
+    bool multisampled = false;
+    std::optional<State> masked;
+    std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
+    std::shared_ptr<Pipeline> pipeline;
+    std::vector<std::shared_ptr<StorageTexture>> owners;
+    std::vector<std::shared_ptr<void>> framebufferOwners;
+    std::shared_ptr<Framebuffer> framebuffer;
+    std::vector<SampleOrderTarget> reordered;
+    SampleOrderPass reorderPass;
+    std::optional<DepthSampleLocations> depthLocations;
+};
+
+bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDrawState& prepared) {
+    auto*& recipeOut = prepared.recipeOut;
+    const auto* ahead = prepared.ahead;
+    auto* ticket = prepared.ticket;
+    const auto stencilUse = TicketPartUse(ticket, DrawTicket::StencilChecked);
+    auto& stencilReferences = prepared.stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
             TicketChecks(stencilUse, DrawTicket::StencilChecked, [&] { Require(shader.stage == ShaderRecompiler::ShaderStage::Fragment && stencilReferences.empty(), "stencil replay requires exactly one fragment stage"); });
@@ -3124,58 +3215,35 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     if (state.quadList) recipeOut = nullptr;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
-    PerformanceTimer timing("Graphics.Draw");
+    auto& timing = prepared.timing.emplace("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    DrawTimer timer(profile);
+    auto& timer = prepared.timer;
+    timer = DrawTimer(profile);
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
     // totals must not carry.
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
-    DrawOutcome outcome;
-    const ShaderResources::BuildTiming* built = nullptr;
+    auto& outcome = prepared.outcome;
+    auto& built = prepared.built;
     // The thread's GPU waits so far: the difference at the report, less the draw's own syncs
     // (`ownWaitedMs`, sampled around them), is what this draw waited for through the flush hook
     // (nested in the draw's hold, see DrawOutcome::hookWaitUs).
-    const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
-    double ownWaitedMs = 0;
+    const auto waitedBefore = prepared.waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+    auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared, ticket);
-    if (inputs.nothing) return;
-    const auto* args = draw.indirect ? &*draw.indirect : nullptr;
+    auto& inputs = prepared.inputs;
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, ahead, ticket);
+    if (inputs.nothing) return false;
+    const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
     timing.Mark("validate");
     timing.Mark("index_upload");
-    // One binding per color attachment. Tiled targets are detiled and retiled on the GPU in video memory;
-    // only changed guest blocks are stored back.
-    struct TargetBinding {
-        ColorTarget color;
-        bool gpuTiling = false;
-        // Resident target: the surface's cached storage image is attached directly and marked dirty
-        // afterwards, so nothing is copied in or out per draw.
-        std::shared_ptr<StorageTexture> resident;
-        bool proxied = false;
-        // Linear pixels converted on the CPU, for targets the GPU detiler does not handle.
-        std::unique_ptr<Buffer> transfer;
-        // Guest bytes in host memory, and their device-local copies for the detiler.
-        std::unique_ptr<Buffer> tiled;
-        std::unique_ptr<DeviceBuffer> tiledDevice;
-        std::unique_ptr<DeviceBuffer> linearDevice;
-        std::vector<std::byte> original;
-        TileMipLayout mip{};
-        std::unique_ptr<RenderTarget> target;
-        bool multisampled = false;
-        VkImage multisampleImage = VK_NULL_HANDLE;
-        std::shared_ptr<void> multisampleOwner;
-        // APS5_DUMP_TARGETS: the rendered linear pixels, read back for target_<address>_<n>.raw.
-        std::unique_ptr<Buffer> dump;
-    };
-    const int dumpLimit = DumpTargetLimit();
-    static AgcDriver::Mutex dumpMutex;
-    static std::map<std::uint64_t, int> dumped;
-    std::vector<TargetBinding> targets(state.colors.size());
-    std::vector<VkImageView> targetViews;
+    const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
+    auto& targets = prepared.targets;
+    targets.resize(state.colors.size());
+    auto& targetViews = prepared.targetViews;
     targetViews.reserve(state.colors.size() + 1);
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): each single-sample target's layout and the
     // surface its resident lookup asks for, from the ticket's Targets part (the same closure state).
@@ -3210,7 +3278,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (ticketTarget != nullptr && !sameSurface(surface, ticketTarget->surface)) TicketDisagrees(DrawTicket::Targets, targetsUse, "a color target surface");
             return surface;
         };
-        static_cast<void>(FlushDepthPlanes(color.address, colorLayout.Bytes()));
+        static_cast<void>(FlushDepthPlanes(color.address, colorLayout.Bytes(), DepthPlaneScope::Whole));
         RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
@@ -3235,7 +3303,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                     const auto geometry = DescribeSurface(array);
                     for (std::uint32_t slice = 0; slice <= color.arrayLastSlice; ++slice) Require(geometry.GuestLayerOffset(slice) == slice * sliceBytes, "the array image's layer pitch differs from the color view's slice offset");
                     Require(color.surfaceAddress == color.arrayAddress + color.arraySlice * sliceBytes, "the array image's layer pitch differs from the color view's slice offset");
-                    auto resident = CachedStorageSurface(context, array);
+                    auto resident = CachedStorageLayers(context, array, color.arraySlice, color.layers);
                     Require(resident->Attachable(), "storage format cannot be a color attachment");
                     return resident;
                 }
@@ -3294,9 +3362,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
-    auto* recorder = Recorder::Active();
+    auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared, ticket);
+    auto& resolved = prepared.resolved;
+    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, ahead, ticket);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
@@ -3336,9 +3405,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // and records plain draws with the same per-dimension rules. The import pointer stays valid:
     // refreshImports runs only under GuestMemory::GpuMutex, held here, and a retired import's
     // buffer is kept while the recorder is busy.
-    IndirectRecord indirect;
+    auto& indirect = prepared.indirect;
     indirect.args = args;
-    std::vector<Pm4::DrawArguments> records;
+    auto& records = prepared.records;
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
         const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) {
@@ -3359,7 +3428,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto rangeBytes = args->RangeBytes();
         if (rangeBytes == 0) {
             report(" indirect draw without records");
-            return;
+            return false;
         }
         Require(rangeBytes <= std::numeric_limits<std::size_t>::max(), "indirect draw record range overflow");
         if (!gpuIndirectDraws) indirect.path = IndirectDrawPath::Disabled;
@@ -3380,7 +3449,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (std::none_of(records.begin(), records.end(), [](const Pm4::DrawArguments& record) { return record.count != 0 && record.instances != 0; })) {
                 CountIndirectDraw(indirect.path, indirect.readMs);
                 report(" indirect draw with empty records");
-                return;
+                return false;
             }
         }
     }
@@ -3405,14 +3474,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static const bool syncCompletionDraws = std::getenv("APS5_SYNC_COMPLETION_DRAWS") != nullptr;
     static const bool recorderSyncDraws = std::getenv("APS5_NO_RECORDER_SYNC_DRAWS") == nullptr;
     static const bool recordCopiedDraws = std::getenv("APS5_NO_RECORD_COPIED_DRAWS") == nullptr;
-    const bool completion = resources->NeedsCompletion();
+    const bool completion = prepared.completion = resources->NeedsCompletion();
     const bool copiedWrites = completion && resources->HasCopiedWrites();
     // A lease only forces the wait when deferred release is off.
     const bool lease = resources->HoldsLease() && SyncLeaseWork();
     outcome.completion = completion;
     outcome.recorded = recordable;
     // Whether the copied write-back is listed in DrawCopiedWriters instead of waited for.
-    bool listed = false;
+    auto& listed = prepared.listed;
     if (!recordable) {
         outcome.reason = !recordDraws || dumpLimit != 0 ? SyncDisabled : recorder == nullptr ? SyncNoRecorder : SyncNotResident;
     } else if (completion && (syncCompletionDraws || copiedWrites || lease)) {
@@ -3422,7 +3491,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         else if (recorderSyncDraws) outcome.waited = true;
         else outcome.recorded = false;
     }
-    const bool recorded = outcome.recorded;
+    const bool recorded = prepared.recorded = outcome.recorded;
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
@@ -3431,8 +3500,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
-    const bool lean = recorded && !drawTransitions;
-    const bool multisampled = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; });
+    const bool lean = prepared.lean = recorded && !drawTransitions;
+    const bool multisampled = prepared.multisampled = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; });
     Require(lean || !multisampled, "multisampled draws are only rendered as recorded draws");
     for (const auto& binding : targets) {
         if (binding.multisampled) Require(std::find(resources->MultisampleSources().begin(), resources->MultisampleSources().end(), binding.color.surfaceAddress) == resources->MultisampleSources().end(), "sampling a multisampled color target the draw renders to is not implemented");
@@ -3444,7 +3513,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
-    auto masked = maskedState(state, inputs.fragmentOutputs);
+    auto& masked = prepared.masked;
+    masked = maskedState(state, inputs.fragmentOutputs);
     if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) {
         if (recipeOut != nullptr) noteRecipeRefusal(RefusalProxied);
         recipeOut = nullptr;
@@ -3462,7 +3532,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         const auto built = resources->SetLayouts();
         Require(described.layouts.main == built.main && described.layouts.fragment == built.fragment && described.layouts.split == built.split && std::ranges::equal(described.mainKey, built.mainKey) && std::ranges::equal(described.fragmentKey, built.fragmentKey), "set layouts described from the shaders differ from the draw's");
     }
-    std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
+    auto& stencilReplay = prepared.stencilReplay;
     for (const auto reference : stencilReferences) {
         auto selected = pipelineState;
         selected.stencilReplayReference = reference;
@@ -3485,26 +3555,83 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         for (std::size_t index = 0; index < targets.size() && index < 32; ++index) {
             if (targets[index].proxied) proxiedMask |= 1u << index;
         }
-        const auto verdict = !lean ? TicketEvent::PipelineNotLean : !stencilReplay.empty() ? TicketEvent::PipelineStencil : resources != ticket->resources ? TicketEvent::PipelineOtherTemplate : prepared != ticket->pipelinePrepared ? TicketEvent::PipelineOtherPrepared : proxiedMask != ticket->proxiedMask || targets.size() > 32 ? TicketEvent::PipelineProxies : ticket->pipeline->Layout() == VK_NULL_HANDLE ? TicketEvent::PipelineAbandoned : TicketEvent::PipelineAccepted;
+        const auto verdict = !lean ? TicketEvent::PipelineNotLean : !stencilReplay.empty() ? TicketEvent::PipelineStencil : resources != ticket->resources ? TicketEvent::PipelineOtherTemplate : ahead != ticket->pipelinePrepared ? TicketEvent::PipelineOtherPrepared : proxiedMask != ticket->proxiedMask || targets.size() > 32 ? TicketEvent::PipelineProxies : ticket->pipeline->Layout() == VK_NULL_HANDLE ? TicketEvent::PipelineAbandoned : TicketEvent::PipelineAccepted;
         NoteTicketEvent(verdict);
         if (verdict == TicketEvent::PipelineAccepted) ticketPipeline = ticket->pipeline;
     }
-    auto pipeline = stencilReplay.empty() ? (pipelineUse == TicketUse::Use && ticketPipeline != nullptr ? ticketPipeline : CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) : stencilReplay.front().second;
+    auto& pipeline = prepared.pipeline;
+    pipeline = stencilReplay.empty() ? (pipelineUse == TicketUse::Use && ticketPipeline != nullptr ? ticketPipeline : CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)) : stencilReplay.front().second;
     if (ticketPipeline != nullptr && pipelineUse != TicketUse::Use && pipeline != ticketPipeline) TicketDisagrees(DrawTicket::Pipeline, pipelineUse, "the pipeline");
     if (pipelineUse == TicketUse::Verify && ticketPipeline != nullptr) pipeline = ticketPipeline;
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
-    std::vector<std::shared_ptr<StorageTexture>> owners;
+    auto& owners = prepared.owners;
     owners.reserve(targets.size());
-    std::vector<std::shared_ptr<void>> framebufferOwners;
+    auto& framebufferOwners = prepared.framebufferOwners;
     framebufferOwners.reserve(targets.size());
     for (const auto& binding : targets) {
         owners.push_back(binding.resident);
         framebufferOwners.push_back(binding.multisampled ? binding.multisampleOwner : binding.resident);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    auto& framebuffer = prepared.framebuffer;
+    framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    auto& reordered = prepared.reordered;
+    auto& reorderPass = prepared.reorderPass;
+    if (pipeline->ReordersSamples()) {
+        reorderPass = SampleOrderPassFor(context, pipelineState, pipeline->HostSampleOrder());
+        for (const auto& step : PlanSampleOrder(context, state, pipeline->HostSampleOrder())) {
+            if (step.attachment < targets.size()) reordered.push_back(MultisampleTargetOrderTarget(context, targets[step.attachment].color));
+            else reordered.push_back(DepthSurfaceOrderTarget(context, *state.depth));
+            Require(reordered.back().method == step.method, "a reordered attachment's surface disagrees with the planned way of putting its samples in order");
+        }
+    }
+    prepared.depthLocations = passDepthLocations(context, pipelineState, *pipeline);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
+    return true;
+}
+
+void recordPreparedDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, PreparedDrawState& prepared) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+    static AgcDriver::Mutex dumpMutex;
+    static std::map<std::uint64_t, int> dumped;
+    auto& timing = *prepared.timing;
+    auto& timer = prepared.timer;
+    auto& outcome = prepared.outcome;
+    const auto* built = prepared.built;
+    const auto waitedBefore = prepared.waitedBefore;
+    auto& ownWaitedMs = prepared.ownWaitedMs;
+    const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
+    auto* recipeOut = prepared.recipeOut;
+    const bool slotOffered = prepared.slotOffered;
+    auto* ticket = prepared.ticket;
+    const auto& stencilReferences = prepared.stencilReferences;
+    auto& inputs = prepared.inputs;
+    const auto* args = prepared.args;
+    const int dumpLimit = prepared.dumpLimit;
+    auto& targets = prepared.targets;
+    const auto& targetViews = prepared.targetViews;
+    auto* recorder = prepared.recorder;
+    auto& resolved = prepared.resolved;
+    auto& resources = resolved.resources;
+    const auto& contentKey = resolved.ContentKey();
+    const bool cacheable = resolved.cacheable;
+    auto& indirect = prepared.indirect;
+    const bool completion = prepared.completion;
+    const bool listed = prepared.listed;
+    const bool recorded = prepared.recorded;
+    const bool lean = prepared.lean;
+    const bool multisampled = prepared.multisampled;
+    const auto& masked = prepared.masked;
+    const auto& stencilReplay = prepared.stencilReplay;
+    const auto& pipeline = prepared.pipeline;
+    // A lean draw hands the owners to the recorder (record.targets).
+    auto& owners = prepared.owners;
+    const auto& framebuffer = prepared.framebuffer;
+    const auto& reordered = prepared.reordered;
+    const auto& reorderPass = prepared.reorderPass;
+    const auto& depthLocations = prepared.depthLocations;
     if (lean) {
         RecordedDraw record;
         record.recorder = recorder;
@@ -3529,6 +3656,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.completion = completion;
         record.waited = outcome.waited;
         record.stencilReplay = stencilReplay;
+        record.reordered = reordered;
+        record.reorderPass = reorderPass;
+        record.depthLocations = depthLocations;
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TEMPLATE): the push block queue 0 assembled and
         // patched with the hint's push patches, when the draw binds that template.
         if (const auto pushUse = TicketPartUse(ticket, DrawTicket::Push); pushUse != TicketUse::None) {
@@ -3572,10 +3702,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // read-only buffers moved builds one only under APS5_EXPERIMENT_MOVED_RECIPES, whose hits
         // list their moved buffers again (DrawWithRecipe).
         if (RecipeRefusalStats()) {
-            const auto refusal = recipeOut == nullptr ? (slotOffered ? RefusalCount : RefusalNoSlot) : !DrawRecipes() ? RefusalDisabled : !cacheable ? RefusalUncacheable : outcome.waited ? RefusalWaited : args != nullptr ? RefusalIndirect : !resources->Reusable() ? RefusalNotReusable : !(resolved.moved.empty() || MovedRecipes() != 0) ? RefusalMoved : multisampled ? RefusalMultisampled : RefusalBuilt;
+            const auto refusal = recipeOut == nullptr ? (slotOffered ? RefusalCount : RefusalNoSlot) : !DrawRecipes() ? RefusalDisabled : !cacheable ? RefusalUncacheable : outcome.waited ? RefusalWaited : args != nullptr ? RefusalIndirect : !resources->Reusable() ? RefusalNotReusable : !(resolved.moved.empty() || MovedRecipes() != 0) ? RefusalMoved : multisampled ? RefusalMultisampled : pipeline->ReordersSamples() ? RefusalReordered : RefusalBuilt;
             if (refusal != RefusalCount) noteRecipeRefusal(refusal);
         }
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (resolved.moved.empty() || MovedRecipes() != 0) && !multisampled) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (resolved.moved.empty() || MovedRecipes() != 0) && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -3694,6 +3824,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         context.Resolved(&DeviceFunctions::cmdCopyBufferToImage, "vkCmdCopyBufferToImage")(commands, linear, binding.target->Image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         imageBarrier(context, commands, binding.target->Image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     }
+    std::vector<std::shared_ptr<void>> reorderKept;
+    RecordSampleOrder(context, commands, reorderPass, reordered, true, reorderKept);
     APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
     pipeline->Begin(commands, *framebuffer, state.renderExtent, state);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
@@ -3720,6 +3852,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     if (recorded) recorder->EndPassSamples();
     EndRenderPass(context, commands);
+    RecordSampleOrder(context, commands, reorderPass, reordered, false, reorderKept);
+    if (depthLocations) {
+        RecordDepthSampleLocations(context, commands, *depthLocations);
+        countBarrier(2);
+        reorderKept.push_back(depthLocations->keep);
+    }
+    if (recorded) {
+        for (auto& object : reorderKept) recorder->Keep(std::move(object));
+    }
     APS5_LOG_CHARS_OUT_DEBUG("Render pass ended");
     for (auto& binding : targets) {
         if (binding.proxied) {
@@ -3858,6 +3999,18 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const PreparedDraw* ahead, DrawTicket* ticket) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    PreparedDrawState prepared(profile);
+    prepared.recipeOut = recipeOut;
+    prepared.slotOffered = recipeOut != nullptr;
+    prepared.ahead = PreparedDrawFor(ahead, context);
+    prepared.ticket = TicketFor(ticket, context);
+    if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
+}
+
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
@@ -3908,15 +4061,18 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         const auto& color = state.colors[index];
         const std::size_t colorBytes = movedRecipes != 0 ? ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes() : 0;
         if (movedRecipes != 0 && color.samples <= 1) {
-            static_cast<void>(FlushDepthPlanes(color.address, colorBytes));
+            static_cast<void>(FlushDepthPlanes(color.address, colorBytes, DepthPlaneScope::Whole));
             RetireDepthSurfaces(context.device, color.address, colorBytes);
         }
         timer.phase(PhaseSetup);
         if (movedRecipes != 0 && color.tileMode == ColorTileMode::Linear && ExistingHostImportFor(context, color.address, colorBytes) == nullptr) return miss(DrawRecipeMiss::TargetGone);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, state.colors[index].dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+        // A slice of an array target refreshes every layer the draw attaches (color.layers), as
+        // Draw's CachedStorageLayers lookup does since eb2aae7f8.
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
-            stored->Refresh();
+            if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, state.colors[index].layers);
+            else stored->Refresh();
             return stored;
         });
         timer.phase(PhaseReadTarget);
@@ -3998,6 +4154,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
     record.pushBytes = &recipe.pushBytes;
     record.pushStages = recipe.pushStages;
+    record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
@@ -4019,6 +4176,12 @@ std::shared_ptr<StorageTexture> metadataPassResident(const Context& context, con
     return resident != nullptr && resident->GuestBytes() == color.bytes ? resident : nullptr;
 }
 
+}
+
+void RunDepthCopyPass(const Context& context, const DepthCopyPass& pass) {
+    Require(pass.color.tileMode != ColorTileMode::Linear && context.detiler != nullptr, "DB depth copy into a target without a resident image is not implemented");
+    const auto resident = CachedStorageSurface(context, SurfaceForTarget(pass.color));
+    CopyDepthSample(context, pass.depthAddress, pass.samples, pass.sample, *resident, resident->StorageView(0, false), pass.extent);
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
