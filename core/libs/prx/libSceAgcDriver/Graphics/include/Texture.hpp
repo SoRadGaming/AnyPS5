@@ -572,15 +572,17 @@ private:
     void verifyUnitProof(const UnitProofWitness& witness, const char* why, bool structural) const;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN=2, GPU-OWNED-PLAN 9.3, K1): what refresh() saw when it
     // took over a refresh refreshProved would have answered from a pinned key proof (the pin's note,
-    // the key proof's generation, WaitForKeyWriters' syncs and the image's generation then), and the
-    // check of today's path against it, with the difference P1's check names (`why`, `structural`;
-    // the depth-plane and alias captures are shared with UnitProofWitness). Agreeing, today's key
-    // read must have kept the pin as it was with no sync, unless the keys were stamped since (raced);
-    // a structural difference aborts, another one counts as raced after a store into the surface or
-    // its keys and aborts otherwise.
+    // the key proof's generation, WaitForKeyWriters' syncs, the image's generation and its filled
+    // keys then), and the check of today's path against it, with the difference P1's check names
+    // (`why`, `structural`; the depth-plane and alias captures are shared with UnitProofWitness).
+    // Agreeing, today's ProvedKeys must have left the filled keys as they were (the reset C8
+    // mirrors), and its key read must have kept the pin as it was with no sync, unless the keys were
+    // stamped since (raced); a structural difference aborts, another one counts as raced after a
+    // store into the surface or its keys and aborts otherwise.
     struct KeyPinWitness {
         bool predicted = false;
         std::uint64_t pinNote = 0, keyGeneration = 0, keySyncs = 0, generation = 0;
+        DccKeys filledKeys = DccKeys::Uncompressed;
     };
     void verifyKeyPinRefresh(const KeyPinWitness& witness, const char* why, bool structural) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
@@ -719,6 +721,13 @@ private:
         // its keys, so every use checks that again (otherPendingInside): a unit marked in an image
         // already pending moves no pending serial. Never set while the switch is unset.
         bool unitChecked = false;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): the key proof was a pin
+        // when the proof was taken. A pinned hit moves the layer generations as today's unchanged
+        // exit does and a plain one does not, so once another key read has replaced the pin with a
+        // stable proof at the same generation the proof no longer answers: today took none under
+        // the pin, and its slow path runs once (with the advance) and takes it. Never set while the
+        // switch is unset.
+        bool keyPinned = false;
     };
     RefreshProof refreshProof;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1): refreshProved found a unit-checked proof

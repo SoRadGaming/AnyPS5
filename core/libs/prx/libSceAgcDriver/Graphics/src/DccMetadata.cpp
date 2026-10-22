@@ -735,8 +735,9 @@ int KeyPins() {
 namespace {
 
 constexpr std::size_t KeyPinKinds = static_cast<std::size_t>(KeyPin::Count);
-// K1's counts: [kind] for committer target lookups, [KeyPinKinds + kind] for other callers.
-constinit std::array<std::atomic<std::uint64_t>, 2 * KeyPinKinds> keyPinCounts{};
+// K1's counts: [kind] for committer target lookups, [KeyPinKinds + kind] for other callers, then the
+// same two for the refusals counted by refreshes.
+constinit std::array<std::atomic<std::uint64_t>, 4 * KeyPinKinds> keyPinCounts{};
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1): the pin conditions C1-C5 over [begin, begin +
 // count), cheapest and most selective first: C1, C3 (under the memo mutex), C2, C4, then C5
@@ -787,8 +788,8 @@ std::uint64_t DccKeyPinNote(std::uint64_t dcc, std::size_t count) {
     return keyPinCheck(dcc, count, note) == KeyPin::Holds ? note : 0;
 }
 
-void CountKeyPin(KeyPin kind, bool targetLookup) {
-    keyPinCounts[(targetLookup ? 0 : KeyPinKinds) + static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+void CountKeyPin(KeyPin kind, bool targetLookup, bool refresh) {
+    keyPinCounts[((refresh ? 2 : 0) + (targetLookup ? 0 : 1)) * KeyPinKinds + static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
 KeyPinCounts KeyPinTotals() {
@@ -796,6 +797,8 @@ KeyPinCounts KeyPinTotals() {
     for (std::size_t i = 0; i < KeyPinKinds; ++i) {
         totals.target[i] = keyPinCounts[i].load(std::memory_order_relaxed);
         totals.other[i] = keyPinCounts[KeyPinKinds + i].load(std::memory_order_relaxed);
+        totals.refreshTarget[i] = keyPinCounts[2 * KeyPinKinds + i].load(std::memory_order_relaxed);
+        totals.refreshOther[i] = keyPinCounts[3 * KeyPinKinds + i].load(std::memory_order_relaxed);
     }
     return totals;
 }
@@ -828,19 +831,23 @@ namespace {
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN=2, K1): today's scan of keys whose pin held at this use
 // must answer as the pin did: from the memo, Uncompressed, with no key writer synced (the GPU mutex
-// is held, so no other thread syncs one meanwhile). Otherwise either the pin no longer holds (the
-// state moved between the check and the scan: raced) or it disagrees with today's read, which aborts.
-void verifyKeyPin(std::uint64_t dcc, std::size_t count, std::uint64_t pinNote, DccKeys keys, bool memoized, std::uint64_t syncs) {
+// is held from the check through the scan, so no other thread syncs one or reaps a batch
+// meanwhile). A disagreement counts as raced only after a store into the keys since the pin's
+// generation (`pinGeneration`, unstamped at the check: C6), as verifyKeyPinRefresh classifies, and
+// aborts otherwise. The pin is not checked again here: a disagreeing read moves the state the check
+// reads itself (a sync reaps the batch: not pending; MemoizedKeys drops a signaled entry: memo
+// moved), so a refusal after it would excuse the very disagreement this looks for.
+void verifyKeyPin(std::uint64_t dcc, std::size_t count, std::uint64_t pinNote, std::uint64_t pinGeneration, DccKeys keys, bool memoized, std::uint64_t syncs) {
     const auto synced = KeyWaitCounts().synced;
     if (memoized && keys == DccKeys::Uncompressed && synced == syncs) {
         CountKeyPin(KeyPin::KeysVerified, InTargetLookup());
         return;
     }
-    if (DccKeyPinRefusal(dcc, count, pinNote) != KeyPin::Holds) {
+    if (!GuestMemory::UnchangedSince(dcc, count, pinGeneration)) {
         CountKeyPin(KeyPin::Raced, InTargetLookup());
         return;
     }
-    std::fprintf(stderr, "[key-pin] APS5_EXPERIMENT_KEY_PIN=2: today's key read of 0x%llx+0x%zx answered %s (memoized %d, key writers synced %llu -> %llu) where the pin (note %llu) answered uncompressed\n", static_cast<unsigned long long>(dcc), count, DccKeysName(keys), memoized ? 1 : 0, static_cast<unsigned long long>(syncs), static_cast<unsigned long long>(synced), static_cast<unsigned long long>(pinNote));
+    std::fprintf(stderr, "[key-pin] APS5_EXPERIMENT_KEY_PIN=2: today's key read of 0x%llx+0x%zx answered %s (memoized %d, key writers synced %llu -> %llu) where the pin (note %llu, keys unstamped since generation %llu) answered uncompressed\n", static_cast<unsigned long long>(dcc), count, DccKeysName(keys), memoized ? 1 : 0, static_cast<unsigned long long>(syncs), static_cast<unsigned long long>(synced), static_cast<unsigned long long>(pinNote), static_cast<unsigned long long>(pinGeneration));
     std::fflush(stderr);
     std::abort();
 }
@@ -896,7 +903,7 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
             stable = !Recorder::SnapshotWriteOverlaps(resource.dccAddress, count);
         }
     }
-    if (predicted) verifyKeyPin(resource.dccAddress, count, proof.pinNote, keys, memoized, syncs);
+    if (predicted) verifyKeyPin(resource.dccAddress, count, proof.pinNote, proof.generation, keys, memoized, syncs);
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1) and LOCAL DEBUG (APS5_PROFILE_DRAW): after a
     // memoized scan, whether a pin would hold now: the take (1 and 2; a predicted pin is kept as it
     // is) and [dcc]'s pinnable count (every switch value). Only a scan that answered Uncompressed is

@@ -113,12 +113,21 @@ KeyPin DccKeyPinRefusal(std::uint64_t dcc, std::size_t count, std::uint64_t pinN
 // them, when its keys are Uncompressed and C1-C5 hold for it; else 0.
 std::uint64_t DccKeyPinNote(std::uint64_t dcc, std::size_t count);
 // Cumulative counts per caller (a committer target lookup, InTargetLookup, or another), kept while
-// the switch is set (relaxed; the [proofs] line prints 10 s deltas).
-void CountKeyPin(KeyPin kind, bool targetLookup);
+// the switch is set (relaxed; the [proofs] line prints 10 s deltas). Refusals are counted per use,
+// key reads (ProvedClearKeys) and refreshes (StorageTexture::refreshProved: `refresh`) apart: a
+// refresh refused for C1-C5 reads its keys on today's path through the same pin, which counts that
+// refusal again as a key read's.
+void CountKeyPin(KeyPin kind, bool targetLookup, bool refresh = false);
 struct KeyPinCounts {
     std::array<std::uint64_t, static_cast<std::size_t>(KeyPin::Count)> target{};
     std::array<std::uint64_t, static_cast<std::size_t>(KeyPin::Count)> other{};
-    std::uint64_t operator[](KeyPin kind) const { return target[static_cast<std::size_t>(kind)] + other[static_cast<std::size_t>(kind)]; }
+    // The refusals counted by refreshes, per caller as above.
+    std::array<std::uint64_t, static_cast<std::size_t>(KeyPin::Count)> refreshTarget{};
+    std::array<std::uint64_t, static_cast<std::size_t>(KeyPin::Count)> refreshOther{};
+    // Every count of `kind`: key reads' and refreshes', both callers.
+    std::uint64_t operator[](KeyPin kind) const { return target[static_cast<std::size_t>(kind)] + other[static_cast<std::size_t>(kind)] + Refreshes(kind); }
+    // The refusals of `kind` counted by refreshes, both callers.
+    std::uint64_t Refreshes(KeyPin kind) const { return refreshTarget[static_cast<std::size_t>(kind)] + refreshOther[static_cast<std::size_t>(kind)]; }
 };
 KeyPinCounts KeyPinTotals();
 const char* KeyPinName(KeyPin kind);

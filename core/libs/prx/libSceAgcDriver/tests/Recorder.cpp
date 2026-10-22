@@ -7364,6 +7364,8 @@ bool refreshKeyPinTests(const Device& device, Recorder& recorder) {
         before = KeyPinTotals();
         image->Refresh();
         if (mode != 0) Require(delta(before, KeyPin::NotPending) >= 1, "K1 refresh (7): the reap did not end the pin");
+        // Once as the refresh's refusal; its slow path's key read counts its own apart.
+        if (mode != 0) Require(KeyPinTotals().Refreshes(KeyPin::NotPending) == before.Refreshes(KeyPin::NotPending) + 1, "K1 refresh (7): the refresh's refusal at the reap was not counted once as a refresh's");
         Require(image->KeyProof().generation != 0 && image->KeyProof().pinNote == 0, "K1 refresh (7): the reaped keys gave no stable key proof");
         expectProved(true, "K1 refresh (7): the target was not proved with a stable key proof");
 
@@ -7375,12 +7377,36 @@ bool refreshKeyPinTests(const Device& device, Recorder& recorder) {
         before = KeyPinTotals();
         expectProved(false, "K1 refresh (8): a refresh was proved from a pin under a newer writer");
         if (mode != 0) Require(delta(before, KeyPin::NotNewest) >= 1, "K1 refresh (8): the pin was not refused under a newer writer");
+        if (mode != 0) Require(KeyPinTotals().Refreshes(KeyPin::NotNewest) == before.Refreshes(KeyPin::NotNewest) + 1, "K1 refresh (8): the refresh's refusal under a newer writer was not counted once as a refresh's");
+        recorder.Sync();
+
+        // 9. A pin another key read replaced with a stable proof at the same generation: the refresh
+        // proof is taken over a new pin, the batch is reaped with nothing stamped, and a key read
+        // through the image's key proof (fastRevalidate's or ServesKeysAt's) refuses the pin (not
+        // pending) and keeps the bytes' stable proof at the pin's generation. Today took no refresh
+        // proof under the pin, so its next refresh runs the slow path and moves every unit to the
+        // surface's collect; no mode may answer it from the proof taken over the pin (a plain hit
+        // would leave the units at the pin's generation).
+        store();
+        image->Refresh();
+        if (mode != 0) Require(image->KeyProof().pinNote != 0, "K1 refresh (9): the refresh after the store did not pin the keys");
+        expectProved(mode == 1, mode == 1 ? "K1 refresh (9) 1: the target was not proved from the pin" : "K1 refresh (9): the target was proved under a pending key store");
+        const auto pinGeneration = image->KeyProof().generation;
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        Require(ProvedClearKeys(resource, surfaceBytes, image->KeyProof()) == DccKeys::Uncompressed && image->KeyProof().generation != 0 && image->KeyProof().pinNote == 0, "K1 refresh (9): the reaped keys gave no stable key proof");
+        if (mode != 0) Require(image->KeyProof().generation == pinGeneration, "K1 refresh (9): something was stamped between the pin and the stable proof (the case needs the pin's generation)");
+        const auto provedReplaced = proved();
+        expectAdvanced("K1 refresh (9): the refresh after a stable proof replaced the pin left a unit off the generation of the surface's collect");
+        Require(proved() == provedReplaced, "K1 refresh (9): the refresh proof taken over a pin answered after a stable proof replaced the pin");
+        expectProved(true, "K1 refresh (9): the target was not proved after today's refresh took the stable proof");
         recorder.Sync();
     }
     recorder.Sync();
     // Nothing counted with the switch off; no answer at 2, no verify at 1, no race.
     const auto end = KeyPinTotals();
-    if (mode == 0) Require(end.target == start.target && end.other == start.other, "K1 refresh: a pin was taken or counted with the switch off");
+    if (mode == 0) Require(end.target == start.target && end.other == start.other && end.refreshTarget == start.refreshTarget && end.refreshOther == start.refreshOther, "K1 refresh: a pin was taken or counted with the switch off");
     if (mode == 1) Require(end[KeyPin::KeysVerified] == start[KeyPin::KeysVerified] && end[KeyPin::RefreshVerified] == start[KeyPin::RefreshVerified], "K1 refresh 1: a pin was verified");
     if (mode == 2) Require(end[KeyPin::KeyAnswer] == start[KeyPin::KeyAnswer] && end[KeyPin::RefreshHit] == start[KeyPin::RefreshHit], "K1 refresh 2: a pin answered");
     Require(end[KeyPin::Raced] == start[KeyPin::Raced], "K1 refresh: a pinned prediction was overtaken in a single-threaded test");
