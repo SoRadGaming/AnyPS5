@@ -83,6 +83,12 @@ struct ScanProfile {
     // GPU stores whose range had a 4-byte unaligned head or tail (copied instead of filled).
     std::atomic<std::uint64_t> gpuSplitStores{0};
     std::atomic<std::uint64_t> cpuStores{0};
+    // LOCAL DEBUG (GPU-OWNED-PLAN L2-0): ProvedClearKeys' unstable scans by why the scan was not
+    // kept: the key range was not collected (no write tracking, or no keys), the keys came from the
+    // GPU-store memo, or recorded work that writes the keys had not signaled.
+    std::atomic<std::uint64_t> unstableUncollected{0};
+    std::atomic<std::uint64_t> unstableMemoized{0};
+    std::atomic<std::uint64_t> unstablePending{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -121,7 +127,10 @@ void ReportScans(std::chrono::steady_clock::time_point now) {
     }
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto& proofs = Proofs();
-    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()));
+    // LOCAL DEBUG (GPU-OWNED-PLAN L2-0): the unstable split and WaitForKeyWriters' totals
+    // (cumulative, as the rest of the line).
+    const auto waits = KeyWaitCounts();
+    std::fprintf(stderr, "[dcc] %llu scans, %.1f MiB scanned, %llu memo hits, %llu flush syncs, %.1f ms; uncompressed keys stored: %llu on the GPU (%llu with an unaligned head or tail), %llu on the CPU; key proofs: %llu proved, %llu scanned, %llu unstable (%llu uncollected, %llu memoized, %llu pending write unsignaled); key waits: %llu calls, %llu no pending, %llu known, %llu fills leave uncompressed, %llu synced\n", static_cast<unsigned long long>(profile.scans.load()), profile.bytes.load() / 1048576.0, static_cast<unsigned long long>(profile.memoHits.load()), static_cast<unsigned long long>(profile.flushSyncs.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.gpuStores.load()), static_cast<unsigned long long>(profile.gpuSplitStores.load()), static_cast<unsigned long long>(profile.cpuStores.load()), static_cast<unsigned long long>(proofs.proved.load()), static_cast<unsigned long long>(proofs.scanned.load()), static_cast<unsigned long long>(proofs.unstable.load()), static_cast<unsigned long long>(profile.unstableUncollected.load()), static_cast<unsigned long long>(profile.unstableMemoized.load()), static_cast<unsigned long long>(profile.unstablePending.load()), static_cast<unsigned long long>(waits.calls), static_cast<unsigned long long>(waits.noPending), static_cast<unsigned long long>(waits.known), static_cast<unsigned long long>(waits.fillsUncompressed), static_cast<unsigned long long>(waits.synced));
 }
 
 void CountScan(std::size_t bytes, std::chrono::steady_clock::time_point start) {
@@ -739,7 +748,14 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
     }
     proof = stable ? DccKeyProof{keys, collected} : DccKeyProof{};
     counters.scanned.fetch_add(1, std::memory_order_relaxed);
-    if (!stable) counters.unstable.fetch_add(1, std::memory_order_relaxed);
+    if (!stable) {
+        counters.unstable.fetch_add(1, std::memory_order_relaxed);
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): why, on the [dcc] line.
+        if (ScanProfileEnabled()) {
+            auto& scans = Scans();
+            (collected == 0 ? scans.unstableUncollected : memoized ? scans.unstableMemoized : scans.unstablePending).fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     return keys;
 }
 

@@ -121,6 +121,70 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): whether this thread's refreshes are a
+// committer target lookup's (StorageTexture::TargetLookupScope). Trivially destructible.
+thread_local bool inTargetLookup = false;
+
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): why refreshProved did not answer (b), and
+// why a refresh that reached the unchanged exit took no proof (c), per caller (0 a target lookup,
+// 1 any other), with each "other pending" case split by StorageTexture::otherPendingReason; per
+// 10 s on the [proofs] line (reportStorageTraffic), counted only while profiling.
+enum ProofFailure : std::size_t { FailNoProof, FailMoved, FailCollect, FailKeyProof, FailStamped, FailOtherPending, ProofFailureCount };
+constexpr std::array<const char*, ProofFailureCount> ProofFailureNames{"no proof", "generation/keys moved or no GPU lock", "collect 0", "key proof moved", "stamped", "other pending"};
+enum ProofRefusal : std::size_t { RefuseLayersBehind, RefuseAliased, RefuseGeneration, RefuseNoLock, RefuseKeyProofEmpty, RefuseKeyProofKeys, RefuseOtherPending, ProofRefusalCount };
+constexpr std::array<const char*, ProofRefusalCount> ProofRefusalNames{"layers behind", "aliased", "generation 0", "no GPU lock", "key proof empty (K1)", "key proof keys", "other pending"};
+constexpr std::size_t OtherPendingCount = static_cast<std::size_t>(StorageTexture::OtherPending::Count);
+constexpr std::array<const char*, OtherPendingCount> OtherPendingNames{"outside only", "flushing", "same range", "unit inside", "key range only"};
+using CallerCounts = std::array<std::array<std::atomic<std::uint64_t>, OtherPendingCount>, 2>;
+struct ProofCounts {
+    std::array<std::array<std::atomic<std::uint64_t>, ProofFailureCount>, 2> failed{};
+    CallerCounts failedOther{};
+    std::array<std::array<std::atomic<std::uint64_t>, ProofRefusalCount>, 2> refused{};
+    CallerCounts refusedOther{};
+};
+constinit ProofCounts proofCounts;
+
+std::size_t proofCaller() {
+    return inTargetLookup ? 0 : 1;
+}
+
+void countProofFailure(ProofFailure failure) {
+    proofCounts.failed[proofCaller()][failure].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countProofRefusal(ProofRefusal refusal) {
+    proofCounts.refused[proofCaller()][refusal].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countOtherPending(CallerCounts& counts, StorageTexture::OtherPending reason) {
+    counts[proofCaller()][static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// The [proofs] line, from reportStorageTraffic (under the traffic mutex): every reason as target
+// lookups/other callers.
+void reportProofs() {
+    std::string line;
+    char text[160];
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto list = [&](const auto& names, auto& counts) {
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            const auto target = take(counts[0][i]);
+            std::snprintf(text, sizeof(text), "%s %s %llu/%llu", i != 0 ? "," : "", names[i], target, take(counts[1][i]));
+            line += text;
+        }
+    };
+    line += "refreshProved failed:";
+    list(ProofFailureNames, proofCounts.failed);
+    line += " (other pending:";
+    list(OtherPendingNames, proofCounts.failedOther);
+    line += "); no proof taken at the unchanged exit:";
+    list(ProofRefusalNames, proofCounts.refused);
+    line += " (other pending:";
+    list(OtherPendingNames, proofCounts.refusedOther);
+    line += ")";
+    AgcDriver::ProfilePrint_nid_no_patch("[proofs] storage refresh proofs per 10 s (target lookups/other callers): %s\n", line.c_str());
+}
+
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
@@ -164,6 +228,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
+    reportProofs();
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
@@ -2065,7 +2130,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    if (refreshProved(profile)) {
         layerBehind.clear();
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
@@ -2268,7 +2333,8 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             if (!outsideChanged || !outside[layer]) layerGeneration[layer] = currentFor(layer);
         }
         refreshGeneration();
-        if (layerBehind.empty()) takeRefreshProof(alias != nullptr);
+        if (layerBehind.empty()) takeRefreshProof(alias != nullptr, profile);
+        else if (profile) countProofRefusal(RefuseLayersBehind);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
@@ -2402,35 +2468,91 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
-bool StorageTexture::refreshProved() {
-    if (refreshProof.generation == 0) return false;
-    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+StorageTexture::OtherPending StorageTexture::otherPendingReason() const {
+    const auto base = descriptor.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    const auto keys = descriptor.dccAddress;
+    const auto keyBytes = keys != 0 ? DccKeyBytes(guestBytes) : 0;
+    auto& pending = Pending();
+    // Lock-free first, as overlappingPending: no pending image over either range, then none being
+    // stored (an image leaves `textures` for `flushing` under the registry mutex, so a clear
+    // `textures` read first and an empty `flushing` read after it hold together).
+    if (pending.textures.SurelyClear(base, bytes) && (keyBytes == 0 || pending.textures.SurelyClear(keys, keyBytes)) && pending.flushingCount.load(std::memory_order_acquire) == 0) return OtherPending::Outside;
+    std::lock_guard lock(pending.mutex);
+    const auto overlapsEither = [&](const StorageTexture* texture) { return texture->overlaps(base, bytes) || (keyBytes != 0 && texture->overlaps(keys, keyBytes)); };
+    if (std::any_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture != this && overlapsEither(texture); })) return OtherPending::Flushing;
+    const bool overSurface = pending.textures.MayOverlap(base, bytes);
+    const bool overKeys = keyBytes != 0 && pending.textures.MayOverlap(keys, keyBytes);
+    if (!overSurface && !overKeys) return OtherPending::Outside;
+    bool keyRange = false;
+    for (const auto* texture : pending.textures) {
+        if (texture == this) continue;
+        if (overSurface && texture->overlaps(base, bytes)) {
+            if (texture->descriptor.baseAddress == base && texture->guestBytes == guestBytes) return OtherPending::SameRange;
+            if (texture->pendingUnitInside(base, bytes)) return OtherPending::Inside;
+        }
+        if (overKeys && !keyRange && texture->overlaps(keys, keyBytes) && texture->pendingUnitInside(keys, keyBytes)) keyRange = true;
+    }
+    return keyRange ? OtherPending::KeyRange : OtherPending::Outside;
+}
+
+bool StorageTexture::TargetLookupScope::Enter() {
+    return std::exchange(inTargetLookup, true);
+}
+
+void StorageTexture::TargetLookupScope::Leave(bool previous) {
+    inTargetLookup = previous;
+}
+
+bool StorageTexture::refreshProved(bool profile) {
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): each refusal names its reason on the
+    // [proofs] line.
+    const auto fail = [&](ProofFailure failure) {
+        if (profile) countProofFailure(failure);
+        return false;
+    };
+    if (refreshProof.generation == 0) return fail(FailNoProof);
+    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return fail(FailMoved);
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return fail(FailCollect);
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
+        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return fail(FailKeyProof);
+        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return fail(FailCollect);
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return fail(FailStamped);
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        if (otherPendingOverlaps()) {
+            if (profile) countOtherPending(proofCounts.failedOther, otherPendingReason());
+            return fail(FailOtherPending);
+        }
         refreshProof.pendingSerial = serial;
     }
     return true;
 }
 
-void StorageTexture::takeRefreshProof(bool aliased) {
+void StorageTexture::takeRefreshProof(bool aliased, bool profile) {
     refreshProof = {};
-    if (aliased || generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): each refusal names its reason on the
+    // [proofs] line, in the order the checks run.
+    const auto refuse = [&](ProofRefusal refusal) {
+        if (profile) countProofRefusal(refusal);
+    };
+    if (aliased) return refuse(RefuseAliased);
+    if (generation == 0) return refuse(RefuseGeneration);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return refuse(RefuseNoLock);
+    if (descriptor.dccAddress != 0 && keyProof.generation == 0) return refuse(RefuseKeyProofEmpty);
+    if (descriptor.dccAddress != 0 && keyProof.keys != uploadedKeys) return refuse(RefuseKeyProofKeys);
     const auto serial = PendingSerial();
-    if (otherPendingOverlaps()) return;
+    if (otherPendingOverlaps()) {
+        if (profile) countOtherPending(proofCounts.refusedOther, otherPendingReason());
+        return refuse(RefuseOtherPending);
+    }
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
 }
 

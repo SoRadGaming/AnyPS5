@@ -375,6 +375,34 @@ public:
     static std::uint64_t SinglePassMoves();
     static std::uint64_t SlabRetiles();
     static std::uint64_t RefreshesProved();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): marks the refreshes this thread makes
+    // while it lives as a committer target lookup's (refreshResidentTarget), so the [proofs] line
+    // splits refresh-proof failures and refusals by caller. The mark is a thread-local flag with no
+    // destructor (prx_thread_local_destructors), touched only while profiling.
+    class TargetLookupScope {
+    public:
+        explicit TargetLookupScope(bool profiled) : profiled(profiled) {
+            if (profiled) previous = Enter();
+        }
+        ~TargetLookupScope() {
+            if (profiled) Leave(previous);
+        }
+        TargetLookupScope(const TargetLookupScope&) = delete;
+        TargetLookupScope& operator=(const TargetLookupScope&) = delete;
+
+    private:
+        static bool Enter();
+        static void Leave(bool previous);
+        bool profiled;
+        bool previous = false;
+    };
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): what the other pending images over the
+    // surface {baseAddress, guestBytes} and over its DCC keys {dccAddress, DccKeyBytes(guestBytes)}
+    // hold, the first of: one a FlushPending is storing right now (Flushing), one of exactly this
+    // surface (SameRange: pendingAlias's candidates), one with a pending unit inside the surface
+    // (Inside: FlushPending's own pretest) or inside the keys only (KeyRange); else Outside (no
+    // pending unit of theirs inside either range: a refresh's FlushPending would store nothing).
+    enum class OtherPending : std::uint8_t { Outside, Flushing, SameRange, Inside, KeyRange, Count };
     static std::uint64_t ClearHandOvers();
     static std::uint64_t HandedOverSuperseded();
     static void SetClearHandOver(bool enabled);
@@ -488,9 +516,11 @@ private:
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
-    bool refreshProved();
-    void takeRefreshProof(bool aliased);
+    // `profile`: LookupOutcomes::Profiled(), for the [proofs] line's reasons (LOCAL DEBUG, L2-0).
+    bool refreshProved(bool profile);
+    void takeRefreshProof(bool aliased, bool profile);
     bool otherPendingOverlaps() const;
+    OtherPending otherPendingReason() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
