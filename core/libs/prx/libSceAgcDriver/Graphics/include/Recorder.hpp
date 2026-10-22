@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <unordered_map>
@@ -1134,6 +1135,11 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN L1-1): one hash memo per
+        // 64 KiB block of a Storage snapshot of at least 1 MiB (empty: no memo; a new entry starts
+        // without one), and the block from which the =1 audit looks for the next one to memcmp.
+        std::vector<SpanHash> hashes;
+        std::uint32_t auditCursor = 0;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;

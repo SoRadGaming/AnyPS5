@@ -10474,6 +10474,107 @@ void vertexZeroFillMergeTests() {
     Require(solo.size() == 1 && solo[0] == 1, "a fetch past the records is copied alone");
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN L1-1): CompareSpansFrom with a hash
+// memo per span (first is the snapshot S, second guest memory), on the pool and serially. A span
+// with a memo uses it whatever the switch; the switch only adds the verify modes (=2 uses memcmp's
+// verdict and counts a contradicted memo, =3 aborts on one), so the S-overwrite check follows it.
+void snapshotHashCompareTests() {
+    using namespace AgcDriver::Graphics;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t count = 48;
+    const int mode = SnapshotHashMode();
+    const auto lengthOf = [](std::size_t k) { return k + 1 == count ? block + 100 : block; };
+    std::vector<std::byte> original(block * count + 100);
+    for (std::size_t i = 0; i < original.size(); ++i) original[i] = static_cast<std::byte>((i * 131u + (i >> 9u)) & 0xFFu);
+    auto snapshot = original;
+    auto guest = original;
+    const std::array<std::size_t, 3> differs{2 * block + 77, 30 * block, 47 * block + block + 99};
+    const auto differsIn = [&](std::size_t k) {
+        return std::any_of(differs.begin(), differs.end(), [&](std::size_t at) { return at >= k * block && at < k * block + lengthOf(k); });
+    };
+    for (const std::size_t threshold : {std::size_t{0}, std::size_t{1} << 40u}) {
+        std::copy(original.begin(), original.end(), snapshot.begin());
+        std::copy(original.begin(), original.end(), guest.begin());
+        for (const auto at : differs) guest[at] ^= std::byte{0x40};
+        std::vector<SpanHash> memo(count);
+        std::vector<CompareSpan> spans;
+        for (std::size_t k = 0; k < count; ++k) spans.push_back({snapshot.data() + k * block, guest.data() + k * block, lengthOf(k), &memo[k]});
+        TakeSnapshotHashCounts();
+        // Unknown memos leave the verdict to memcmp; a memo is learned, from S, only where it found
+        // the span equal.
+        std::vector<std::uint8_t> equal(count, 2);
+        CompareSpansFrom(spans, equal, threshold);
+        std::size_t equalSpans = 0;
+        for (std::size_t k = 0; k < count; ++k) {
+            Require(equal[k] == (differsIn(k) ? 0 : 1), "an unknown hash memo did not leave the verdict to memcmp");
+            Require((memo[k].known != 0) == !differsIn(k), "a hash memo was learned from a differing span, or not from an equal one");
+            Require(memo[k].known == 0 || memo[k].lanes == HashLanes(snapshot.data() + k * block, lengthOf(k)), "a learned hash memo is not the lanes of S's bytes");
+            if (!differsIn(k)) ++equalSpans;
+        }
+        auto counts = TakeSnapshotHashCounts();
+        Require(counts.learned == equalSpans && counts.decided == 0, "the hash memo counted the wrong learned spans");
+        // Known memos decide from guest memory (3); the differing spans, still unknown, memcmp again.
+        std::fill(equal.begin(), equal.end(), 2);
+        CompareSpansFrom(spans, equal, threshold);
+        for (std::size_t k = 0; k < count; ++k) Require(equal[k] == (differsIn(k) ? 0 : 3), "a known hash memo did not decide its equal span");
+        counts = TakeSnapshotHashCounts();
+        Require(counts.decided == equalSpans && counts.decidedEqual == equalSpans && counts.learned == 0 && counts.falseEqual == 0 && counts.stale == 0, "the hash memo counted the wrong decided spans");
+        std::copy(original.begin(), original.end(), guest.begin());
+        std::fill(equal.begin(), equal.end(), 2);
+        CompareSpansFrom(spans, equal, threshold);
+        for (std::size_t k = 0; k < count; ++k) Require(equal[k] == (differsIn(k) ? 1 : 3) && memo[k].known != 0, "a span that became equal did not learn its hash memo");
+        TakeSnapshotHashCounts();
+        // A changed guest byte under a known memo reads as differing: the range's first and last
+        // byte, a whole block's last byte, one byte of each lane's word in a stripe, and the 4-byte
+        // tail word of the 65,636-byte span (no whole word follows its stripes, so it is lane 0's).
+        constexpr std::size_t last = count - 1;
+        const std::array<std::pair<std::size_t, std::size_t>, 9> probes{{{0, 0}, {last, block + 99}, {10, block - 1}, {5, 4096 + 3}, {5, 4096 + 8 + 4}, {5, 4096 + 16 + 5}, {5, 4096 + 24 + 7}, {last, block + 96}, {last, block + 98}}};
+        for (const auto& [span, at] : probes) {
+            const auto position = span * block + at;
+            guest[position] ^= std::byte{0x01};
+            std::fill(equal.begin(), equal.end(), 2);
+            CompareSpansFrom(spans, equal, threshold);
+            for (std::size_t k = 0; k < count; ++k) Require(equal[k] == (k == span ? 0 : 3), "a known hash memo missed a changed guest byte, or misreported another span");
+            guest[position] ^= std::byte{0x01};
+        }
+        counts = TakeSnapshotHashCounts();
+        Require(counts.decided == probes.size() * count && counts.falseEqual == 0 && counts.stale == 0, "a changed guest byte counted a verify disagreement");
+        // With known memos and guest memory unchanged S is not read: garbage in S still reads as equal
+        // by the memo. Under =2 memcmp runs beside it, so its verdict (differs) is used, and the memo,
+        // which no longer describes S, is counted stale and repaired from S; =3 would abort.
+        if (mode == 3) continue;
+        for (std::size_t i = 0; i < snapshot.size(); ++i) snapshot[i] = static_cast<std::byte>((i * 7u + 0x5Au) & 0xFFu);
+        std::fill(equal.begin(), equal.end(), 2);
+        CompareSpansFrom(spans, equal, threshold);
+        counts = TakeSnapshotHashCounts();
+        if (mode == 2) {
+            for (std::size_t k = 0; k < count; ++k) Require(equal[k] == 0 && memo[k].lanes == HashLanes(snapshot.data() + k * block, lengthOf(k)), "=2 did not use memcmp's verdict or repair a stale hash memo");
+            Require(counts.stale == count && counts.falseEqual == 0, "=2 did not count each stale hash memo");
+        } else {
+            for (std::size_t k = 0; k < count; ++k) Require(equal[k] == 3, "a known hash memo read S: garbage in S changed its verdict");
+            Require(counts.decidedEqual == count, "the hash memo counted the wrong decided spans over garbage in S");
+        }
+    }
+    // HashLanes: a change confined to one 8-byte word always changes the lanes. A 4,109-byte buffer
+    // (128 stripes, one whole word for lane 0, a 5-byte tail word for lane 1): every byte flipped,
+    // and every 8 bytes from every position (the aligned words and the tail among them) inverted.
+    std::vector<std::byte> buffer(4109);
+    for (std::size_t i = 0; i < buffer.size(); ++i) buffer[i] = static_cast<std::byte>((i * 29u + 3u) & 0xFFu);
+    const auto base = HashLanes(buffer.data(), buffer.size());
+    for (std::size_t i = 0; i < buffer.size(); ++i) {
+        buffer[i] ^= std::byte{0x80};
+        Require(HashLanes(buffer.data(), buffer.size()) != base, "HashLanes missed a changed byte");
+        buffer[i] ^= std::byte{0x80};
+    }
+    for (std::size_t at = 0; at < buffer.size(); ++at) {
+        const auto end = std::min(buffer.size(), at + 8);
+        for (std::size_t i = at; i < end; ++i) buffer[i] = ~buffer[i];
+        Require(HashLanes(buffer.data(), buffer.size()) != base, "HashLanes missed a changed 8-byte word");
+        for (std::size_t i = at; i < end; ++i) buffer[i] = ~buffer[i];
+    }
+    Require(HashLanes(buffer.data(), buffer.size()) == base, "HashLanes is not a function of the bytes");
+}
+
 void parallelCompareTests() {
     using AgcDriver::Graphics::CompareSpan;
     using AgcDriver::Graphics::CompareSpansFrom;
@@ -10507,6 +10608,74 @@ void parallelCompareTests() {
     for (std::size_t k = 0; k < count; ++k) Require((left[k] == 1) == expected(k) && (right[k] == 1) == expected(k), "concurrent parallel compares misreported a span");
     std::vector<std::uint8_t> none;
     CompareSpansFrom({}, none, 0);
+    snapshotHashCompareTests();
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN 2.5 and 2.6.1): memcmp of two
+// 64 MiB buffers against HashLanes of one, in 64 KiB blocks handed out as the compare pool does, on
+// 1 and on 3 threads (the committer and two helpers), cold (after streaming 512 MiB through the
+// caches) and warm (right after an untimed pass). Rates are one buffer's bytes per second, the
+// compared-byte rate. The plan's gate before the game: the cold 3-thread hash rate is at least
+// 1.3 x memcmp's; otherwise R3 and R4 also run an APS5_COMPARE_HELPERS=4 arm.
+void snapshotHashBenchmark() {
+    using AgcDriver::Graphics::HashLanes;
+    constexpr std::size_t bytes = std::size_t{64} << 20u;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t blocks = bytes / block;
+    std::vector<std::byte> snapshot(bytes), guest(bytes), flush(std::size_t{512} << 20u);
+    for (std::size_t offset = 0; offset < bytes; offset += sizeof(std::uint64_t)) {
+        const std::uint64_t word = (offset * 0x9E3779B97F4A7C15ull) ^ (offset >> 7u);
+        std::memcpy(snapshot.data() + offset, &word, sizeof(word));
+    }
+    std::memcpy(guest.data(), snapshot.data(), bytes);
+    std::atomic<std::uint64_t> sink{0};
+    int flushes = 0;
+    const auto pass = [&](unsigned threads, bool hash) {
+        std::atomic<unsigned> ready{0}, finished{0};
+        std::atomic<bool> go{false};
+        std::atomic<std::size_t> next{0};
+        const auto work = [&] {
+            std::uint64_t local = 0;
+            for (auto index = next.fetch_add(1, std::memory_order_relaxed); index < blocks; index = next.fetch_add(1, std::memory_order_relaxed)) {
+                if (hash) local += HashLanes(guest.data() + index * block, block)[0];
+                else local += std::memcmp(snapshot.data() + index * block, guest.data() + index * block, block) == 0 ? 1 : 0;
+            }
+            sink.fetch_add(local, std::memory_order_relaxed);
+            finished.fetch_add(1, std::memory_order_acq_rel);
+        };
+        std::vector<std::thread> helpers;
+        for (unsigned helper = 1; helper < threads; ++helper) {
+            helpers.emplace_back([&] {
+                ready.fetch_add(1, std::memory_order_acq_rel);
+                while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                work();
+            });
+        }
+        while (ready.load(std::memory_order_acquire) != threads - 1) std::this_thread::yield();
+        const auto begin = std::chrono::steady_clock::now();
+        go.store(true, std::memory_order_release);
+        work();
+        while (finished.load(std::memory_order_acquire) != threads) std::this_thread::yield();
+        const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+        for (auto& helper : helpers) helper.join();
+        return static_cast<double>(bytes) / seconds / 1e9;
+    };
+    const auto rate = [&](unsigned threads, bool hash, bool cold) {
+        double best = 0;
+        for (int repeat = 0; repeat < 5; ++repeat) {
+            if (cold) std::memset(flush.data(), ++flushes, flush.size());
+            else pass(threads, hash);
+            best = std::max(best, pass(threads, hash));
+        }
+        return best;
+    };
+    std::array<double, 8> rates{};
+    for (std::size_t index = 0; index < rates.size(); ++index) rates[index] = rate((index & 2u) != 0 ? 3u : 1u, (index & 4u) != 0, (index & 1u) == 0);
+    std::printf("snapshot-hash benchmark (64 MiB in 64 KiB blocks; GB/s of compared bytes, best of 5):\n");
+    std::printf("  memcmp    1 thread cold %.1f warm %.1f; 3 threads cold %.1f warm %.1f\n", rates[0], rates[1], rates[2], rates[3]);
+    std::printf("  HashLanes 1 thread cold %.1f warm %.1f; 3 threads cold %.1f warm %.1f\n", rates[4], rates[5], rates[6], rates[7]);
+    const double ratio = rates[6] / rates[2];
+    std::printf("  gate (cold 3-thread hash >= 1.3 x memcmp): %.2f x, %s (checksum %llu)\n", ratio, ratio >= 1.3 ? "pass" : "FAIL: also run R3 and R4 with APS5_COMPARE_HELPERS=4", static_cast<unsigned long long>(sink.load()));
 }
 
 void ResourceContentKeyTests(bool benchmark) {
@@ -11121,6 +11290,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--resource-content-key" || std::string_view(argv[1]) == "--benchmark-resource-content-key")) {
             ResourceContentKeyTests(std::string_view(argv[1]) == "--benchmark-resource-content-key");
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN 2.5): not a ctest row.
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-snapshot-hash") {
+            snapshotHashBenchmark();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
