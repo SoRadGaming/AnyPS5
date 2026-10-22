@@ -769,7 +769,11 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
 }
 
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr) return false;
+    // Read once, as WaitMemory's storeHeldResults is: StorageTexture::FlushPending asks for every
+    // draw input, target refresh and texture proof, and a getenv per call (the CRT locks and scans
+    // the environment) cost ASTRO BOT's draw committer ~15% of its time.
+    static const bool disabled = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
+    if (bytes == 0 || disabled) return false;
     const auto end = address + bytes;
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
