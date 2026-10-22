@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -63,6 +64,7 @@
 #include <cctype>
 #include <cmath>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -4458,6 +4460,150 @@ void drawSnapshotEvictionTests(const Device& device) {
     std::memset(block, 0x5a, 16);
     CollectWrites(address, 16);
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
+}
+
+// The =3 death case below must end the process with a plain exit code (see Locks.cpp's
+// PrepareScopeDeath): ctest fails a run that ends in an exception without reading its output.
+[[maybe_unused]] void snapshotHashExitOnAbort(int) {
+    std::_Exit(3);
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN L1-1): the refreshes of a 4 MiB
+// Storage snapshot (Recorder::refreshDrawSnapshot through ReusableDrawSnapshot) over a watched
+// block, under GpuMutex. Unset, today's compares and copies run with no memo. With the memo: the
+// first refresh after KeepDrawSnapshot learns every block's memo (memcmp) and the next is decided by
+// it; a CPU store's block is copied and rehashed from S (the next refresh decides it equal); a
+// differing block with another holder of S erases the entry; and S written through its mapping
+// behind its memo in two blocks (a hidden writer) is counted stale twice at =2, aborts at =3 (the
+// last case; its ctest row matches the [snapshot-hash] line), and is found by =1's audit within one
+// refresh per block, which copies the audited block and the other one (both differ in that refresh,
+// as today's compare would copy them) and drops the entry's memo.
+bool drawSnapshotRefreshTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t bytes = std::size_t{4} << 20u;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t count = bytes / block;
+    void* memory = WriteWatched() ? AllocateWatched(bytes, block) : nullptr;
+    if (memory == nullptr) {
+        std::cout << "skipped, write watching unavailable\n";
+        return false;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    auto* guest = static_cast<std::uint8_t*>(memory);
+    for (std::size_t i = 0; i < bytes; ++i) guest[i] = static_cast<std::uint8_t>((i * 131u + (i >> 11u)) & 0xFFu);
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const int mode = SnapshotHashMode();
+    // ReusableDrawSnapshot asserts the hold (APS5_ASSERT_GPU_LOCK=1); the compare pool's helpers never
+    // take it.
+    std::unique_lock gpu(GpuMutex());
+    Recorder cache(device.GetContext());
+    // A new entry holding a copy of guest memory; the entry holds the only reference to S, whose
+    // mapped bytes are returned.
+    const auto keep = [&] {
+        auto buffer = std::make_shared<Buffer>(device.GetContext(), bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const auto held = buffer->Bytes();
+        std::memcpy(held.data(), memory, bytes);
+        BumpCollectEpoch();
+        const auto generation = CollectWrites(address, bytes);
+        Require(generation != 0, "the snapshot refresh fixture has no write generation");
+        cache.KeepDrawSnapshot(address, bytes, generation, registry, std::move(buffer));
+        return held;
+    };
+    // A lookup as PrepareDrawBindings makes it: the blocks stamped since the entry's generation are
+    // compared. Whether the entry survived.
+    const auto refresh = [&] {
+        BumpCollectEpoch();
+        const auto generation = CollectWrites(address, bytes);
+        return cache.ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::Storage, nullptr, generation) != nullptr;
+    };
+    const auto current = [&](std::span<std::byte> held) { return std::memcmp(held.data(), memory, bytes) == 0; };
+    // At =2/=3 the [snapshot-stats] line prints at the process's first refresh (then every 10 s),
+    // taking the memo's counts: a refresh of a first entry lets it print before the counted cases.
+    keep();
+    MarkWritten(address, bytes);
+    Require(refresh(), "a refresh over unchanged bytes lost the snapshot");
+    TakeSnapshotHashCounts();
+    auto held = keep();
+    // Memo learned, then used: a driver stamp over unchanged bytes has every block compared.
+    MarkWritten(address, bytes);
+    Require(refresh() && current(held), "a refresh over unchanged bytes lost the snapshot");
+    auto counts = TakeSnapshotHashCounts();
+    Require(counts.learned == (mode != 0 ? count : 0) && counts.decided == 0, mode != 0 ? "the first refresh did not learn every block's hash memo" : "a hash memo was used with the switch unset");
+    MarkWritten(address, bytes);
+    Require(refresh() && current(held), "a refresh over unchanged bytes lost the snapshot");
+    counts = TakeSnapshotHashCounts();
+    if (mode == 0) Require(counts.learned == 0 && counts.decided == 0 && counts.audited == 0, "a hash memo was used with the switch unset");
+    else Require(counts.decided == count && counts.decidedEqual == count && counts.learned == 0 && counts.falseEqual == 0 && counts.stale == 0 && counts.raced == 0 && counts.audited == (mode == 1 ? 1 : 0) && counts.anomalies == 0, "the second refresh was not decided by the hash memo");
+    // Copy and rehash: a CPU store's block alone is compared, differs, and is copied, then rehashed
+    // from S, so the next refresh decides it equal.
+    guest[5 * block + 123] ^= 0xFFu;
+    Require(refresh() && current(held), "a refresh did not copy a CPU store's block");
+    counts = TakeSnapshotHashCounts();
+    if (mode != 0) Require(counts.decided == 1 && counts.decidedEqual == 0 && counts.rehashed == 1, "a CPU store's block was not decided differing by its memo, or not rehashed after its copy");
+    MarkWritten(address, bytes);
+    Require(refresh() && current(held), "a refresh over unchanged bytes lost the snapshot");
+    counts = TakeSnapshotHashCounts();
+    if (mode != 0) Require(counts.decided == count && counts.decidedEqual == count && counts.rehashed == 0, "a rehashed memo does not describe the copied block");
+    // Not sole: with another holder of S, a differing block fails the refresh and erases the entry
+    // (with its memo), and S is left as the other holder reads it.
+    {
+        const auto other = cache.ReusableDrawSnapshot(address, bytes);
+        Require(other != nullptr, "the refreshed snapshot is not reusable");
+        guest[9 * block] ^= 0xFFu;
+        Require(!refresh(), "a refresh copied into a snapshot another holder still reads");
+        Require(cache.ReusableDrawSnapshot(address, bytes) == nullptr, "a snapshot that could not be refreshed was kept");
+        Require(std::memcmp(held.data() + 9 * block, guest + 9 * block, block) != 0, "a failed refresh wrote a snapshot another holder still reads");
+    }
+    TakeSnapshotHashCounts();
+    // S written through its mapping behind its memo in blocks 7 and 11, guest memory unchanged. A
+    // recreated entry starts without a memo, so it learns first.
+    held = keep();
+    MarkWritten(address, bytes);
+    Require(refresh() && current(held), "a refresh over unchanged bytes lost the recreated snapshot");
+    counts = TakeSnapshotHashCounts();
+    Require(counts.learned == (mode != 0 ? count : 0) && counts.decided == 0, "a recreated snapshot did not start without a hash memo");
+    held[7 * block + 40] ^= std::byte{0x5A};
+    held[11 * block + 4000] ^= std::byte{0x5A};
+    if (mode == 0) {
+        MarkWritten(address, bytes);
+        Require(refresh() && current(held), "the compare did not heal a snapshot written behind it");
+    } else if (mode == 1) {
+        std::size_t refreshes = 0;
+        do {
+            MarkWritten(address, bytes);
+            Require(refresh(), "a refresh over unchanged bytes lost the snapshot");
+            ++refreshes;
+            counts = TakeSnapshotHashCounts();
+            Require(counts.audited == 1, "a refresh decided by the hash memo audited no block");
+        } while (counts.anomalies == 0 && refreshes < count);
+        Require(counts.anomalies == 1 && counts.falseEqual == 0 && counts.raced == 0, "the audit did not find a block of S written behind its memo within one refresh per block");
+        Require(counts.rehashed == 2 && current(held), "the audit's anomaly did not copy every memo-decided block of its refresh that differs");
+        MarkWritten(address, bytes);
+        Require(refresh() && current(held), "a refresh over unchanged bytes lost the snapshot");
+        counts = TakeSnapshotHashCounts();
+        Require(counts.learned == count - 2 && counts.decided == 2 && counts.decidedEqual == 2 && counts.anomalies == 0, "the audit's anomaly did not drop the entry's memo, or the copied blocks were not rehashed");
+    } else if (mode == 2) {
+        MarkWritten(address, bytes);
+        Require(refresh() && current(held), "=2 did not use memcmp's verdict for a snapshot written behind its memo");
+        counts = TakeSnapshotHashCounts();
+        Require(counts.stale == 2 && counts.falseEqual == 0 && counts.raced == 0 && counts.rehashed == 2, "=2 did not count the stale memos of a snapshot written behind them");
+    } else {
+#ifdef _WIN32
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#else
+        std::signal(SIGABRT, snapshotHashExitOnAbort);
+#endif
+        std::cout << "APS5_EXPERIMENT_SNAPSHOT_HASH=3: the next refresh must abort" << std::endl;
+        MarkWritten(address, bytes);
+        refresh();
+        Require(false, "=3 did not abort on the stale memo of a snapshot written behind it");
+    }
+    return true;
 }
 
 void unwrittenSnapshotTests(const Device& device) {
@@ -11321,6 +11467,12 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--integer-clear-only") {
             integerClearTests(device);
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN L1-1).
+        if (argc == 2 && std::string_view(argv[1]) == "--snapshot-refresh-only") {
+            if (!drawSnapshotRefreshTests(device)) return 77;
+            std::cout << "draw snapshot refresh tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--settled-baseline-only") {

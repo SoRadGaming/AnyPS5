@@ -1718,6 +1718,23 @@ if(BUILD_TESTING)
         set_tests_properties(agc_draw_snapshots_lazy_generation agc_draw_snapshot_epoch_lazy_generation agc_draw_snapshots_watched_imports_lazy_generation agc_unchanged_cpu_stamps_lazy_generation PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN L1-1): a 4 MiB Storage
+    # snapshot's refreshes with the switch unset (today's compares), with the hash memo and its audit
+    # (=1), verified (=2: a snapshot written behind its memo counted stale), and at =3, whose last
+    # case must abort with the [snapshot-hash] line (matched; the test turns abort() into exit code 3).
+    add_test(NAME agc_snapshot_refresh COMMAND agc_driver_recorder_tests --snapshot-refresh-only)
+    add_test(NAME agc_snapshot_refresh_hash1 COMMAND agc_driver_recorder_tests --snapshot-refresh-only)
+    add_test(NAME agc_snapshot_refresh_hash2 COMMAND agc_driver_recorder_tests --snapshot-refresh-only)
+    add_test(NAME agc_snapshot_refresh_hash3 COMMAND agc_driver_recorder_tests --snapshot-refresh-only)
+    set_tests_properties(agc_snapshot_refresh agc_snapshot_refresh_hash1 agc_snapshot_refresh_hash2 agc_snapshot_refresh_hash3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_snapshot_refresh_hash1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_SNAPSHOT_HASH=1")
+    set_tests_properties(agc_snapshot_refresh_hash2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_SNAPSHOT_HASH=2")
+    set_tests_properties(agc_snapshot_refresh_hash3 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_SNAPSHOT_HASH=3"
+        PASS_REGULAR_EXPRESSION "\\[snapshot-hash\\] APS5_EXPERIMENT_SNAPSHOT_HASH=3: a stale memo")
+    if(WIN32)
+        set_tests_properties(agc_snapshot_refresh agc_snapshot_refresh_hash1 agc_snapshot_refresh_hash2 agc_snapshot_refresh_hash3 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_pending_key_stores COMMAND agc_driver_recorder_tests --pending-key-stores-only)
     set_tests_properties(agc_pending_key_stores PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_shadowed_key_stores COMMAND agc_driver_recorder_tests --shadowed-key-stores-only)
@@ -2941,6 +2958,15 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_graphics_draw_inputs_vram1 agc_driver_graphics_draw_snapshots_vram PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH=3, GPU-OWNED-PLAN L1-1): the graphics suite with
+    # every hash-memo verdict verified by memcmp and the first disagreement fatal (the parallel
+    # compare tests' memo cases then skip their S-overwrite check).
+    add_test(NAME agc_driver_graphics_snapshot_hash3 COMMAND agc_driver_graphics_tests)
+    set_tests_properties(agc_driver_graphics_snapshot_hash3 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_SNAPSHOT_HASH=3" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_graphics_snapshot_hash3 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 
     add_test(NAME agc_driver_stencil_replay_no_gpl COMMAND agc_driver_stencil_replay_tests)
     set_tests_properties(agc_driver_stencil_replay_no_gpl PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" TIMEOUT 30 SKIP_RETURN_CODE 77)
@@ -3070,7 +3096,12 @@ if(BUILD_TESTING)
             # outside the arena and the lock order are in agc_write_tracking, the count's covered,
             # older-token and moved-serial cases in agc_write_tracking_host_write_count.
             "host_write_stamps|APS5_EXPERIMENT_HOST_WRITE_STAMPS=1"
-            "host_write_count|APS5_EXPERIMENT_HOST_WRITE_STAMPS=2,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1")
+            "host_write_count|APS5_EXPERIMENT_HOST_WRITE_STAMPS=2,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1"
+            # LOCAL EXPERIMENT (GPU-OWNED-PLAN L1-1): the snapshot hash memo verified (=3: memcmp beside
+            # every memo verdict, the first disagreement fatal) and on (=1, with the audit); its own
+            # cases are in agc_snapshot_refresh_hash* and the graphics suite's parallel compare tests.
+            "snapshot_hash|APS5_EXPERIMENT_SNAPSHOT_HASH=3"
+            "snapshot_hash_on|APS5_EXPERIMENT_SNAPSHOT_HASH=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"
