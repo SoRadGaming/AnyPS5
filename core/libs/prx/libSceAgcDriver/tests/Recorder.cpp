@@ -6440,11 +6440,13 @@ void storageUploadLifetimeTests(const Device& device, Recorder& previous, bool f
     std::cout << "Storage upload lifetime" << (failView ? " after view failure" : " after caller release") << ": passed\n";
 }
 
-void refreshProofTests(const Device& device, Recorder& recorder) {
+// LOCAL EXPERIMENT (GPU-OWNED-PLAN L2-1): false when nothing could be tested (--refresh-proof-only
+// then reports a skip).
+bool refreshProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: refresh proofs not tested\n";
-        return;
+        return false;
     }
     constexpr std::uint32_t side = 256;
     constexpr std::size_t surfaceBytes = side * side * 4;
@@ -6453,7 +6455,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
         std::cout << "no write watching: refresh proofs not tested\n";
-        return;
+        return false;
     }
     auto* texels = static_cast<std::uint8_t*>(block);
     auto* keys = texels + surfaceBytes;
@@ -6478,7 +6480,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "no watched host import: refresh proofs not tested\n";
-        return;
+        return false;
     }
     TextureDetiler detiler(base);
     auto context = base;
@@ -6561,6 +6563,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
     }
     recorder.Sync();
+    return true;
 }
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): refresh proofs while
@@ -6570,12 +6573,12 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
 // its keys in O's unit 12). What a refresh answers follows the switch: unset or 0 never proves T
 // while O is pending, 1 proves it, 2 hands every predicted hit to today's refresh (verified, never
 // proved). With APS5_NO_FLUSH_PRETEST=1 every overlapping pending image has a unit "inside", so no
-// proof is ever unit-checked.
-void refreshProofUnitTests(const Device& device, Recorder& recorder) {
+// proof is ever unit-checked. False when nothing could be tested.
+bool refreshProofUnitTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: unit-checked refresh proofs not tested\n";
-        return;
+        return false;
     }
     constexpr std::size_t bytes = std::size_t{1} << 20;
     constexpr std::size_t targetOffset = 256 * 1024;
@@ -6585,7 +6588,7 @@ void refreshProofUnitTests(const Device& device, Recorder& recorder) {
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
         std::cout << "no write watching: unit-checked refresh proofs not tested\n";
-        return;
+        return false;
     }
     auto* memory = static_cast<std::uint8_t*>(block);
     std::memset(memory, 0x55, bytes);
@@ -6609,7 +6612,7 @@ void refreshProofUnitTests(const Device& device, Recorder& recorder) {
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "no watched host import: unit-checked refresh proofs not tested\n";
-        return;
+        return false;
     }
     TextureDetiler detiler(base);
     auto context = base;
@@ -6744,6 +6747,7 @@ void refreshProofUnitTests(const Device& device, Recorder& recorder) {
     if (mode == 1) Require(end.scansChecked == start.scansChecked, "1: a unit scan was checked against the loop");
     Require(end.raced == start.raced && end.keysOnly == start.keysOnly, "a predicted hit was overtaken by a store or differed in the keys");
     std::cout << "Unit-checked refresh proofs (APS5_EXPERIMENT_PROOF_UNITS=" << units << (pretest ? "" : ", no flush pretest") << "): passed\n";
+    return true;
 }
 
 
@@ -11452,10 +11456,13 @@ int main(int argc, char** argv) {
         Recorder recorder(device.GetContext());
         recorder.Activate();
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1): both refresh proof suites,
-        // for the switch's rows.
+        // for the switch's rows; skipped (77) when either could not test.
         if (argc == 2 && std::string_view(argv[1]) == "--refresh-proof-only") {
-            refreshProofTests(device, recorder);
-            refreshProofUnitTests(device, recorder);
+            const bool tested = refreshProofTests(device, recorder);
+            if (!refreshProofUnitTests(device, recorder) || !tested) {
+                std::cout << "skipped, the device imports no watched host memory for the refresh proofs\n";
+                return 77;
+            }
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {

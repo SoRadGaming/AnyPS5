@@ -168,7 +168,8 @@ void countOtherPending(CallerCounts& counts, StorageTexture::OtherPending reason
 // exit. pendingUnitInside scans only the units the range can overlap, found by division. Unset or
 // 0: today's code (no proof is unit-checked, the unit loop as it was). 1: on. 2: verify: a
 // predicted hit runs today's refresh, which must agree (StorageTexture::verifyUnitProof), and every
-// unit scan runs the loop over every unit too; a difference aborts with a [proof-units] line.
+// unit scan made under the GPU mutex runs the loop over every unit too; a difference aborts with a
+// [proof-units] line.
 int ProofUnits() {
     static const int mode = [] {
         const char* text = std::getenv("APS5_EXPERIMENT_PROOF_UNITS");
@@ -4180,8 +4181,11 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     // contiguous (unit u is [layerBegin(u), layerBegin(u) + layerBytes(u)), layerBytes at most
     // trackedLayerBytes), so only units first..last-1 can meet the range: those beginning before its
     // end, and none ending at or before its start. They take the loop's own test, so the answer is
-    // the loop's; =2 runs the loop too and aborts on a difference. Without unit bytes, or with a
-    // range end past 2^64, the loop as before.
+    // the loop's; =2 runs the loop too and aborts on a difference, under the GPU mutex only: the
+    // writers of layerPending hold it (markLayersPending sets units before it takes the registry
+    // mutex), so a scan without it (the flush hook's overlappingPending and FlushPending pretest)
+    // can see a unit change between the two reads. P1's own scans all hold it. Without unit bytes,
+    // or with a range end past 2^64, the loop as before.
     const int units = ProofUnits();
     if (units == 0 || trackedLayerBytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return everyUnit();
     bool inside = false;
@@ -4196,7 +4200,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
             inside = address < begin + layerBytes(static_cast<std::uint32_t>(layer)) && begin < end;
         }
     }
-    if (units == 2) {
+    if (units == 2 && GuestMemory::GpuMutex().HeldByThisThread()) {
         countProofUnits(UnitScansChecked);
         if (inside != everyUnit()) {
             std::fprintf(stderr, "[proof-units] APS5_EXPERIMENT_PROOF_UNITS=2: the unit scan of image 0x%llx+0x%llx (%u units of 0x%llx bytes) over 0x%llx+0x%zx says %d, the loop over every unit %d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, static_cast<unsigned long long>(trackedLayerBytes), static_cast<unsigned long long>(address), bytes, inside ? 1 : 0, inside ? 0 : 1);

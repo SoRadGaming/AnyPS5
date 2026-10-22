@@ -409,7 +409,7 @@ public:
     // converted from a plain proof (refreshProved), refreshes they answered, their per-use refusals
     // by OtherPending, =2's predictions verified against today's path (agreeing, agreeing but for
     // the keys' side effects, or overtaken by a store after the prediction), and pendingUnitInside's
-    // unit scans checked against the loop over every unit (=2).
+    // unit scans checked against the loop over every unit (=2, the scans under the GPU mutex).
     struct ProofUnitCounts {
         std::uint64_t taken = 0;
         std::uint64_t converted = 0;
