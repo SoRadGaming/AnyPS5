@@ -3073,9 +3073,14 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH=1): the audit. The first memo-decided block
-    // (equal 3) at or after the entry's cursor, wrapping, is memcmp'd as well, one per refresh. A
-    // difference means S was written behind its memo: the block is copied as a differing one, every
-    // memo of the entry is dropped, and the anomaly is counted and printed (the first 8).
+    // (equal 3) at or after the entry's cursor, wrapping, is memcmp'd as well, one per refresh. On a
+    // difference ClassifyMemoDisagreement says why. Guest memory moved since the pool hashed the
+    // block (a store is stamped, so it is compared again at the next refresh): counted raced, the
+    // memo kept, and the classifier's one read of the block decides it. S written behind its memo:
+    // the block is copied, every memo of the entry is dropped, and every other memo-decided block of
+    // this refresh that memcmp finds differing is copied too, as today's compare would. A lane
+    // collision: the block is copied. Either of the last two is an anomaly, counted and printed (the
+    // first 8).
     if (hashed && hashMode == 1) {
         std::size_t audit = spans.size();
         for (std::size_t k = 0; k < spans.size(); ++k) {
@@ -3094,10 +3099,30 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
             audited.audited = 1;
             if (std::memcmp(span.first, span.second, span.bytes) != 0) {
                 equal[audit] = 0;
-                for (auto& hash : entry.hashes) hash.known = 0;
-                audited.anomalies = 1;
-                static std::atomic<std::uint32_t> printed{0};
-                if (printed.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[snapshot-hash] audit: the memo held block %zu (guest 0x%llx, %zu bytes) of the snapshot of 0x%llx+0x%zx equal but S differs; the block is copied and the entry's memo dropped\n", at, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(span.second)), span.bytes, static_cast<unsigned long long>(address), bytes);
+                bool equalNow = false;
+                const auto cause = ClassifyMemoDisagreement(span, equalNow);
+                if (cause == MemoDisagreement::Raced) {
+                    audited.raced = 1;
+                    if (equalNow) equal[audit] = 1;
+                } else {
+                    audited.anomalies = 1;
+                    std::size_t healed = 0;
+                    if (cause == MemoDisagreement::Stale) {
+                        for (auto& hash : entry.hashes) hash.known = 0;
+                        for (std::size_t k = 0; k < spans.size(); ++k) {
+                            if (equal[k] != 3 || std::memcmp(spans[k].first, spans[k].second, spans[k].bytes) == 0) continue;
+                            equal[k] = 0;
+                            ++healed;
+                        }
+                    } else {
+                        audited.falseEqual = 1;
+                    }
+                    static std::atomic<std::uint32_t> printed{0};
+                    if (printed.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        if (cause == MemoDisagreement::Stale) std::fprintf(stderr, "[snapshot-hash] audit: the memo held block %zu (guest 0x%llx, %zu bytes) of the snapshot of 0x%llx+0x%zx equal but S differs from its memo (written behind it); the block and %zu more memo-decided blocks that differ are copied, and the entry's memo dropped\n", at, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(span.second)), span.bytes, static_cast<unsigned long long>(address), bytes, healed);
+                        else std::fprintf(stderr, "[snapshot-hash] audit: the memo held block %zu (guest 0x%llx, %zu bytes) of the snapshot of 0x%llx+0x%zx equal, and one read of guest memory hashes to the memo yet differs from S (a lane collision); the block is copied\n", at, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(span.second)), span.bytes, static_cast<unsigned long long>(address), bytes);
+                    }
+                }
             }
             NoteSnapshotHashCounts(audited);
         }
@@ -3129,10 +3154,10 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto last = lastMs.load();
         if (nowMs - last >= 10000 && lastMs.compare_exchange_strong(last, nowMs)) {
-            char memo[256] = "";
+            char memo[320] = "";
             if (hashMode != 0) {
                 const auto hashCounts = TakeSnapshotHashCounts();
-                std::snprintf(memo, sizeof(memo), "; hash memo: decided %llu (equal %llu), learned %llu, rehashed %llu, audited %llu (anomalies %llu); verify: false-equal %llu, stale %llu", static_cast<unsigned long long>(hashCounts.decided), static_cast<unsigned long long>(hashCounts.decidedEqual), static_cast<unsigned long long>(hashCounts.learned), static_cast<unsigned long long>(hashCounts.rehashed), static_cast<unsigned long long>(hashCounts.audited), static_cast<unsigned long long>(hashCounts.anomalies), static_cast<unsigned long long>(hashCounts.falseEqual), static_cast<unsigned long long>(hashCounts.stale));
+                std::snprintf(memo, sizeof(memo), "; hash memo: decided %llu (equal %llu), learned %llu, rehashed %llu, audited %llu (anomalies %llu); verify: false-equal %llu, stale %llu; guest moved between reads %llu", static_cast<unsigned long long>(hashCounts.decided), static_cast<unsigned long long>(hashCounts.decidedEqual), static_cast<unsigned long long>(hashCounts.learned), static_cast<unsigned long long>(hashCounts.rehashed), static_cast<unsigned long long>(hashCounts.audited), static_cast<unsigned long long>(hashCounts.anomalies), static_cast<unsigned long long>(hashCounts.falseEqual), static_cast<unsigned long long>(hashCounts.stale), static_cast<unsigned long long>(hashCounts.raced));
             }
             std::fprintf(stderr, "[snapshot-stats] refreshes %llu (sole %llu), snapshot bytes %.1f MiB, blocks compared %llu (%.1f MiB), equal %llu; CPU-stamped %llu (equal %llu)%s\n", static_cast<unsigned long long>(refreshes.exchange(0)), static_cast<unsigned long long>(soles.exchange(0)), totalBytes.exchange(0) / 1048576.0, static_cast<unsigned long long>(blocks.exchange(0)), compared.exchange(0) / 1048576.0, static_cast<unsigned long long>(equalBlocks.exchange(0)), static_cast<unsigned long long>(cpuBlocks.exchange(0)), static_cast<unsigned long long>(cpuEqual.exchange(0)), memo);
         }

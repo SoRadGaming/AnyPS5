@@ -4474,9 +4474,10 @@ void drawSnapshotEvictionTests(const Device& device) {
 // first refresh after KeepDrawSnapshot learns every block's memo (memcmp) and the next is decided by
 // it; a CPU store's block is copied and rehashed from S (the next refresh decides it equal); a
 // differing block with another holder of S erases the entry; and S written through its mapping
-// behind its memo (a hidden writer) is counted stale at =2, aborts at =3 (the last case; its ctest
-// row matches the [snapshot-hash] line), and is found by =1's audit within one refresh per block,
-// which copies the block and drops the entry's memo.
+// behind its memo in two blocks (a hidden writer) is counted stale twice at =2, aborts at =3 (the
+// last case; its ctest row matches the [snapshot-hash] line), and is found by =1's audit within one
+// refresh per block, which copies the audited block and the other one (both differ in that refresh,
+// as today's compare would copy them) and drops the entry's memo.
 bool drawSnapshotRefreshTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t bytes = std::size_t{4} << 20u;
@@ -4496,6 +4497,9 @@ bool drawSnapshotRefreshTests(const Device& device) {
     const auto address = reinterpret_cast<std::uint64_t>(memory);
     const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const int mode = SnapshotHashMode();
+    // ReusableDrawSnapshot asserts the hold (APS5_ASSERT_GPU_LOCK=1); the compare pool's helpers never
+    // take it.
+    std::unique_lock gpu(GpuMutex());
     Recorder cache(device.GetContext());
     // A new entry holding a copy of guest memory; the entry holds the only reference to S, whose
     // mapped bytes are returned.
@@ -4533,7 +4537,7 @@ bool drawSnapshotRefreshTests(const Device& device) {
     Require(refresh() && current(held), "a refresh over unchanged bytes lost the snapshot");
     counts = TakeSnapshotHashCounts();
     if (mode == 0) Require(counts.learned == 0 && counts.decided == 0 && counts.audited == 0, "a hash memo was used with the switch unset");
-    else Require(counts.decided == count && counts.decidedEqual == count && counts.learned == 0 && counts.falseEqual == 0 && counts.stale == 0 && counts.audited == (mode == 1 ? 1 : 0) && counts.anomalies == 0, "the second refresh was not decided by the hash memo");
+    else Require(counts.decided == count && counts.decidedEqual == count && counts.learned == 0 && counts.falseEqual == 0 && counts.stale == 0 && counts.raced == 0 && counts.audited == (mode == 1 ? 1 : 0) && counts.anomalies == 0, "the second refresh was not decided by the hash memo");
     // Copy and rehash: a CPU store's block alone is compared, differs, and is copied, then rehashed
     // from S, so the next refresh decides it equal.
     guest[5 * block + 123] ^= 0xFFu;
@@ -4555,14 +4559,15 @@ bool drawSnapshotRefreshTests(const Device& device) {
         Require(std::memcmp(held.data() + 9 * block, guest + 9 * block, block) != 0, "a failed refresh wrote a snapshot another holder still reads");
     }
     TakeSnapshotHashCounts();
-    // S written through its mapping behind its memo, guest memory unchanged. A recreated entry
-    // starts without a memo, so it learns first.
+    // S written through its mapping behind its memo in blocks 7 and 11, guest memory unchanged. A
+    // recreated entry starts without a memo, so it learns first.
     held = keep();
     MarkWritten(address, bytes);
     Require(refresh() && current(held), "a refresh over unchanged bytes lost the recreated snapshot");
     counts = TakeSnapshotHashCounts();
     Require(counts.learned == (mode != 0 ? count : 0) && counts.decided == 0, "a recreated snapshot did not start without a hash memo");
     held[7 * block + 40] ^= std::byte{0x5A};
+    held[11 * block + 4000] ^= std::byte{0x5A};
     if (mode == 0) {
         MarkWritten(address, bytes);
         Require(refresh() && current(held), "the compare did not heal a snapshot written behind it");
@@ -4575,16 +4580,17 @@ bool drawSnapshotRefreshTests(const Device& device) {
             counts = TakeSnapshotHashCounts();
             Require(counts.audited == 1, "a refresh decided by the hash memo audited no block");
         } while (counts.anomalies == 0 && refreshes < count);
-        Require(counts.anomalies == 1 && current(held), "the audit did not find and copy a block of S written behind its memo within one refresh per block");
+        Require(counts.anomalies == 1 && counts.falseEqual == 0 && counts.raced == 0, "the audit did not find a block of S written behind its memo within one refresh per block");
+        Require(counts.rehashed == 2 && current(held), "the audit's anomaly did not copy every memo-decided block of its refresh that differs");
         MarkWritten(address, bytes);
         Require(refresh() && current(held), "a refresh over unchanged bytes lost the snapshot");
         counts = TakeSnapshotHashCounts();
-        Require(counts.learned == count - 1 && counts.decided == 1 && counts.anomalies == 0, "the audit's anomaly did not drop the entry's memo, or the copied block was not rehashed");
+        Require(counts.learned == count - 2 && counts.decided == 2 && counts.decidedEqual == 2 && counts.anomalies == 0, "the audit's anomaly did not drop the entry's memo, or the copied blocks were not rehashed");
     } else if (mode == 2) {
         MarkWritten(address, bytes);
         Require(refresh() && current(held), "=2 did not use memcmp's verdict for a snapshot written behind its memo");
         counts = TakeSnapshotHashCounts();
-        Require(counts.stale == 1 && counts.falseEqual == 0 && counts.rehashed == 1, "=2 did not count the stale memo of a snapshot written behind it");
+        Require(counts.stale == 2 && counts.falseEqual == 0 && counts.raced == 0 && counts.rehashed == 2, "=2 did not count the stale memos of a snapshot written behind them");
     } else {
 #ifdef _WIN32
         SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);

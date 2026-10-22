@@ -41,9 +41,11 @@ std::array<std::uint64_t, 4> HashLanes(const void* data, std::size_t bytes);
 // verdict used, false-equals and stale memos counted); 3 as 2, aborting on the first of either.
 int SnapshotHashMode();
 // Totals since the last take ([snapshot-stats]): blocks the memo decided (and found equal), memos
-// learned from a memcmp, blocks rehashed after their copy, audited blocks (and differences found),
-// and under =2/=3 memo verdicts memcmp contradicted (false-equal: a lane collision; stale: the memo
-// no longer described S).
+// learned from a memcmp, blocks rehashed after their copy, audited blocks (and anomalies: the audit
+// found the memo wrong, S written behind it or a lane collision), memo verdicts memcmp contradicted
+// (false-equal: a lane collision, under =2/=3 or found by the audit; stale, under =2/=3: the memo no
+// longer described S), and contradictions guest memory moving between the two reads explains
+// (raced: not a fault of the memo).
 struct SnapshotHashCounts {
     std::uint64_t decided = 0;
     std::uint64_t decidedEqual = 0;
@@ -53,9 +55,19 @@ struct SnapshotHashCounts {
     std::uint64_t anomalies = 0;
     std::uint64_t falseEqual = 0;
     std::uint64_t stale = 0;
+    std::uint64_t raced = 0;
 };
 void NoteSnapshotHashCounts(const SnapshotHashCounts& counts);
 SnapshotHashCounts TakeSnapshotHashCounts();
+// Why a known memo's verdict and a memcmp of the same span disagreed when each read guest memory at
+// its own time (a guest CPU store may land between them, GPU-OWNED-PLAN 2.3). Stale: HashLanes of S
+// is not the memo, so S was written behind it (exact: nothing writes S meanwhile); the memo is
+// repaired from S and `equal` is left as passed. Otherwise one copy of the guest block decides both
+// verdicts, and `equal` gets the copy's memcmp verdict: hashing to the memo while differing from S
+// is a lane collision; anything else means guest memory moved between the reads (raced). The rare
+// path: it allocates the copy.
+enum class MemoDisagreement : std::uint8_t { Raced, Stale, Collision };
+MemoDisagreement ClassifyMemoDisagreement(const CompareSpan& span, bool& equal);
 
 }
 

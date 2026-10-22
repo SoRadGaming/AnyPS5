@@ -27,6 +27,7 @@ struct SnapshotHashTotals {
     std::atomic<std::uint64_t> anomalies{0};
     std::atomic<std::uint64_t> falseEqual{0};
     std::atomic<std::uint64_t> stale{0};
+    std::atomic<std::uint64_t> raced{0};
 };
 
 constinit SnapshotHashTotals snapshotHashTotals;
@@ -39,11 +40,13 @@ constinit SnapshotHashTotals snapshotHashTotals;
 
 // A span with a hash memo: an unknown memo is learned from S when memcmp finds the block equal (S
 // was just read, so the hash reads it from L2); a known one decides from guest memory alone. Under
-// =2/=3 memcmp runs beside every memo verdict and its verdict is used. When they disagree, a memo
-// that no longer describes S is stale (S was written behind it) and is repaired from S; otherwise
-// the memo held a differing block equal through a lane collision (false-equal). Each span writes
-// only its own memo, and Run's acquire of `done` orders the helpers' writes before the caller's
-// reads.
+// =2/=3 memcmp runs beside every memo verdict and its verdict is used. The two read guest memory at
+// different times, so a disagreement is classified (ClassifyMemoDisagreement): a memo that no
+// longer describes S is stale (S was written behind it) and is repaired from S; one copy of the
+// guest block hashing to the memo while differing from S is a lane collision (false-equal); else a
+// guest store landed between the reads (raced: counted, never fatal, the copy's memcmp verdict
+// used). Each span writes only its own memo, and Run's acquire of `done` orders the helpers' writes
+// before the caller's reads.
 [[gnu::noinline]] std::uint8_t compareHashed(const CompareSpan& span, SnapshotHashCounts& counts) {
     auto& memo = *span.hash;
     if (memo.known == 0) {
@@ -58,16 +61,17 @@ constinit SnapshotHashTotals snapshotHashTotals;
     if (const int mode = SnapshotHashMode(); mode >= 2) {
         const bool bytesEqual = std::memcmp(span.first, span.second, span.bytes) == 0;
         if (hashEqual != bytesEqual) {
-            const auto lanes = HashLanes(span.first, span.bytes);
-            const bool stale = lanes != memo.lanes;
-            if (stale) {
-                ++counts.stale;
-                memo.lanes = lanes;
-            } else {
-                ++counts.falseEqual;
+            bool equal = bytesEqual;
+            const auto cause = ClassifyMemoDisagreement(span, equal);
+            if (cause == MemoDisagreement::Raced) {
+                ++counts.raced;
+                return equal ? 1 : 0;
             }
+            const bool stale = cause == MemoDisagreement::Stale;
+            if (stale) ++counts.stale;
+            else ++counts.falseEqual;
             if (mode == 3) snapshotHashDisagrees(span, stale ? "a stale memo (S changed behind it) disagrees with memcmp" : "the memo held a differing block equal (a lane collision)");
-            return bytesEqual ? 1 : 0;
+            return equal ? 1 : 0;
         }
     }
     if (!hashEqual) return 0;
@@ -304,6 +308,21 @@ std::array<std::uint64_t, 4> HashLanes(const void* data, std::size_t bytes) {
     return lanes;
 }
 
+MemoDisagreement ClassifyMemoDisagreement(const CompareSpan& span, bool& equal) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH): S has no writer while it is compared (the
+    // committer holds GpuMutex and waits for the compare), so its lanes decide staleness exactly.
+    // Guest memory is read once more, into a copy, so the collision test sees one state of it.
+    auto& memo = *span.hash;
+    if (const auto lanes = HashLanes(span.first, span.bytes); lanes != memo.lanes) {
+        memo.lanes = lanes;
+        return MemoDisagreement::Stale;
+    }
+    std::vector<std::byte> copy(span.bytes);
+    std::memcpy(copy.data(), span.second, span.bytes);
+    equal = std::memcmp(span.first, copy.data(), span.bytes) == 0;
+    return !equal && HashLanes(copy.data(), span.bytes) == memo.lanes ? MemoDisagreement::Collision : MemoDisagreement::Raced;
+}
+
 int SnapshotHashMode() {
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_SNAPSHOT_HASH, GPU-OWNED-PLAN L1-1): read once per process.
     static const int mode = [] {
@@ -327,12 +346,13 @@ void NoteSnapshotHashCounts(const SnapshotHashCounts& counts) {
     add(totals.anomalies, counts.anomalies);
     add(totals.falseEqual, counts.falseEqual);
     add(totals.stale, counts.stale);
+    add(totals.raced, counts.raced);
 }
 
 SnapshotHashCounts TakeSnapshotHashCounts() {
     const auto take = [](std::atomic<std::uint64_t>& total) { return total.exchange(0, std::memory_order_relaxed); };
     auto& totals = snapshotHashTotals;
-    return {take(totals.decided), take(totals.decidedEqual), take(totals.learned), take(totals.rehashed), take(totals.audited), take(totals.anomalies), take(totals.falseEqual), take(totals.stale)};
+    return {take(totals.decided), take(totals.decidedEqual), take(totals.learned), take(totals.rehashed), take(totals.audited), take(totals.anomalies), take(totals.falseEqual), take(totals.stale), take(totals.raced)};
 }
 
 }

@@ -10518,7 +10518,7 @@ void snapshotHashCompareTests() {
         CompareSpansFrom(spans, equal, threshold);
         for (std::size_t k = 0; k < count; ++k) Require(equal[k] == (differsIn(k) ? 0 : 3), "a known hash memo did not decide its equal span");
         counts = TakeSnapshotHashCounts();
-        Require(counts.decided == equalSpans && counts.decidedEqual == equalSpans && counts.learned == 0 && counts.falseEqual == 0 && counts.stale == 0, "the hash memo counted the wrong decided spans");
+        Require(counts.decided == equalSpans && counts.decidedEqual == equalSpans && counts.learned == 0 && counts.falseEqual == 0 && counts.stale == 0 && counts.raced == 0, "the hash memo counted the wrong decided spans");
         std::copy(original.begin(), original.end(), guest.begin());
         std::fill(equal.begin(), equal.end(), 2);
         CompareSpansFrom(spans, equal, threshold);
@@ -10538,7 +10538,7 @@ void snapshotHashCompareTests() {
             guest[position] ^= std::byte{0x01};
         }
         counts = TakeSnapshotHashCounts();
-        Require(counts.decided == probes.size() * count && counts.falseEqual == 0 && counts.stale == 0, "a changed guest byte counted a verify disagreement");
+        Require(counts.decided == probes.size() * count && counts.falseEqual == 0 && counts.stale == 0 && counts.raced == 0, "a changed guest byte counted a verify disagreement");
         // With known memos and guest memory unchanged S is not read: garbage in S still reads as equal
         // by the memo. Under =2 memcmp runs beside it, so its verdict (differs) is used, and the memo,
         // which no longer describes S, is counted stale and repaired from S; =3 would abort.
@@ -10549,11 +10549,43 @@ void snapshotHashCompareTests() {
         counts = TakeSnapshotHashCounts();
         if (mode == 2) {
             for (std::size_t k = 0; k < count; ++k) Require(equal[k] == 0 && memo[k].lanes == HashLanes(snapshot.data() + k * block, lengthOf(k)), "=2 did not use memcmp's verdict or repair a stale hash memo");
-            Require(counts.stale == count && counts.falseEqual == 0, "=2 did not count each stale hash memo");
+            Require(counts.stale == count && counts.falseEqual == 0 && counts.raced == 0, "=2 did not count each stale hash memo");
         } else {
             for (std::size_t k = 0; k < count; ++k) Require(equal[k] == 3, "a known hash memo read S: garbage in S changed its verdict");
             Require(counts.decidedEqual == count, "the hash memo counted the wrong decided spans over garbage in S");
         }
+    }
+    // ClassifyMemoDisagreement, as =2/=3 and the =1 audit call it when a memo verdict and a memcmp
+    // that read guest memory at different times disagree. S has no writer, so a memo that is not
+    // S's lanes is stale whatever guest memory holds: repaired from S, the passed verdict kept. With
+    // the memo S's lanes, one copy of guest memory decides: guest memory that differs from S and
+    // does not hash to the memo, or now equals S, moved between the two reads (raced), never a lane
+    // collision, and the verdict is the copy's. (A real collision cannot be built.)
+    {
+        std::vector<std::byte> snapshotBlock(block + 100), guestBlock(block + 100);
+        for (std::size_t i = 0; i < snapshotBlock.size(); ++i) snapshotBlock[i] = static_cast<std::byte>((i * 37u + 11u) & 0xFFu);
+        guestBlock = snapshotBlock;
+        SpanHash memo;
+        memo.lanes = HashLanes(snapshotBlock.data(), snapshotBlock.size());
+        memo.known = 1;
+        const CompareSpan span{snapshotBlock.data(), guestBlock.data(), snapshotBlock.size(), &memo};
+        const auto lanes = memo.lanes;
+        // The pool's hash matched the memo, then a store landed before memcmp read the block.
+        guestBlock[block / 2] ^= std::byte{0x10};
+        bool equal = true;
+        Require(ClassifyMemoDisagreement(span, equal) == MemoDisagreement::Raced && !equal && memo.lanes == lanes && memo.known != 0, "guest memory that moved after its hash was not classified raced, or its verdict or memo changed");
+        // The hash read the store, then a second store restored the block before memcmp.
+        guestBlock[block / 2] ^= std::byte{0x10};
+        equal = false;
+        Require(ClassifyMemoDisagreement(span, equal) == MemoDisagreement::Raced && equal && memo.lanes == lanes, "guest memory that moved back to S's bytes was classified a lane collision");
+        // S written behind the memo: stale whatever guest memory holds.
+        snapshotBlock[block + 50] ^= std::byte{0x01};
+        guestBlock[3] ^= std::byte{0x01};
+        equal = false;
+        Require(ClassifyMemoDisagreement(span, equal) == MemoDisagreement::Stale && !equal && memo.lanes == HashLanes(snapshotBlock.data(), snapshotBlock.size()), "a memo S was written behind was not classified stale and repaired from S");
+        memo.lanes = lanes;
+        equal = true;
+        Require(ClassifyMemoDisagreement(span, equal) == MemoDisagreement::Stale && equal, "a stale memo's classification changed the passed verdict");
     }
     // HashLanes: a change confined to one 8-byte word always changes the lanes. A 4,109-byte buffer
     // (128 stripes, one whole word for lane 0, a 5-byte tail word for lane 1): every byte flipped,
