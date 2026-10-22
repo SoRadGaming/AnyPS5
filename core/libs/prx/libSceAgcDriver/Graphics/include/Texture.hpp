@@ -396,13 +396,34 @@ public:
         bool profiled;
         bool previous = false;
     };
-    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): what the other pending images over the
-    // surface {baseAddress, guestBytes} and over its DCC keys {dccAddress, DccKeyBytes(guestBytes)}
-    // hold, the first of: one a FlushPending is storing right now (Flushing), one of exactly this
-    // surface (SameRange: pendingAlias's candidates), one with a pending unit inside the surface
-    // (Inside: FlushPending's own pretest) or inside the keys only (KeyRange); else Outside (no
-    // pending unit of theirs inside either range: a refresh's FlushPending would store nothing).
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0) and LOCAL EXPERIMENT
+    // (APS5_EXPERIMENT_PROOF_UNITS, L2-1): what the other pending images over the surface
+    // {baseAddress, guestBytes} and over its DCC keys {dccAddress, DccKeyBytes(guestBytes)} hold, the
+    // first of: one a FlushPending is storing right now (Flushing), one of exactly this surface
+    // (SameRange: pendingAlias's candidates), one with a pending unit inside the surface (Inside:
+    // FlushPending's own pretest) or inside the keys only (KeyRange); else Outside (no pending unit
+    // of theirs inside either range: a refresh's FlushPending would store nothing).
     enum class OtherPending : std::uint8_t { Outside, Flushing, SameRange, Inside, KeyRange, Count };
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): cumulative counts,
+    // kept while the switch is set: unit-checked refresh proofs taken at the unchanged exit and
+    // converted from a plain proof (refreshProved), refreshes they answered, their per-use refusals
+    // by OtherPending, =2's predictions verified against today's path (agreeing, agreeing but for
+    // the keys' side effects, or overtaken by a store after the prediction), and pendingUnitInside's
+    // unit scans checked against the loop over every unit (=2).
+    struct ProofUnitCounts {
+        std::uint64_t taken = 0;
+        std::uint64_t converted = 0;
+        std::uint64_t hits = 0;
+        std::uint64_t refusedFlushing = 0;
+        std::uint64_t refusedSameRange = 0;
+        std::uint64_t refusedInside = 0;
+        std::uint64_t refusedKeyRange = 0;
+        std::uint64_t verified = 0;
+        std::uint64_t keysOnly = 0;
+        std::uint64_t raced = 0;
+        std::uint64_t scansChecked = 0;
+    };
+    static ProofUnitCounts ProofUnitTotals();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t HandedOverSuperseded();
     static void SetClearHandOver(bool enabled);
@@ -521,6 +542,26 @@ private:
     void takeRefreshProof(bool aliased, bool profile);
     bool otherPendingOverlaps() const;
     OtherPending otherPendingReason() const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): otherPendingReason is
+    // not Outside. Under the registry mutex, after its lock-free checks.
+    bool otherPendingInside() const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1): what refresh() saw when it took over a
+    // unit-checked hit refreshProved predicted (the generations the proof held, WaitForKeyWriters'
+    // syncs then; whether depth planes were stored over the surface and whether pendingAlias found
+    // an image), and the check of today's path against it: `why` null means it ended at the
+    // unchanged exit with nothing flushed, borrowed, handed over or changed, else it names the
+    // first difference. A difference aborts unless it is not `structural` and a store landed in
+    // the surface or its keys after the prediction (counted as raced); a key-proof side effect
+    // alone (WaitForKeyWriters synced or dropped the key proof) is counted apart (keys only).
+    struct UnitProofWitness {
+        bool predicted = false;
+        bool depthStored = false;
+        bool aliasSeen = false;
+        std::uint64_t generation = 0;
+        std::uint64_t keyGeneration = 0;
+        std::uint64_t keySyncs = 0;
+    };
+    void verifyUnitProof(const UnitProofWitness& witness, const char* why, bool structural) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -652,8 +693,17 @@ private:
         std::uint64_t pendingSerial = 0;
         std::uint64_t keyGeneration = 0;
         DccKeys keys = DccKeys::Uncompressed;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): the proof was taken,
+        // or kept, while another pending image overlapped with no pending unit inside the surface or
+        // its keys, so every use checks that again (otherPendingInside): a unit marked in an image
+        // already pending moves no pending serial. Never set while the switch is unset.
+        bool unitChecked = false;
     };
     RefreshProof refreshProof;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1): refreshProved found a unit-checked proof
+    // holding and left the refresh to today's path, which refresh() checks against it. Written under
+    // GuestMemory::GpuMutex only, as refreshProof is.
+    bool unitProofPredicted = false;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;

@@ -160,8 +160,42 @@ void countOtherPending(CallerCounts& counts, StorageTexture::OtherPending reason
     counts[proofCaller()][static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): a refresh proof is taken
+// and kept while other pending images overlap the surface, as long as none of them has a pending
+// unit inside the surface or its DCC keys, none is being stored and none is of exactly this
+// surface, which every use checks again (StorageTexture::otherPendingInside): in that state today's
+// refresh flushes nothing (FlushPending's pretest skips every such image) and ends at its unchanged
+// exit. pendingUnitInside scans only the units the range can overlap, found by division. Unset or
+// 0: today's code (no proof is unit-checked, the unit loop as it was). 1: on. 2: verify: a
+// predicted hit runs today's refresh, which must agree (StorageTexture::verifyUnitProof), and every
+// unit scan runs the loop over every unit too; a difference aborts with a [proof-units] line.
+int ProofUnits() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_PROOF_UNITS");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, P1): StorageTexture::ProofUnitCounts, counted while
+// the switch is set (relaxed, cumulative; the [proofs] line prints 10 s deltas). The four refusals
+// follow OtherPending's order from Flushing.
+enum ProofUnitCount : std::size_t { UnitTaken, UnitConverted, UnitHits, UnitRefusedFlushing, UnitRefusedSameRange, UnitRefusedInside, UnitRefusedKeyRange, UnitVerified, UnitKeysOnly, UnitRaced, UnitScansChecked, ProofUnitCountCount };
+constexpr std::array<const char*, ProofUnitCountCount> ProofUnitCountNames{"unit-checked proofs taken", "converted", "hits", "refused per use: flushing", "same range", "unit inside", "key range", "=2: verified", "keys only", "raced", "unit scans checked"};
+constinit std::array<std::atomic<std::uint64_t>, ProofUnitCountCount> proofUnitCounts{};
+
+void countProofUnits(ProofUnitCount kind) {
+    proofUnitCounts[kind].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countUnitRefusal(StorageTexture::OtherPending reason) {
+    countProofUnits(static_cast<ProofUnitCount>(UnitRefusedFlushing + static_cast<std::size_t>(reason) - static_cast<std::size_t>(StorageTexture::OtherPending::Flushing)));
+}
+
 // The [proofs] line, from reportStorageTraffic (under the traffic mutex): every reason as target
-// lookups/other callers.
+// lookups/other callers, then P1's counts while its switch is set.
 void reportProofs() {
     std::string line;
     char text[160];
@@ -182,6 +216,18 @@ void reportProofs() {
     line += " (other pending:";
     list(OtherPendingNames, proofCounts.refusedOther);
     line += ")";
+    if (const int units = ProofUnits(); units != 0) {
+        static std::array<std::uint64_t, ProofUnitCountCount> reported{};
+        std::snprintf(text, sizeof(text), "; P1 (APS5_EXPERIMENT_PROOF_UNITS=%d):", units);
+        line += text;
+        for (std::size_t i = 0; i < ProofUnitCountCount; ++i) {
+            const auto now = proofUnitCounts[i].load(std::memory_order_relaxed);
+            const char* separator = i == 0 ? "" : i == UnitRefusedFlushing || i == UnitVerified || i == UnitScansChecked ? ";" : ",";
+            std::snprintf(text, sizeof(text), "%s %s %llu", separator, ProofUnitCountNames[i], static_cast<unsigned long long>(now - reported[i]));
+            line += text;
+            reported[i] = now;
+        }
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[proofs] storage refresh proofs per 10 s (target lookups/other callers): %s\n", line.c_str());
 }
 
@@ -2137,6 +2183,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
         return true;
     }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, GPU-OWNED-PLAN L2-1, P1): refreshProved found a
+    // unit-checked proof holding and handed the refresh to today's path below, which must agree
+    // (verifyUnitProof at its two exits).
+    UnitProofWitness witness;
+    if (unitProofPredicted) {
+        unitProofPredicted = false;
+        witness = {true, false, false, generation, keyProof.generation, KeyWaitCounts().synced};
+    }
     refreshProof = {};
     struct Exempt {
         const StorageTexture* previous;
@@ -2154,6 +2208,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = scoped ? std::shared_ptr<StorageTexture>{} : pendingAlias();
+    if (witness.predicted) witness.aliasSeen = alias != nullptr;
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
@@ -2172,6 +2227,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     handedOver.clear();
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr && !scoped ? clearHandOver() : std::nullopt;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1): the depth planes FlushPending stores
+    // first, stored here instead with the same range, so the check learns whether any were
+    // (FlushPending's own call then finds none stale).
+    if (witness.predicted && !handOverKeys.has_value()) witness.depthStored = !FlushDepthPlanes(scopeBegin, scopeBytes).empty();
     const bool flushed = !handOverKeys.has_value() && FlushPending(scopeBegin, scopeBytes, alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
@@ -2327,6 +2386,28 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool outsideChanged = std::any_of(outside.begin(), outside.end(), [](bool value) { return value; });
     if (scoped) noteLayersBehind(firstLayer, lastLayer, outside);
     else layerBehind.clear();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1): the first way today's path differed from
+    // the predicted hit (nullptr: none). The structural ones contradict what the unit check found
+    // (nothing to flush, no alias, no hand-over); the others take a store into the surface or its
+    // keys, which verifyUnitProof tells apart from one that landed after the prediction.
+    const auto unitProofDifference = [&](bool upload, bool& structural) -> const char* {
+        structural = true;
+        if (witness.depthStored) return "depth planes were stored over the surface";
+        if (flushed) return "the flush stored other images' results";
+        if (witness.aliasSeen || alias != nullptr) return "an alias of the surface is pending";
+        if (handOverKeys.has_value()) return "the clear-key hand-over took other images' units";
+        if (anyBorrowed) return "units were borrowed";
+        structural = false;
+        if (keysChanged) return "the keys changed";
+        if (!stamped || compared) return "the surface was compared";
+        if (outsideChanged) return "layers outside the scope changed";
+        return upload ? "the refresh reached the upload path" : nullptr;
+    };
+    if (witness.predicted) {
+        bool structural = false;
+        const auto* why = unitProofDifference(!unchanged, structural);
+        verifyUnitProof(witness, why, structural);
+    }
     if (unchanged) {
         ++Profile().storageReused;
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -2526,14 +2607,101 @@ bool StorageTexture::refreshProved(bool profile) {
     }
     if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return fail(FailStamped);
     const auto serial = PendingSerial();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): a unit-checked proof
+    // holds while no other pending image has a pending unit inside the surface or its keys, none
+    // is being stored and none is of this surface, checked on every use (markLayersPending on an
+    // image already pending sets units without moving the serial). =2 hands each hit to today's
+    // path, which refresh() checks against it.
+    const auto unitHit = [&] {
+        refreshProof.pendingSerial = serial;
+        if (ProofUnits() == 2) {
+            unitProofPredicted = true;
+            return false;
+        }
+        countProofUnits(UnitHits);
+        return true;
+    };
+    if (refreshProof.unitChecked) {
+        const auto reason = otherPendingReason();
+        if (reason == OtherPending::Outside) return unitHit();
+        countUnitRefusal(reason);
+        if (profile) countOtherPending(proofCounts.failedOther, reason);
+        return fail(FailOtherPending);
+    }
     if (serial != refreshProof.pendingSerial) {
         if (otherPendingOverlaps()) {
-            if (profile) countOtherPending(proofCounts.failedOther, otherPendingReason());
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, P1): with no pending unit of theirs
+            // inside, the proof becomes unit-checked instead of failing (one slow path saved per
+            // change of the registry).
+            const int units = ProofUnits();
+            const auto reason = profile || units != 0 ? otherPendingReason() : OtherPending::Outside;
+            if (units != 0 && reason == OtherPending::Outside) {
+                refreshProof.unitChecked = true;
+                countProofUnits(UnitConverted);
+                return unitHit();
+            }
+            if (profile) countOtherPending(proofCounts.failedOther, reason);
             return fail(FailOtherPending);
         }
         refreshProof.pendingSerial = serial;
     }
     return true;
+}
+
+bool StorageTexture::otherPendingInside() const {
+    return otherPendingReason() != OtherPending::Outside;
+}
+
+void StorageTexture::verifyUnitProof(const UnitProofWitness& witness, const char* why, bool structural) const {
+    const auto keyBytes = descriptor.dccAddress != 0 ? DccKeyBytes(guestBytes) : 0;
+    static std::atomic<int> reports{0};
+    if (why == nullptr) {
+        // WaitForKeyWriters (inside ProvedKeys) synced the key writers or dropped the key proof: a
+        // side effect the proved route skips, today's as well as this one.
+        if (keyBytes != 0 && (keyProof.generation != witness.keyGeneration || KeyWaitCounts().synced != witness.keySyncs)) {
+            countProofUnits(UnitKeysOnly);
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[proof-units] image 0x%llx+0x%llx: today's refresh agreed with the unit-checked proof but for the keys (key proof generation %llu -> %llu, key writers synced %s)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(witness.keyGeneration), static_cast<unsigned long long>(keyProof.generation), KeyWaitCounts().synced != witness.keySyncs ? "yes" : "no");
+            return;
+        }
+        countProofUnits(UnitVerified);
+        return;
+    }
+    // A store into the surface or its keys after the prediction (a new collect epoch on this thread,
+    // a driver or HLE stamp from another) is what today's proved route would answer alike.
+    if (!structural && (!GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), witness.generation) || (keyBytes != 0 && !GuestMemory::UnchangedSince(descriptor.dccAddress, keyBytes, witness.keyGeneration)))) {
+        countProofUnits(UnitRaced);
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[proof-units] image 0x%llx+0x%llx: %s after a store that landed after the unit-checked prediction (not a disagreement)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), why);
+        return;
+    }
+    std::string others;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const auto describe = [&](const StorageTexture* texture, const char* list) {
+            if (texture == this || !(texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) || (keyBytes != 0 && texture->overlaps(descriptor.dccAddress, keyBytes)))) return;
+            char text[160];
+            std::snprintf(text, sizeof(text), " [%s 0x%llx+0x%llx, units", list, static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes));
+            others += text;
+            std::size_t listed = 0;
+            for (std::uint32_t unit = 0; unit < texture->trackedLayers && listed < 32; ++unit) {
+                if (!texture->layerPending[unit]) continue;
+                std::snprintf(text, sizeof(text), " %u", unit);
+                others += text;
+                ++listed;
+            }
+            others += "]";
+        };
+        for (const auto* texture : pending.textures) describe(texture, "pending");
+        for (const auto* texture : pending.flushing) describe(texture, "flushing");
+    }
+    std::fprintf(stderr, "[proof-units] APS5_EXPERIMENT_PROOF_UNITS=2: today's refresh of image 0x%llx+0x%llx (keys 0x%llx+0x%zx) disagrees with the unit-checked proof: %s; other pending images over it:%s\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), keyBytes, why, others.empty() ? " none" : others.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
+StorageTexture::ProofUnitCounts StorageTexture::ProofUnitTotals() {
+    const auto load = [](ProofUnitCount kind) { return proofUnitCounts[kind].load(std::memory_order_relaxed); };
+    return {load(UnitTaken), load(UnitConverted), load(UnitHits), load(UnitRefusedFlushing), load(UnitRefusedSameRange), load(UnitRefusedInside), load(UnitRefusedKeyRange), load(UnitVerified), load(UnitKeysOnly), load(UnitRaced), load(UnitScansChecked)};
 }
 
 void StorageTexture::takeRefreshProof(bool aliased, bool profile) {
@@ -2549,11 +2717,20 @@ void StorageTexture::takeRefreshProof(bool aliased, bool profile) {
     if (descriptor.dccAddress != 0 && keyProof.generation == 0) return refuse(RefuseKeyProofEmpty);
     if (descriptor.dccAddress != 0 && keyProof.keys != uploadedKeys) return refuse(RefuseKeyProofKeys);
     const auto serial = PendingSerial();
+    bool unitChecked = false;
     if (otherPendingOverlaps()) {
-        if (profile) countOtherPending(proofCounts.refusedOther, otherPendingReason());
-        return refuse(RefuseOtherPending);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): with no pending unit
+        // of theirs inside the surface or its keys, the proof is taken unit-checked.
+        const int units = ProofUnits();
+        const auto reason = profile || units != 0 ? otherPendingReason() : OtherPending::Outside;
+        if (units == 0 || reason != OtherPending::Outside) {
+            if (profile) countOtherPending(proofCounts.refusedOther, reason);
+            return refuse(RefuseOtherPending);
+        }
+        unitChecked = true;
+        countProofUnits(UnitTaken);
     }
-    refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+    refreshProof = {generation, serial, keyProof.generation, uploadedKeys, unitChecked};
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {
@@ -3990,13 +4167,44 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
     static const bool pretest = std::getenv("APS5_NO_FLUSH_PRETEST") == nullptr;
     if (!pretest) return true;
     const bool whole = descriptor.dccAddress != 0 && uploadedKeys != DccKeys::Uncompressed;
-    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (!layerPending[layer]) continue;
-        if (whole) return true;
-        const auto begin = layerBegin(layer);
-        if (address < begin + layerBytes(layer) && begin < address + bytes) return true;
+    const auto everyUnit = [&] {
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (!layerPending[layer]) continue;
+            if (whole) return true;
+            const auto begin = layerBegin(layer);
+            if (address < begin + layerBytes(layer) && begin < address + bytes) return true;
+        }
+        return false;
+    };
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): the units are
+    // contiguous (unit u is [layerBegin(u), layerBegin(u) + layerBytes(u)), layerBytes at most
+    // trackedLayerBytes), so only units first..last-1 can meet the range: those beginning before its
+    // end, and none ending at or before its start. They take the loop's own test, so the answer is
+    // the loop's; =2 runs the loop too and aborts on a difference. Without unit bytes, or with a
+    // range end past 2^64, the loop as before.
+    const int units = ProofUnits();
+    if (units == 0 || trackedLayerBytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return everyUnit();
+    bool inside = false;
+    if (whole) {
+        inside = anyLayerPending();
+    } else if (const auto end = address + bytes, base = descriptor.baseAddress; end > base) {
+        const auto first = address <= base ? std::uint64_t{0} : (address - base) / trackedLayerBytes;
+        const auto last = std::min<std::uint64_t>((end - base - 1) / trackedLayerBytes + 1, trackedLayers);
+        for (auto layer = first; layer < last && !inside; ++layer) {
+            if (!layerPending[static_cast<std::size_t>(layer)]) continue;
+            const auto begin = layerBegin(static_cast<std::uint32_t>(layer));
+            inside = address < begin + layerBytes(static_cast<std::uint32_t>(layer)) && begin < end;
+        }
     }
-    return false;
+    if (units == 2) {
+        countProofUnits(UnitScansChecked);
+        if (inside != everyUnit()) {
+            std::fprintf(stderr, "[proof-units] APS5_EXPERIMENT_PROOF_UNITS=2: the unit scan of image 0x%llx+0x%llx (%u units of 0x%llx bytes) over 0x%llx+0x%zx says %d, the loop over every unit %d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, static_cast<unsigned long long>(trackedLayerBytes), static_cast<unsigned long long>(address), bytes, inside ? 1 : 0, inside ? 0 : 1);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    return inside;
 }
 
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS) and LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1;
