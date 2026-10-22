@@ -20,7 +20,9 @@
 // work. Otherwise it misses, by the first reason in that order (a memo key move by its cause: the
 // epoch, else the allocations, else UnwatchSerial; a refresh not proved by StorageTexture::
 // TakeTargetMiss). A quiet lookup whose memo key and levels serial held across it writes the
-// entry, as D4-B's creation rule would. Counted on the [proofs] line.
+// entry, as D4-B's creation rule would. Counted on the [proofs] line. Both calls sit outside the
+// [draws] lookup wall (refreshResidentTarget), so a stats run's lookup wall stays comparable with
+// r70's, which had no counter; the draw's phase totals still carry the counter's cost.
 namespace AgcDriver::Graphics {
 
 class Recorder;

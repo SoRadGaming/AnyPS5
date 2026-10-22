@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FieldCount.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -11464,6 +11465,36 @@ int submitThreadTests(const Device& device, int mode) {
     return 0;
 }
 
+// LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.1 D4-0, 9.4.2 D4-A): the lease and memo keys' merge tripwire
+// (AggregateFieldCount, FieldCount.hpp), checked at compile time: a member added in a padding hole,
+// where sizeof does not move, changes the count; a member that is itself an aggregate counts once;
+// a type that is not an aggregate never passes.
+namespace FieldCountChecks {
+struct Holed {
+    std::uint64_t address;
+    std::uint8_t flag;
+};
+struct HoleFilled {
+    std::uint64_t address;
+    std::uint8_t flag;
+    bool added = false;
+};
+struct Nested {
+    std::uint64_t address;
+    VkExtent2D extent;
+    std::array<std::uint32_t, 2> words{};
+    TextureTileMode tileMode = TextureTileMode::kLinear;
+};
+struct Constructed {
+    explicit Constructed(std::uint64_t value) : address(value) {}
+    std::uint64_t address;
+};
+static_assert(sizeof(Holed) == sizeof(HoleFilled), "the probe's added member must fill a padding hole");
+static_assert(AggregateFieldCount<Holed, 2> && !AggregateFieldCount<HoleFilled, 2> && AggregateFieldCount<HoleFilled, 3>, "the field count missed a member added in a padding hole");
+static_assert(AggregateFieldCount<Nested, 4> && !AggregateFieldCount<Nested, 3> && !AggregateFieldCount<Nested, 5>, "the field count did not count each aggregate member once");
+static_assert(!AggregateFieldCount<Constructed, 1>, "the field count passed a type that is not an aggregate");
+}
+
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's
 // surface size and key memos answer what DescribeSurface and SurfaceKey answer; every field of the
 // resource is in their keys (each changed alone misses), the key memo keys the context's address,
@@ -11549,6 +11580,7 @@ void targetMemoTests() {
         {"allocatedMipCount", [](GuestTextureResource& resource) { resource.allocatedMipCount = 1; }},
         {"samples", [](GuestTextureResource& resource) { resource.samples = 2; }},
     }};
+    static_assert(AggregateFieldCount<GuestTextureResource, std::tuple_size_v<decltype(fields)>>, "a GuestTextureResource field was added: change it alone here too");
     for (const auto& [name, change] : fields) {
         auto changed = base;
         change(changed);

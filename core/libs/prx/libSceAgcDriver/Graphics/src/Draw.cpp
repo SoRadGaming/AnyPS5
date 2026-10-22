@@ -1928,14 +1928,19 @@ void noteTargetRefreshes(DrawOutcome& outcome, bool after) {
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead. `lease` (LOCAL DEBUG, APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0):
-// the slot loop's lookups while profiling, for the target lease counter (TargetLease.hpp).
+// the slot loop's lookups while profiling, for the target lease counter (TargetLease.hpp). The
+// counter runs outside the lookup wall (lookupStart to lookupUs), so the [draws] lookup wall of a
+// stats run stays comparable with r70's, which had no counter: TargetLeaseBefore before the clock
+// starts and TargetLeaseAfter once the lookup is accounted. The order changes no value: the [draws]
+// lines they now step over write only the draw's outcome and read the clock and ThreadCollectedBytes,
+// and the counter writes only its own table and counters and TakeTargetMiss's byte.
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup, TargetLeaseUse* lease = nullptr) {
+    if (lease != nullptr) TargetLeaseBefore(*lease);
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): the lookup's refresh outcomes, and the
     // caller mark for the [proofs] line.
     if (profile) noteTargetRefreshes(outcome, false);
-    if (lease != nullptr) TargetLeaseBefore(*lease);
     std::shared_ptr<StorageTexture> resident;
     try {
         {
@@ -1956,7 +1961,6 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
     if (resident != nullptr) materializeCmaskClear(context, color, resident, lease != nullptr ? &lease->cmaskClearWorked : nullptr);
-    if (lease != nullptr) TargetLeaseAfter(*lease, resident != nullptr);
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -1969,6 +1973,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }
+    if (lease != nullptr) TargetLeaseAfter(*lease, resident != nullptr);
     return resident;
 }
 

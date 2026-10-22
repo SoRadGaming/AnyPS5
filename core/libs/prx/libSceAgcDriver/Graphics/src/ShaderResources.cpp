@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FieldCount.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -1086,8 +1087,10 @@ void countTargetMemo(TargetMemoCount kind) {
     targetMemoCounts[kind].fetch_add(1, std::memory_order_relaxed);
 }
 
-// The memo keys hold every field; a field added by a merge fails the size check until it is compared here.
-static_assert(sizeof(GuestTextureResource) == 88, "a GuestTextureResource field was added: compare it in sameResource (the D4-A memos key on every field)");
+// The memo keys hold every field. A member added by a merge, wherever it lands (a padding hole
+// too, where sizeof would not move), fails the field count until it is compared here and the
+// count is raised (FieldCount.hpp; targetMemoTests changes each field alone).
+static_assert(AggregateFieldCount<GuestTextureResource, 24>, "a GuestTextureResource field was added: compare it in sameResource (the D4-A memos key on every field) and in targetMemoTests");
 bool sameResource(const GuestTextureResource& a, const GuestTextureResource& b) {
     return a.baseAddress == b.baseAddress && a.width == b.width && a.height == b.height && a.depthOrLastArray == b.depthOrLastArray && a.baseArray == b.baseArray && a.mipCount == b.mipCount && a.baseLevel == b.baseLevel && a.tileMode == b.tileMode && a.dimension == b.dimension && a.format == b.format && a.dstSelX == b.dstSelX && a.dstSelY == b.dstSelY && a.dstSelZ == b.dstSelZ && a.dstSelW == b.dstSelW && a.pipeBankXor == b.pipeBankXor && a.bcSwizzle == b.bcSwizzle && a.lastLevel == b.lastLevel && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.iterate256 == b.iterate256 && a.minLod == b.minLod && a.allocatedMipCount == b.allocatedMipCount && a.samples == b.samples;
 }

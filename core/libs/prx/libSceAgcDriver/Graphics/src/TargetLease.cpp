@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TargetLease.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FieldCount.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -32,9 +33,11 @@ void countLease(std::atomic<std::uint64_t>& counter) {
     counter.fetch_add(1, std::memory_order_relaxed);
 }
 
-// The key holds every ColorTarget field but the slot; a field added by a merge fails the size check
-// until it is compared here.
-static_assert(sizeof(ColorTarget) == 176, "a ColorTarget field was added: compare it in sameTarget (the D4-0 lease key holds every field but the slot)");
+// The key holds every ColorTarget field but the slot (32 members with the slot; the two VkExtent2D
+// are compared by their parts). A member added by a merge, wherever it lands (a padding hole too,
+// where sizeof would not move), fails the field count until it is compared here and the count is
+// raised (FieldCount.hpp).
+static_assert(AggregateFieldCount<ColorTarget, 32>, "a ColorTarget field was added: compare it in sameTarget (the D4-0 lease key holds every field but the slot)");
 bool sameTarget(const ColorTarget& a, const ColorTarget& b) {
     return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.componentMapping == b.componentMapping && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.packing == b.packing && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.cmaskAddress == b.cmaskAddress && a.cmaskBytes == b.cmaskBytes && a.cmaskFastClear == b.cmaskFastClear && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.clearWords == b.clearWords && a.depth == b.depth && a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.layers == b.layers && a.exportIndex == b.exportIndex && a.uintExport == b.uintExport && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples && a.dccControl == b.dccControl;
 }

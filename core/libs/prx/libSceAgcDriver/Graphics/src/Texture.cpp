@@ -251,7 +251,8 @@ void reportProofs() {
         reported = now;
     }
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter's would-hits
-    // and misses (TargetLease.cpp).
+    // and misses (TargetLease.cpp); counted outside the [draws] lookup wall, which stays comparable
+    // with r70's.
     line += TargetLeaseReport();
     AgcDriver::ProfilePrint_nid_no_patch("[proofs] storage refresh proofs per 10 s (target lookups/other callers): %s\n", line.c_str());
 }
