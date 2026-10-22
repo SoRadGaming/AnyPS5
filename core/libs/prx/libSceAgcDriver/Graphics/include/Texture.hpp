@@ -396,6 +396,13 @@ public:
         bool profiled;
         bool previous = false;
     };
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): why the refreshes this thread made
+    // inside its target lookups since the last call were not proved, the strongest reason seen: the K1
+    // refusal at the unchanged exit (key proof empty), then refreshProved's "no proof", "stamped", and
+    // any other failure. Returns it and clears it; None when none failed. Noted with the [proofs]
+    // counters, so only while profiling (a thread-local byte with no destructor).
+    enum class TargetMiss : std::uint8_t { None, Other, Stamped, NoProof, KeyProofEmpty };
+    static TargetMiss TakeTargetMiss();
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0) and LOCAL EXPERIMENT
     // (APS5_EXPERIMENT_PROOF_UNITS, L2-1): what the other pending images over the surface
     // {baseAddress, guestBytes} and over its DCC keys {dccAddress, DccKeyBytes(guestBytes)} hold, the

@@ -326,6 +326,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Screenshot.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawTicket.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TargetLease.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleTarget.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetLayout.cpp
@@ -720,12 +721,17 @@ if(BUILD_TESTING)
     add_test(NAME agc_write_tracking_host_write_count COMMAND agc_write_tracking_tests --host-write-count)
     set_tests_properties(agc_write_tracking_host_write_count PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
         ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_Q0_RECEIPTS=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_LAZY_GENERATION=1")
+    # LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): the collect memo key a target lease holds, with the epoch
+    # coverage on (the full run checks it stays zero without): it moves with the epoch, an unwatch
+    # and an allocation change, each alone.
+    add_test(NAME agc_write_tracking_collect_memo_key COMMAND agc_write_tracking_tests --collect-memo-key)
+    set_tests_properties(agc_write_tracking_collect_memo_key PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -3122,7 +3128,10 @@ if(BUILD_TESTING)
             # predicted hit runs today's refresh, which must agree, and every unit scan is checked
             # against the loop over every unit) and on.
             "proof_units|APS5_EXPERIMENT_PROOF_UNITS=2"
-            "proof_units_on|APS5_EXPERIMENT_PROOF_UNITS=1")
+            "proof_units_on|APS5_EXPERIMENT_PROOF_UNITS=1"
+            # LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter counting (profiling, with
+            # the epoch coverage that gives the committer's lookups a collect memo key); it changes no draw.
+            "target_lease_counter|APS5_PROFILE_DRAW=1,APS5_DEBUG_COVERAGE=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

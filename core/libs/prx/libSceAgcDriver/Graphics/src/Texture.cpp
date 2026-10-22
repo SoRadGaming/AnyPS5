@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TargetLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -124,6 +125,14 @@ std::atomic<std::uint64_t> untrackedCompares{0};
 // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): whether this thread's refreshes are a
 // committer target lookup's (StorageTexture::TargetLookupScope). Trivially destructible.
 thread_local bool inTargetLookup = false;
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the strongest reason this thread's
+// target-lookup refreshes were not proved since StorageTexture::TakeTargetMiss last read it.
+// Trivially destructible.
+thread_local StorageTexture::TargetMiss targetMiss = StorageTexture::TargetMiss::None;
+
+void noteTargetMiss(StorageTexture::TargetMiss miss) {
+    if (inTargetLookup && miss > targetMiss) targetMiss = miss;
+}
 
 // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): why refreshProved did not answer (b), and
 // why a refresh that reached the unchanged exit took no proof (c), per caller (0 a target lookup,
@@ -150,10 +159,12 @@ std::size_t proofCaller() {
 
 void countProofFailure(ProofFailure failure) {
     proofCounts.failed[proofCaller()][failure].fetch_add(1, std::memory_order_relaxed);
+    noteTargetMiss(failure == FailNoProof ? StorageTexture::TargetMiss::NoProof : failure == FailStamped ? StorageTexture::TargetMiss::Stamped : StorageTexture::TargetMiss::Other);
 }
 
 void countProofRefusal(ProofRefusal refusal) {
     proofCounts.refused[proofCaller()][refusal].fetch_add(1, std::memory_order_relaxed);
+    if (refusal == RefuseKeyProofEmpty) noteTargetMiss(StorageTexture::TargetMiss::KeyProofEmpty);
 }
 
 void countOtherPending(CallerCounts& counts, StorageTexture::OtherPending reason) {
@@ -229,6 +240,9 @@ void reportProofs() {
             reported[i] = now;
         }
     }
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter's would-hits
+    // and misses (TargetLease.cpp).
+    line += TargetLeaseReport();
     AgcDriver::ProfilePrint_nid_no_patch("[proofs] storage refresh proofs per 10 s (target lookups/other callers): %s\n", line.c_str());
 }
 
@@ -2588,6 +2602,10 @@ bool StorageTexture::TargetLookupScope::Enter() {
 
 void StorageTexture::TargetLookupScope::Leave(bool previous) {
     inTargetLookup = previous;
+}
+
+StorageTexture::TargetMiss StorageTexture::TakeTargetMiss() {
+    return std::exchange(targetMiss, TargetMiss::None);
 }
 
 bool StorageTexture::refreshProved(bool profile) {

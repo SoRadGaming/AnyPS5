@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TargetLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -149,9 +150,12 @@ void storeSingleTexels(const Context& context, const ColorTarget& color) {
     MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
 }
 
-void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
+// LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): `worked`, when given, is set once the keys hold a register
+// clear to materialize (the lease counter's "clear work").
+void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident, bool* worked = nullptr) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
     if (ProvedCurrentDccKeys(color.dccAddress, color.bytes, resident.TargetKeyProof()) != DccKeys::ClearRegister) return;
+    if (worked != nullptr) *worked = true;
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     const bool pendingKeysKnown = KnownPendingDccKeys(color.dccAddress, color.bytes) == DccKeys::ClearRegister;
@@ -276,13 +280,16 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
 
-bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident) {
+// LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): `worked`, when given, is set once the CMASK is not proved
+// expanded (the lease counter's "clear work").
+bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident, bool* worked = nullptr) {
     if (color.cmaskAddress == 0) return false;
     if (context.detiler != nullptr) requireCmaskCodes(context.detiler->CmaskErrors());
     const CmaskLayout layout(color.extent.width, color.extent.height);
     const auto bytes = layout.Bytes();
     Require(color.cmaskBytes == bytes, "CMASK size differs from the color target's CMASK layout");
     if (cmaskProved(color.cmaskAddress, bytes)) return false;
+    if (worked != nullptr) *worked = true;
     auto* recorder = Recorder::Active();
     if (resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
         const auto* import = HostImportFor(context, color.cmaskAddress, bytes);
@@ -1920,13 +1927,15 @@ void noteTargetRefreshes(DrawOutcome& outcome, bool after) {
 // The resident-target proof of one attachment (StorageTexture::Refresh: FlushPending, CollectWrites
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
-// the stored object instead.
-std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+// the stored object instead. `lease` (LOCAL DEBUG, APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0):
+// the slot loop's lookups while profiling, for the target lease counter (TargetLease.hpp).
+std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup, TargetLeaseUse* lease = nullptr) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): the lookup's refresh outcomes, and the
     // caller mark for the [proofs] line.
     if (profile) noteTargetRefreshes(outcome, false);
+    if (lease != nullptr) TargetLeaseBefore(*lease);
     std::shared_ptr<StorageTexture> resident;
     try {
         {
@@ -1939,14 +1948,15 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             }
         }
         if (profile) noteTargetRefreshes(outcome, true);
-        if (resident != nullptr) materializeRegisterClear(context, color, *resident);
+        if (resident != nullptr) materializeRegisterClear(context, color, *resident, lease != nullptr ? &lease->registerClearWorked : nullptr);
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
-    if (resident != nullptr) materializeCmaskClear(context, color, resident);
+    if (resident != nullptr) materializeCmaskClear(context, color, resident, lease != nullptr ? &lease->cmaskClearWorked : nullptr);
+    if (lease != nullptr) TargetLeaseAfter(*lease, resident != nullptr);
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -3497,6 +3507,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Target);
+            // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter.
+            std::optional<TargetLeaseUse> lease;
+            if (profile) lease.emplace(TargetLeaseUse{&color, context.device, colorLayout.Bytes(), color.tileMode != ColorTileMode::Linear && context.detiler != nullptr, dumpLimit != 0});
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
@@ -3514,7 +3527,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
-            });
+            }, lease ? &*lease : nullptr);
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);

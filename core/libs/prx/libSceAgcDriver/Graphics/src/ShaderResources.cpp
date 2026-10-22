@@ -1073,6 +1073,9 @@ struct ExtendedSurfaces {
     AgcDriver::Mutex mutex;
     std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
     std::atomic<bool> any{false};
+    // LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): moves only when a `levels` entry is inserted or grows,
+    // the only changes StorageSurface's answer can see (StorageLevelsSerial).
+    std::atomic<std::uint64_t> serial{0};
 };
 
 ExtendedSurfaces& ExtendedChains() {
@@ -1094,6 +1097,7 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
     std::lock_guard lock(surfaces.mutex);
     if (extended) {
         auto& levels = surfaces.levels[identity];
+        if (viewed.mipCount > levels) surfaces.serial.fetch_add(1, std::memory_order_release);
         levels = std::max(levels, viewed.mipCount);
         surfaces.any.store(true, std::memory_order_release);
         surface.mipCount = levels;
@@ -1463,6 +1467,10 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount) {
     return cachedStorageTexture(context, {}, resource, 0, 0, false, std::pair{firstLayer, layerCount});
+}
+
+std::uint64_t StorageLevelsSerial() {
+    return ExtendedChains().serial.load(std::memory_order_acquire);
 }
 
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress) {

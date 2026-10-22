@@ -2420,6 +2420,15 @@ std::uint64_t UnwatchSerial() {
     return unwatchSerial.load(std::memory_order_acquire);
 }
 
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the key collectWrites' epoch coverage
+// test (epochCovers) compares, from the thread's own slot.
+CollectMemoKey CurrentCollectMemoKey() {
+    if (!collectMemoEnabled() || !epochCoverageEnabled() || sharedCollectMemo()) return {};
+    const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+    if (epoch == 0) return {};
+    return {epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
+}
+
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);

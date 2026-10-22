@@ -1567,6 +1567,38 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
+// LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): the collect memo key a target lease would hold is zero
+// without the epoch coverage (APS5_DEBUG_COVERAGE=1) or on a thread that never bumped its epoch, and
+// otherwise moves with exactly one of its parts at a time: the epoch at a bump, UnwatchSerial at an
+// unwatch, the allocation generation at a registry change.
+void CheckCollectMemoKey() {
+    const bool coverage = std::getenv("APS5_DEBUG_COVERAGE") != nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    CollectMemoKey unbumped{1, 1, 1};
+    std::thread([&] { unbumped = CurrentCollectMemoKey(); }).join();
+    Require(!unbumped.Valid() && unbumped == CollectMemoKey{}, "a thread that never bumped its collect epoch has a collect memo key");
+    BumpCollectEpoch();
+    const auto first = CurrentCollectMemoKey();
+    if (!coverage) {
+        Require(!first.Valid() && first == CollectMemoKey{}, "a collect memo key without the epoch coverage (APS5_DEBUG_COVERAGE)");
+        return;
+    }
+    Require(first.Valid() && first.epoch == ThreadCollectEpoch() && first.unwatched == UnwatchSerial() && first.mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix(), "the collect memo key is not the thread's epoch, UnwatchSerial and allocation generation");
+    Require(CurrentCollectMemoKey() == first, "the collect memo key moved without a bump, an unwatch or an allocation change");
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    BumpCollectEpoch();
+    const auto bumped = CurrentCollectMemoKey();
+    Require(bumped.epoch != first.epoch && bumped.epoch == ThreadCollectEpoch() && bumped.unwatched == UnwatchSerial() && bumped.mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix(), "an epoch bump did not move the collect memo key's epoch");
+    Require(CollectWrites(base, 2 * Block) != 0 && CurrentCollectMemoKey() == bumped, "a collect moved the collect memo key");
+    Unwatch(base + Block, Block);
+    const auto unwatched = CurrentCollectMemoKey();
+    Require(unwatched.epoch == bumped.epoch && unwatched.unwatched != bumped.unwatched && unwatched.mapping == bumped.mapping, "an unwatch did not move the collect memo key's UnwatchSerial alone");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base), 4096);
+    const auto remapped = CurrentCollectMemoKey();
+    Require(remapped.epoch == unwatched.epoch && remapped.unwatched == unwatched.unwatched && remapped.mapping != unwatched.mapping, "an allocation change did not move the collect memo key's allocation generation alone");
+}
+
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS, PARALLEL-COMMIT-PLAN H): the driver's hooks
 // installed by hand (the switch only chooses which one device init installs), and what they see.
 void NoteHostWriteHook(std::uintptr_t address, std::size_t bytes) {
@@ -1861,6 +1893,13 @@ int main(int argc, char** argv) {
         }
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS=2): in its own receipts environment.
         if (argc > 1 && std::string_view(argv[1]) == "--host-write-count") return CheckHostWriteCount() ? 0 : 77;
+        // LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): the collect memo key alone, in the epoch coverage's
+        // environment (the full run checks it stays zero without).
+        if (argc > 1 && std::string_view(argv[1]) == "--collect-memo-key") {
+            CheckCollectMemoKey();
+            std::cout << "collect memo key tests passed\n";
+            return 0;
+        }
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(HostHoleMode)) {
             CheckHostHole();
@@ -1908,6 +1947,7 @@ int main(int argc, char** argv) {
         CheckHighestIndexMemo();
         CheckLazyGeneration();
         CheckAdoptLatestEpoch();
+        CheckCollectMemoKey();
         CheckHostWriteStamps();
 #ifdef _WIN32
         CheckHostWriteWatchedMiddle();

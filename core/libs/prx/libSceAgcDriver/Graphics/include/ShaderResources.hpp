@@ -60,6 +60,10 @@ bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
 // to date with guest memory before it is returned.
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource);
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount);
+// LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): a serial of the extended mip chains the storage cache
+// keys surfaces under (StorageSurface); moves only when a chain is recorded or grows, so while it
+// holds a surface maps to the same storage key.
+std::uint64_t StorageLevelsSerial();
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
