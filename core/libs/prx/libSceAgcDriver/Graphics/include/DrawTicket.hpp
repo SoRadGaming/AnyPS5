@@ -40,8 +40,10 @@ struct PreparedDraw;
 // objects (its state, parameters and stages) and from build-fixed data only; queue 0 reads no
 // guest bytes, calls no Recorder instance method and never takes GuestMemory::GpuMutex for it.
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the one exception
-// is the FetchPlan part's index scan (GuestMemory::CopyMapped), whose answer is only a prediction
-// the committer compares with its own in-order maxIndex.
+// is the FetchPlan part's index scan (GuestMemory::CopyMapped before the push, CopyMappedUnpinned on
+// a helper after it, where only the kernel copy keeps a page the title unmapped meanwhile from
+// faulting; the ForgetSerial bracket around it only drops bytes read under stale page states),
+// whose answer is only a prediction the committer compares with its own in-order maxIndex.
 struct DrawTicket {
     enum Part : std::uint32_t {
         // Q1: pure checks and target descriptions (APS5_EXPERIMENT_Q0_TICKET).
@@ -170,7 +172,15 @@ bool Q0WordParts();
 // inline otherwise; 2 the same with every accepted plan also made inline and compared
 // (sameFetchPlan, and the zero buffers' sizes and bytes; a difference aborts with a [q0ticket]
 // line). Requires APS5_EXPERIMENT_Q0_TICKET (said once; ignored without it). Read once.
+// PARALLEL-COMMIT-PLAN builds B2 on B0 and judges it with prep helpers on; with them off queue 0
+// builds the part inside Enqueue under its PrepareBudget (asked before the part and before every
+// 64 KiB of the scan) and HelperFetchPlanScanBytes caps its scan, so the part only costs queue 0
+// what the bail allows.
 int HelperFetchPlan();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB, B2): the largest index range (in KiB)
+// a FetchPlan part scans; a larger indexed draw gets no part (FetchPlanEvent::Large), so its scan
+// never holds back the ticket's other parts. 256 when unset, 0 no cap. Read once.
+std::uint64_t HelperFetchPlanScanBytes();
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): queue 0's WordBuffers part (after the
 // template parts, with the hint's memo).
 void FillDrawTicketWords(DrawTicket& ticket, const Context& context, std::span<const CompiledShader> shaders);
@@ -276,11 +286,12 @@ void NoteTicketEvent(TicketEvent event);
 // because the draw has nothing to plan ahead (an indirect, quad-list, mesh or empty draw, no vertex
 // attributes, or every index a restart index), the index scan found an unmapped page, the mapping
 // moved under it (GuestMemory::ForgetSerial odd or changed), the zero-fetch clamp would rewrite the
-// indices, a check prepareDrawInputs makes after the scan or the plan threw, or the budget stopped
-// the scan. The committer, at a direct draw with vertex attributes and a ticket: the part offered,
-// accepted (its own maxIndex equals predictedMax), refused on a mismatch (the maxIndex differs, or a
-// replay applies), or absent from the ticket.
-enum class FetchPlanEvent : std::uint8_t { Built, Skipped, Unmapped, Moved, Clamp, Threw, Cut, Offered, Accepted, Mismatch, NoPart, Count };
+// indices, a check prepareDrawInputs makes after the scan or the plan threw, the budget held before
+// the part or stopped the scan (the queue-0 bail or a helper's item already committing), or the
+// index range is past HelperFetchPlanScanBytes. The committer, at a direct draw with vertex
+// attributes and a ticket: the part offered, accepted (its own maxIndex equals predictedMax),
+// refused on a mismatch (the maxIndex differs, or a replay applies), or absent from the ticket.
+enum class FetchPlanEvent : std::uint8_t { Built, Skipped, Unmapped, Moved, Clamp, Threw, Cut, Large, Offered, Accepted, Mismatch, NoPart, Count };
 void NoteFetchPlanEvent(FetchPlanEvent event);
 
 // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the ticket counters of the [q0prep] line, reset by

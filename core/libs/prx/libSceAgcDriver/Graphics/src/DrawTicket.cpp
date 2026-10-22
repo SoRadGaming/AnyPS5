@@ -160,6 +160,15 @@ int HelperFetchPlan() {
     return mode;
 }
 
+std::uint64_t HelperFetchPlanScanBytes() {
+    static const std::uint64_t bytes = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB");
+        const auto kib = text != nullptr ? std::strtoull(text, nullptr, 10) : 256ull;
+        return static_cast<std::uint64_t>(std::min<unsigned long long>(kib, 1ull << 30)) * 1024u;
+    }();
+    return bytes;
+}
+
 namespace {
 
 // Queue 0's moved data-word buffers (Q2b), for reuse by later tickets of the same template with

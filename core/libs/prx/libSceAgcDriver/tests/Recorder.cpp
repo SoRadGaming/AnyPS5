@@ -9323,7 +9323,16 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
 //   mismatch and plans inline;
 // - an index past the zero-fetch clamp's slack gives no part, and the committer clamps as before;
 // - a vertex range aliasing the color target gives no part, and the committer raises the alias at
-//   its own place, with the message a draw without a ticket raises.
+//   its own place, with the message a draw without a ticket raises;
+// - a plan built on another thread with the kernel copy a prep helper uses after the push, with a
+//   zero buffer, is accepted (=2 compares it); a ticket that thread drops (a failed
+//   compare-exchange) hands its zero buffer to the ticket release list instead of destroying it;
+// - the budget, asked before the part and before every 64 KiB chunk after the first, leaves the
+//   part out (cut) when it holds before the part or before the second chunk;
+// - an index range past HelperFetchPlanScanBytes (128 KiB in the ctest environments) is not
+//   scanned (no part, the budget never asked);
+// - under the VRAM draw inputs, queue 0's receipt plan walks the plan's own copies instead of the
+//   descriptors' whole extents.
 bool helperFetchPlanTests(const Device& device, Recorder& recorder) {
     if (!device.Graphics()) return false;
     if (HelperFetchPlan() == 0 || AgcDriver::GuestMemory::Q0PrepStats() == 0) {
@@ -9331,7 +9340,9 @@ bool helperFetchPlanTests(const Device& device, Recorder& recorder) {
         return false;
     }
     constexpr std::size_t unit = 65536;
-    constexpr std::size_t bytes = unit * 3;
+    // The color target, the vertex records, then four units of indices (the scan tests' two chunks
+    // and the scan cap's range).
+    constexpr std::size_t bytes = unit * 6;
     void* watched = AllocateWatched(bytes, unit);
     std::vector<std::byte> fallback(watched == nullptr ? bytes + unit : 0);
     auto* block = watched != nullptr ? static_cast<std::byte*>(watched) : reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(fallback.data()) + unit - 1) & ~(unit - 1));
@@ -9402,13 +9413,23 @@ bool helperFetchPlanTests(const Device& device, Recorder& recorder) {
     auto producerContext = context;
     producerContext.recorder = nullptr;
     producerContext.copiedWriters = nullptr;
-    const auto build = [&](const AgcDriver::Pm4::DrawParameters& draw) {
+    const auto buildWith = [&](const AgcDriver::Pm4::DrawParameters& draw, bool (*stop)(const void*), const void* budget, bool unpinned) {
         auto ticket = std::make_unique<DrawTicket>();
         ticket->device = context.device;
         ticket->pool = context.bufferPool;
         const AgcDriver::GuestMemory::PrepareScope scope;
-        FillDrawTicketFetchPlan(*ticket, producerContext, consumer, draw, shaders);
+        FillDrawTicketFetchPlan(*ticket, producerContext, consumer, draw, shaders, stop, budget, unpinned);
         return ticket;
+    };
+    const auto build = [&](const AgcDriver::Pm4::DrawParameters& draw) { return buildWith(draw, nullptr, nullptr, false); };
+    // A budget that counts how often it is asked and holds at its `holdAt`th ask (0: never).
+    struct Asks {
+        mutable int count = 0;
+        int holdAt = 0;
+    };
+    bool (*const asked)(const void*) = [](const void* budget) {
+        const auto& asks = *static_cast<const Asks*>(budget);
+        return ++asks.count == asks.holdAt;
     };
     // The committer's side, as VulkanDevice::Draw runs it; the ticket's references are settled
     // whether the draw records or throws.
@@ -9503,6 +9524,87 @@ bool helperFetchPlanTests(const Device& device, Recorder& recorder) {
         counts = events();
         Require(count(counts, FetchPlanEvent::NoPart) == 1, "the committer did not find the alias draw's ticket without a part");
         vertex.vertexAttributes = {attributeFor(vertices, 16, 16)};
+    }
+    if (AgcDriver::GuestMemory::SpeculativeReadsSupported()) {
+        // A producer on another thread, as a prep helper after the push (the scan copies through the
+        // kernel), with a zero buffer: the committer on this thread accepts its plan (=2 also plans
+        // inline and compares the plan and the zero buffer).
+        writeIndices(std::array<std::uint16_t, 3>{0, 1, 2});
+        vertex.vertexAttributes = {attributeFor(vertices, 0, 16)};
+        const AgcDriver::Pm4::DrawParameters indexed{indices, 3, 2, 1, 0, true};
+        std::unique_ptr<DrawTicket> ticket;
+        std::thread([&] { ticket = buildWith(indexed, nullptr, nullptr, true); }).join();
+        Require(ticket->Has(DrawTicket::FetchPlan) && ticket->predictedMax == 2u && ticket->zeroBuffers.size() == 1 && ticket->zeroBuffers[0] != nullptr, "a fetch plan built on another thread through the kernel copy was not made");
+        commit(*ticket, indexed);
+        const auto counts = events();
+        Require(count(counts, FetchPlanEvent::Built) == 1 && count(counts, FetchPlanEvent::Accepted) == 1, "a fetch plan built on another thread was not accepted");
+        // A ticket its commit never takes (a helper whose compare-exchange failed destroys it): its
+        // zero buffer goes to the ticket release list, not destroyed on the producing thread.
+        std::weak_ptr<Buffer> zero;
+        bool made = false;
+        std::thread([&] {
+            auto lost = buildWith(indexed, nullptr, nullptr, true);
+            made = lost->Has(DrawTicket::FetchPlan) && lost->zeroBuffers.size() == 1 && lost->zeroBuffers[0] != nullptr;
+            if (made) zero = lost->zeroBuffers[0];
+        }).join();
+        Require(made && !zero.expired(), "a dropped ticket's zero vertex buffer was destroyed on its producing thread");
+        DrainTicketRelease(context);
+        static_cast<void>(events());
+        vertex.vertexAttributes = {attributeFor(vertices, 16, 16)};
+    } else {
+        std::cout << "the kernel-copy fetch plan checks need speculative guest reads, skipped\n";
+    }
+    {
+        // The budget: holding before the part leaves it out; holding before the second 64 KiB chunk
+        // cuts the scan (no part, no zero buffer); not holding, it is asked before the part and
+        // before the second chunk, and the scan finds the second chunk's highest index.
+        writeIndices(std::array<std::uint16_t, 3>{0, 1, 2});
+        const AgcDriver::Pm4::DrawParameters indexed{indices, 3, 2, 1, 0, true};
+        const Asks before{0, 1};
+        auto ticket = buildWith(indexed, asked, &before, false);
+        auto counts = events();
+        Require(!ticket->Has(DrawTicket::FetchPlan) && before.count == 1 && count(counts, FetchPlanEvent::Cut) == 1, "a budget holding before the fetch plan did not leave the part out as cut");
+        constexpr std::uint32_t twoChunks = 40000;
+        std::vector<std::uint16_t> many(twoChunks, 0);
+        many.back() = 5;
+        writeIndices(many);
+        const AgcDriver::Pm4::DrawParameters scanned{indices, twoChunks, 2, 1, 0, true};
+        const Asks second{0, 2};
+        ticket = buildWith(scanned, asked, &second, false);
+        counts = events();
+        Require(!ticket->Has(DrawTicket::FetchPlan) && ticket->zeroBuffers.empty() && second.count == 2 && count(counts, FetchPlanEvent::Cut) == 1, "a budget holding before the second chunk did not cut the index scan");
+        const Asks never{0, 0};
+        ticket = buildWith(scanned, asked, &never, false);
+        counts = events();
+        Require(ticket->Has(DrawTicket::FetchPlan) && ticket->predictedMax == 5u && never.count == 2 && count(counts, FetchPlanEvent::Built) == 1, "a scan of two chunks did not find the second chunk's highest index, or did not ask the budget before each chunk");
+    }
+    if (const auto cap = HelperFetchPlanScanBytes(); cap != 0 && cap + 4 <= 4 * unit) {
+        // Past the scan cap: no part, and neither the budget nor the guest bytes are asked.
+        const AgcDriver::Pm4::DrawParameters large{indices, static_cast<std::uint32_t>(cap / 4 + 1), 4, 1, 0, true};
+        const Asks never{0, 0};
+        auto ticket = buildWith(large, asked, &never, false);
+        const auto counts = events();
+        Require(!ticket->Has(DrawTicket::FetchPlan) && never.count == 0 && count(counts, FetchPlanEvent::Large) == 1, "an index range past the scan cap got a fetch plan or was scanned");
+    } else {
+        std::cout << "the scan cap check needs APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB between 1 and 255, skipped\n";
+    }
+    if (DrawInputsVram() != 0) {
+        // Queue 0's receipt plan with the part walks the plan's own copies (exact for the committer's
+        // copies while its maxIndex equals the prediction), without it each descriptor's extent.
+        writeIndices(std::array<std::uint16_t, 3>{0, 1, 2});
+        const AgcDriver::Pm4::DrawParameters indexed{indices, 3, 2, 1, 0, true};
+        auto ticket = build(indexed);
+        Require(ticket->Has(DrawTicket::FetchPlan) && !ticket->fetchPlan.copies.copies.empty(), "the receipt plan's fetch plan was not made");
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> planned;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> extents;
+        PlanDrawTicketWalks(*ticket, consumer, indexed, shaders, planned);
+        const DrawTicket bare;
+        PlanDrawTicketWalks(bare, consumer, indexed, shaders, extents);
+        for (const auto& [begin, end] : ticket->fetchPlan.copies.copies) {
+            Require(std::find(planned.begin(), planned.end(), std::pair<std::uint64_t, std::uint64_t>{begin, end}) != planned.end(), "queue 0's receipt plan does not walk a copy of the ticket's fetch plan");
+        }
+        Require(planned != extents, "queue 0's receipt plan with a fetch plan still walks the descriptors' whole extents");
+        static_cast<void>(events());
     }
     std::cout << "Helper fetch plan tests passed (APS5_EXPERIMENT_HELPER_FETCH_PLAN=" << HelperFetchPlan() << ", APS5_EXPERIMENT_DRAW_INPUTS_VRAM=" << DrawInputsVram() << ")\n";
     return true;

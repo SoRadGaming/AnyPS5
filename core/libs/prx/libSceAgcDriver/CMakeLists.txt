@@ -715,12 +715,17 @@ if(BUILD_TESTING)
     add_test(NAME agc_write_tracking_lazy_generation COMMAND agc_write_tracking_tests)
     set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(agc_write_tracking_lazy_generation PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_LAZY_GENERATION=1")
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS=2, PARALLEL-COMMIT-PLAN H): the count-only hook
+    # against walk receipts this test publishes as queue 0 does (covered, older token, a moved serial).
+    add_test(NAME agc_write_tracking_host_write_count COMMAND agc_write_tracking_tests --host-write-count)
+    set_tests_properties(agc_write_tracking_host_write_count PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+        ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_Q0_RECEIPTS=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_LAZY_GENERATION=1")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -2041,16 +2046,18 @@ if(BUILD_TESTING)
     # LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): a ticket's fetch plan
     # made as a producer makes it and taken by Draw: accepted while its predicted maxIndex holds,
     # refused on a mismatch, absent under the zero-fetch clamp and the render-target alias (which
-    # the committer raises at its own place); used (=1), verified (=2, every accepted plan also made
-    # inline and compared) and verified over the ReBAR VRAM draw inputs.
+    # the committer raises at its own place); built on another thread with the kernel copy, dropped
+    # there (its zero buffer to the release list), cut by the budget and past the scan cap (128 KiB
+    # here); used (=1), verified (=2, every accepted plan also made inline and compared) and verified
+    # over the ReBAR VRAM draw inputs (where queue 0's receipt plan walks the plan's copies).
     set(helperFetchPlanTests agc_helper_fetch_plan agc_helper_fetch_plan_verify agc_helper_fetch_plan_vram1)
     foreach(helperFetchPlanTest IN LISTS helperFetchPlanTests)
         add_test(NAME ${helperFetchPlanTest} COMMAND agc_driver_recorder_tests --helper-fetch-plan-only)
     endforeach()
     set_tests_properties(${helperFetchPlanTests} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
-    set_tests_properties(agc_helper_fetch_plan PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=1;APS5_DEBUG_Q0_PREP_STATS=1")
-    set_tests_properties(agc_helper_fetch_plan_verify PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=2;APS5_DEBUG_Q0_PREP_STATS=1")
-    set_tests_properties(agc_helper_fetch_plan_vram1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=2;APS5_DEBUG_Q0_PREP_STATS=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+    set_tests_properties(agc_helper_fetch_plan PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=1;APS5_DEBUG_Q0_PREP_STATS=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB=128")
+    set_tests_properties(agc_helper_fetch_plan_verify PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=2;APS5_DEBUG_Q0_PREP_STATS=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB=128")
+    set_tests_properties(agc_helper_fetch_plan_vram1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=2;APS5_DEBUG_Q0_PREP_STATS=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB=128")
     if(WIN32)
         set_tests_properties(${helperFetchPlanTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
@@ -3035,8 +3042,12 @@ if(BUILD_TESTING)
             "prep_helpers_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN B2): the tickets' fetch plans, every accepted plan
             # also made inline at the commit and compared (=2), built by queue 0 inside Enqueue
-            # (helpers off), by three prep helpers, and by helpers with random delays.
+            # (helpers off), by queue 0 with its receipt plan over the VRAM draw inputs (which walks
+            # the plan's copies, the walks verified), by three prep helpers, and by helpers with random
+            # delays. These runs fetch no vertex attributes, so they check that the part stays out of
+            # the way; the draws that take a plan run in committerFetchPlanRuns below.
             "fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
+            "q0_receipts_vram_fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2,APS5_DEBUG_Q0_VERIFY_WALKS=1"
             "prep_helpers_fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
             "prep_helpers_fetch_plan_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue gate and the present queue, with
@@ -3053,8 +3064,11 @@ if(BUILD_TESTING)
             "submit_pools|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1"
             "present_submit|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN H): the host-write hook registered at device
-            # init, stamping (=1), and counting (=2) against queue 0's walk receipts; the hook's own
-            # checks (stamps, outside the arena, lock order) are in agc_write_tracking.
+            # init, stamping (=1), and counting (=2) against queue 0's walk receipts; these runs make
+            # no HLE host write, so they only check the hook's installation: the stamps (queued,
+            # one generation per drain, the write watch consumed, page exact over a watched middle),
+            # outside the arena and the lock order are in agc_write_tracking, the count's covered,
+            # older-token and moved-serial cases in agc_write_tracking_host_write_count.
             "host_write_stamps|APS5_EXPERIMENT_HOST_WRITE_STAMPS=1"
             "host_write_count|APS5_EXPERIMENT_HOST_WRITE_STAMPS=2,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1")
     set(committerExperimentRuns
@@ -3103,6 +3117,33 @@ if(BUILD_TESTING)
     set_tests_properties(${committerExperimentTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
     if(WIN32)
         set_tests_properties(${committerExperimentTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN B2): the fetch-plan rows over the one pipelined DCB suite
+    # whose draws fetch vertex attributes through a fetch shader (draw_ahead: an indexed draw of
+    # fetched vertices, a restart-only draw, and its references), so the committer offers, accepts
+    # and (=2) re-plans and compares a FetchPlan part built by queue 0 inside Enqueue, by queue 0
+    # with its receipt plan over the plan's copies, and by prep helpers (whose plans land when they
+    # beat the commit).
+    set(committerFetchPlanRuns
+            "fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
+            "q0_receipts_vram_fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2,APS5_DEBUG_Q0_VERIFY_WALKS=1"
+            "prep_helpers_fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
+            "prep_helpers_fetch_plan_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2")
+    set(committerFetchPlanTests)
+    foreach(fetchPlanRun IN LISTS committerFetchPlanRuns)
+        string(REPLACE "|" ";" fetchPlanRun "${fetchPlanRun}")
+        list(GET fetchPlanRun 0 fetchPlanRunName)
+        list(GET fetchPlanRun 1 fetchPlanRunEnvironment)
+        string(REPLACE "," ";" fetchPlanRunEnvironment "${fetchPlanRunEnvironment}")
+        set(fetchPlanTest agc_driver_draw_ahead_${fetchPlanRunName})
+        add_test(NAME ${fetchPlanTest} COMMAND agc_driver_draw_ahead_tests)
+        set_tests_properties(${fetchPlanTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${fetchPlanRunEnvironment}")
+        list(APPEND committerFetchPlanTests ${fetchPlanTest})
+    endforeach()
+    set_tests_properties(${committerFetchPlanTests} PROPERTIES SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+    if(WIN32)
+        set_tests_properties(${committerFetchPlanTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     # LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the prep helpers' hand-off

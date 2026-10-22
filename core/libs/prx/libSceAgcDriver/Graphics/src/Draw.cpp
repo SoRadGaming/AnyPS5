@@ -3170,26 +3170,29 @@ namespace {
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): a producer's scan of
 // an index range for its highest index, as HighestDrawIndex finds it over the whole range (each
 // chunk holds whole indices, and a chunk of restart indices only adds none). The bytes are copied
-// through GuestMemory::CopyMapped, 64 KiB at a time into the thread's scratch, inside a
-// GuestMemory::ForgetSerial bracket that must be even at its start and unchanged at its end (else
-// the page states the copies consulted may be stale). `stop` is asked every 1 MiB.
+// 64 KiB at a time into the thread's scratch, inside a GuestMemory::ForgetSerial bracket that must
+// be even at its start and unchanged at its end: the bracket only says whether the page states the
+// copies consulted may be stale (the bytes are then dropped), it cannot keep a copy from faulting.
+// Before the push (queue 0) the title cannot free the range yet, as before the committer's own
+// read, and CopyMapped copies; after it (`unpinned`: a prep helper, whose item may already be
+// committed, completed and its range unmapped by the title) CopyMappedUnpinned copies through the
+// kernel, so such a page ends the scan as Unmapped. `stop` is asked before every chunk but the
+// first (FillDrawTicketFetchPlan asked it just before the scan).
 enum class TicketIndexScan : std::uint8_t { Done, Unmapped, Moved, Stopped };
 
-TicketIndexScan scanTicketIndices(std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart, bool (*stop)(const void*), const void* budget, std::optional<std::uint32_t>& highest) {
+TicketIndexScan scanTicketIndices(std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart, bool (*stop)(const void*), const void* budget, bool unpinned, std::optional<std::uint32_t>& highest) {
     constexpr std::size_t ChunkBytes = 64 * 1024;
-    constexpr std::size_t ChunksPerStop = 16;
     struct ChunkTag {};
     auto& chunk = ThreadScratch<std::vector<std::byte>, ChunkTag>();
     chunk.resize(ChunkBytes);
     highest.reset();
     const auto serial = GuestMemory::ForgetSerial();
     if ((serial & 1u) != 0) return TicketIndexScan::Moved;
-    std::size_t chunks = 0;
+    const auto copy = unpinned ? &GuestMemory::CopyMappedUnpinned : &GuestMemory::CopyMapped;
     for (std::size_t offset = 0; offset < bytes; offset += ChunkBytes) {
-        if (stop != nullptr && chunks != 0 && chunks % ChunksPerStop == 0 && stop(budget)) return TicketIndexScan::Stopped;
-        ++chunks;
+        if (stop != nullptr && offset != 0 && stop(budget)) return TicketIndexScan::Stopped;
         const auto span = std::span(chunk).first(std::min(ChunkBytes, bytes - offset));
-        if (GuestMemory::CopyMapped(address + offset, span) != GuestMemory::Compare::Equal) return TicketIndexScan::Unmapped;
+        if (copy(address + offset, span) != GuestMemory::Compare::Equal) return TicketIndexScan::Unmapped;
         if (const auto found = HighestDrawIndex(span, indexSize, skipRestart)) highest = std::max(highest.value_or(0u), *found);
     }
     return GuestMemory::ForgetSerial() == serial ? TicketIndexScan::Done : TicketIndexScan::Moved;
@@ -3197,7 +3200,7 @@ TicketIndexScan scanTicketIndices(std::uint64_t address, std::size_t bytes, std:
 
 }
 
-void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool (*stop)(const void* budget), const void* budget) {
+void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool (*stop)(const void* budget), const void* budget, bool unpinned) {
     const TicketPartTimer timer{DrawTicket::FetchPlan};
     // prepareDrawInputs plans an indirect draw from whole extents, rewrites a quad list's indices
     // before it plans, returns before planning an empty draw, and a mesh draw fetches no vertices:
@@ -3207,6 +3210,22 @@ void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const S
         return;
     }
     const auto& attributes = shaders.front().program->vertexAttributes;
+    const auto indexBytes = draw.indexed ? static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize : 0u;
+    if (draw.indexed && ((draw.indexSize != 2 && draw.indexSize != 4) || indexBytes > std::numeric_limits<std::size_t>::max())) {
+        NoteFetchPlanEvent(FetchPlanEvent::Threw);
+        return;
+    }
+    // An index range past the scan cap gets no part: its scan would hold back the ticket's single
+    // publish (a helper's cheap parts are done in microseconds) and on queue 0 delay the push.
+    if (const auto cap = HelperFetchPlanScanBytes(); cap != 0 && indexBytes > cap) {
+        NoteFetchPlanEvent(FetchPlanEvent::Large);
+        return;
+    }
+    // The budget before the part, so a part the bail or the commit's start left out is counted.
+    if (stop != nullptr && stop(budget)) {
+        NoteFetchPlanEvent(FetchPlanEvent::Cut);
+        return;
+    }
     try {
         std::uint32_t maxIndex = 0;
         if (!draw.indexed) {
@@ -3217,16 +3236,11 @@ void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const S
             }
             maxIndex = draw.firstVertex + draw.indexCount - 1u;
         } else {
-            const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
-            if ((draw.indexSize != 2 && draw.indexSize != 4) || indexBytes > std::numeric_limits<std::size_t>::max()) {
-                NoteFetchPlanEvent(FetchPlanEvent::Threw);
-                return;
-            }
             // The restart rule of prepareDrawInputs' indexed branch (a fan geometry draw is a mesh draw).
             const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
             const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart);
             std::optional<std::uint32_t> highest;
-            switch (scanTicketIndices(draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart, stop, budget, highest)) {
+            switch (scanTicketIndices(draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart, stop, budget, unpinned, highest)) {
             case TicketIndexScan::Done:
                 break;
             case TicketIndexScan::Unmapped:

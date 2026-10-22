@@ -45,13 +45,17 @@ void FillDrawTicketTemplate(DrawTicket& ticket, const Context& context, const St
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the FetchPlan part of a
 // direct draw's ticket, made by its producer (a prep helper, or queue 0 inside Enqueue) with a
 // context without a recorder, inside a GuestMemory::PrepareScope: maxIndex as prepareDrawInputs
-// computes it, an indexed draw's highest index from its own scan of the guest index range
-// (GuestMemory::CopyMapped in 64 KiB chunks inside an even, unchanged ForgetSerial bracket; no flush
-// hook, no GuestMemory::Read), then planVertexFetches' plan for it and its zero buffers. No part
-// for a draw without one to plan, an unmapped page, a moved mapping, the zero-fetch clamp, a check
-// that throws (the committer raises it at its own place) or `stop(budget)` holding during the scan
-// (asked every 1 MiB). Counted per FetchPlanEvent.
-void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool (*stop)(const void* budget) = nullptr, const void* budget = nullptr);
+// computes it, an indexed draw's highest index from its own scan of the guest index range (64 KiB
+// chunks inside an even, unchanged ForgetSerial bracket, which only drops bytes whose page states
+// may be stale; no flush hook, no GuestMemory::Read), then planVertexFetches' plan for it and its
+// zero buffers. The scan copies with GuestMemory::CopyMapped before the push (queue 0: the title
+// cannot free the range yet) and with GuestMemory::CopyMappedUnpinned when `unpinned` (a prep
+// helper, after the push: the item's commit may have completed and the title unmapped the range;
+// the kernel copy turns that into an unmapped page instead of a fault). No part for a draw without
+// one to plan, an index range past HelperFetchPlanScanBytes, `stop(budget)` holding before the part
+// or before any chunk of the scan, an unmapped page, a moved mapping, the zero-fetch clamp, or a
+// check that throws (the committer raises it at its own place). Counted per FetchPlanEvent.
+void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool (*stop)(const void* budget) = nullptr, const void* budget = nullptr, bool unpinned = false);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 

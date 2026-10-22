@@ -98,8 +98,8 @@ bool postPushStops(const void* post) {
     return DrawPipeline::Queue0().Outstanding() <= *static_cast<const std::size_t*>(post);
 }
 
-// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, B2): the fetch plan's index scan asks the
-// build's budget between its chunks.
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, B2): the fetch plan asks the build's budget
+// before the part and before every chunk of its index scan.
 bool fetchPlanStops(const void* budget) {
     return static_cast<const HelperBudget*>(budget)->Stop();
 }
@@ -147,9 +147,9 @@ void skippedTicket(void*, DrawPipeline::PrepareSkip why) {
 // PARALLEL-COMMIT-PLAN B0): the draw's ticket, built by queue 0 inside Enqueue or by a prep helper,
 // in a GuestMemory::PrepareScope and without GpuMutex. The context is the device's without a recorder
 // or copied writers, so any recorder use on this path faults at once; nothing here reads guest
-// bytes but the fetch plan's index scan (APS5_EXPERIMENT_HELPER_FETCH_PLAN, through CopyMapped; its
-// result is a prediction the committer checks). A part whose checks throw is left out (the
-// committer runs them).
+// bytes but the fetch plan's index scan (APS5_EXPERIMENT_HELPER_FETCH_PLAN, through CopyMapped on
+// queue 0 before the push and CopyMappedUnpinned on a helper; its result is a prediction the
+// committer checks). A part whose checks throw is left out (the committer runs them).
 std::unique_ptr<Graphics::DrawTicket> BuildTicket(TicketInputs& inputs, const HelperBudget& budget) {
     // A stage without a compiled program fails VulkanDevice::Draw's first check; the checks after
     // it assume programs, so such a draw gets no ticket.
@@ -182,9 +182,12 @@ std::unique_ptr<Graphics::DrawTicket> BuildTicket(TicketInputs& inputs, const He
         if (Graphics::Q0WordParts() && !budget.Stop()) Graphics::FillDrawTicketWords(*ticket, context, inputs.stages);
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the fetch plan
         // for the maxIndex the producer predicts from its own index scan, the last cheap part (before
-        // queue 0's receipt plan, which then walks the plan's copies). Only CopyMapped reads guest
-        // bytes here, never GuestMemory::Read or the flush hook.
-        if (Graphics::HelperFetchPlan() != 0 && !budget.Stop()) Graphics::FillDrawTicketFetchPlan(*ticket, context, *inputs.state, inputs.parameters, inputs.stages, &fetchPlanStops, &budget);
+        // queue 0's receipt plan, which then walks the plan's copies). Only the scan reads guest
+        // bytes here, never GuestMemory::Read or the flush hook: queue 0 copies before the push, when
+        // the title cannot free the range yet; a helper runs after it, when the item may already be
+        // committed and the range unmapped, and copies through the kernel. The part asks the budget
+        // itself, so a part the budget leaves out is counted (FetchPlanEvent::Cut).
+        if (Graphics::HelperFetchPlan() != 0) Graphics::FillDrawTicketFetchPlan(*ticket, context, *inputs.state, inputs.parameters, inputs.stages, &fetchPlanStops, &budget, budget.queue0 == nullptr);
         if (budget.queue0 != nullptr) {
             const auto& prepare = *budget.queue0;
             // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, in full pipeline waits only.
@@ -321,7 +324,7 @@ void Driver::reportQ0Prep() {
     if (Graphics::HelperFetchPlan() != 0) {
         const auto fetch = [&](Graphics::FetchPlanEvent event) { return tickets.fetchEvents[static_cast<std::size_t>(event)]; };
         using Event = Graphics::FetchPlanEvent;
-        AgcDriver::ProfilePrint_nid_no_patch("[q0prep] fetch plans (10 s, %s): producers built %llu; no part: not planned %llu, unmapped page %llu, mapping moved %llu, zero-fetch clamp %llu, a check or the plan threw %llu, cut %llu; committer: offered %llu, accepted %llu (%.1f%%), mismatch %llu, no part %llu\n", Graphics::HelperFetchPlan() == 2 ? "verify" : "used", count(fetch(Event::Built)), count(fetch(Event::Skipped)), count(fetch(Event::Unmapped)), count(fetch(Event::Moved)), count(fetch(Event::Clamp)), count(fetch(Event::Threw)), count(fetch(Event::Cut)), count(fetch(Event::Offered)), count(fetch(Event::Accepted)), percent(fetch(Event::Accepted), fetch(Event::Offered)), count(fetch(Event::Mismatch)), count(fetch(Event::NoPart)));
+        AgcDriver::ProfilePrint_nid_no_patch("[q0prep] fetch plans (10 s, %s): producers built %llu; no part: not planned %llu, unmapped page %llu, mapping moved %llu, zero-fetch clamp %llu, a check or the plan threw %llu, cut by the budget %llu, index range past %llu KiB %llu; committer: offered %llu, accepted %llu (%.1f%%), mismatch %llu, no part %llu\n", Graphics::HelperFetchPlan() == 2 ? "verify" : "used", count(fetch(Event::Built)), count(fetch(Event::Skipped)), count(fetch(Event::Unmapped)), count(fetch(Event::Moved)), count(fetch(Event::Clamp)), count(fetch(Event::Threw)), count(fetch(Event::Cut)), count(Graphics::HelperFetchPlanScanBytes() >> 10u), count(fetch(Event::Large)), count(fetch(Event::Offered)), count(fetch(Event::Accepted)), percent(fetch(Event::Accepted), fetch(Event::Offered)), count(fetch(Event::Mismatch)), count(fetch(Event::NoPart)));
     }
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the helpers' jobs (and
     // where they were dropped), their builds, the tickets they made ready or wasted, the slots as the
