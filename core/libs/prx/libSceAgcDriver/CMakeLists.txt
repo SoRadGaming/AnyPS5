@@ -3051,7 +3051,12 @@ if(BUILD_TESTING)
             "submit_thread|APS5_EXPERIMENT_SUBMIT_THREAD=2"
             "submit_thread_on|APS5_EXPERIMENT_SUBMIT_THREAD=1"
             "submit_pools|APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1"
-            "present_submit|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1")
+            "present_submit|APS5_EXPERIMENT_PRESENT_QUEUE=1,APS5_EXPERIMENT_SUBMIT_THREAD=1,APS5_EXPERIMENT_SUBMIT_POOLS=1"
+            # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN H): the host-write hook registered at device
+            # init, stamping (=1), and counting (=2) against queue 0's walk receipts; the hook's own
+            # checks (stamps, outside the arena, lock order) are in agc_write_tracking.
+            "host_write_stamps|APS5_EXPERIMENT_HOST_WRITE_STAMPS=1"
+            "host_write_count|APS5_EXPERIMENT_HOST_WRITE_STAMPS=2,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_RECEIPTS=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_LAZY_GENERATION=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

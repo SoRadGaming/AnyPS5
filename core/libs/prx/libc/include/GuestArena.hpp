@@ -69,6 +69,11 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS, PARALLEL-COMMIT-PLAN H): called with every
+// host write's range once GuestArenaEndHostWrite has ended it, after the mappings (or the write
+// watch) released their mutex: the driver's hook takes its write-tracker lock, whose holders take
+// that mutex. Not for host imports, and not for an empty range. Unset (the default) calls nothing.
+void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 
 }
 

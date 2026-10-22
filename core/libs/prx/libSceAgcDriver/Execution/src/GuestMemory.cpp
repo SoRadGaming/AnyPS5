@@ -1060,7 +1060,9 @@ struct WriteTracker {
 #endif
     }
 
-    void stampWatchedPart(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS): `kind` Cpu stamps a host write's watched
+    // part as a walk stamps a CPU store (NoteHostWrite); every other caller stamps the driver's own.
+    void stampWatchedPart(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration, StampKind kind = StampKind::Driver) {
 #ifdef _WIN32
         address = std::max<std::uint64_t>(address, base);
         end = std::min<std::uint64_t>(end, base + size);
@@ -1073,8 +1075,9 @@ struct WriteTracker {
             const auto first = std::max(address, blockBegin(block));
             const auto stop = std::min<std::uint64_t>(end, blockBegin(block) + WriteBlockBytes);
             if (!blockPartWatched(first, stop)) continue;
-            stamp(block, stampGeneration, StampKind::Driver);
-            noteDriverStore(block, address, end, stampGeneration);
+            stamp(block, stampGeneration, kind);
+            if (kind == StampKind::Driver) noteDriverStore(block, address, end, stampGeneration);
+            else noteCpuStore(first, stop, stampGeneration);
         }
     }
 
@@ -2359,6 +2362,22 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
 #endif
 }
 
+#ifdef __APPLE__
+namespace {
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS): set while ImportWatched holds the tracker
+// lock across its own GuestArena::HostWrite (the macOS opening of an import window): that write is
+// the import's, not the title's, and its stamp would take the tracker lock again.
+struct HostWriteMuteSlot {};
+using HostWriteMute = HostThreadSlot<bool, HostWriteMuteSlot>;
+struct MuteHostWriteStamps {
+    MuteHostWriteStamps() { HostWriteMute::Set(true); }
+    ~MuteHostWriteStamps() { HostWriteMute::Set(false); }
+    MuteHostWriteStamps(const MuteHostWriteStamps&) = delete;
+    MuteHostWriteStamps& operator=(const MuteHostWriteStamps&) = delete;
+};
+}
+#endif
+
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return import();
     if (!staysWatched) {
@@ -2379,6 +2398,8 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
     const auto runImport = [&] {
 #ifdef __APPLE__
+        // Declared before the write, so it is still set when the write's end calls the hook.
+        const MuteHostWriteStamps mute;
         const GuestArena::HostWrite open(reinterpret_cast<void*>(first), static_cast<std::size_t>(stop - first));
 #endif
         return import();
@@ -2565,6 +2586,160 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation);
     }
     return tracker.generation;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS, PARALLEL-COMMIT-PLAN H): host-write stamps
+// (see the header). Lock order: libc calls the hook after EndHostWrite released the mappings' (or
+// the write watch's) mutex, and the tracker lock is otherwise only ever taken before that mutex
+// (a collect); NoteHostWrite takes the tracker lock alone (GpuMutex, when its caller holds it, comes
+// first, as for MarkWritten) and CountHostWrite the receipt ring alone, a leaf.
+namespace {
+struct HostWriteCounters {
+    std::atomic<std::uint64_t> writes{0}, bytes{0}, outside{0}, covered{0}, coveredOlder{0};
+    std::atomic<std::int64_t> windowStartMs{0};
+};
+HostWriteCounters& hostWriteCounters() {
+    static auto* counters = new HostWriteCounters();
+    return *counters;
+}
+void countHostWriteBytes(std::size_t bytes) {
+    auto& counters = hostWriteCounters();
+    counters.writes.fetch_add(1, std::memory_order_relaxed);
+    counters.bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+// Whether a run of the merged `ranges` holds a byte of [first, stop).
+bool rangesOverlap(const std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t first, std::uintptr_t stop) {
+    const auto it = ranges.upper_bound(first);
+    if (it != ranges.begin() && std::prev(it)->second > first) return true;
+    return it != ranges.end() && it->first < stop;
+}
+// The [hostwrite] line, printed by the host write that ends a 10 s window (nothing while none
+// happens; the first one only starts the window).
+void reportHostWrites() {
+    auto& counters = hostWriteCounters();
+    const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto start = counters.windowStartMs.load(std::memory_order_relaxed);
+    if (start == 0) {
+        counters.windowStartMs.compare_exchange_strong(start, nowMs, std::memory_order_relaxed);
+        return;
+    }
+    if (nowMs - start < 10000 || !counters.windowStartMs.compare_exchange_strong(start, nowMs, std::memory_order_relaxed)) return;
+    const auto stats = TakeHostWriteStats();
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    if (HostWriteStamps() == 1) {
+        AgcDriver::ProfilePrint_nid_no_patch("[hostwrite] (%.1f s, stamped): %llu host writes, %.2f MiB; outside the watched arena (not stamped) %llu\n", static_cast<double>(nowMs - start) / 1e3, count(stats.writes), static_cast<double>(stats.bytes) / 1048576.0, count(stats.outside));
+        return;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[hostwrite] (%.1f s, count only, receipts %s): %llu host writes, %.2f MiB; under a receipt of the newest token %llu, of an older token only %llu\n", static_cast<double>(nowMs - start) / 1e3, Q0Receipts() == 0 ? "off" : Q0Receipts() == 2 ? "count only" : "used", count(stats.writes), static_cast<double>(stats.bytes) / 1048576.0, count(stats.covered), count(stats.coveredOlder));
+}
+// The hooks libc calls (std::uintptr_t, which is not std::uint64_t everywhere). From ~HostWrite, so
+// nothing may escape.
+void stampHostWrite(std::uintptr_t address, std::size_t bytes) {
+#ifdef __APPLE__
+    if (HostWriteMute::Get()) return;
+#endif
+    NoteHostWrite(address, bytes);
+    try {
+        reportHostWrites();
+    } catch (const std::exception&) {
+    }
+}
+void countHostWrite(std::uintptr_t address, std::size_t bytes) {
+#ifdef __APPLE__
+    if (HostWriteMute::Get()) return;
+#endif
+    CountHostWrite(address, bytes);
+    try {
+        reportHostWrites();
+    } catch (const std::exception&) {
+    }
+}
+}
+
+int HostWriteStamps() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_HOST_WRITE_STAMPS");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+void InstallHostWriteStamps() {
+    const auto mode = HostWriteStamps();
+    if (mode == 0) return;
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(mode == 1 ? &stampHostWrite : &countHostWrite);
+}
+
+void NoteHostWrite(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    countHostWriteBytes(bytes);
+    const auto end = address + bytes;
+    try {
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        // Only the watched arena: a host write to host memory has no blocks and moves nothing.
+#ifdef _WIN32
+        const bool inArena = tracker.watched && end > tracker.base && address < tracker.base + tracker.size;
+#else
+        const bool inArena = tracker.watched && GuestWriteWatch::GuestWriteWatchOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+#endif
+        if (!inArena) {
+            hostWriteCounters().outside.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        ++tracker.generation;
+        const auto generation = tracker.generation.load(std::memory_order_relaxed);
+        if (!tracker.covers(address, bytes)) {
+            tracker.noteUnstampedStore(address, end);
+            tracker.stampWatchedPart(address, end, generation, StampKind::Cpu);
+            return;
+        }
+        tracker.noteCpuStore(address, end, generation);
+        for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, StampKind::Cpu);
+    } catch (const std::exception&) {
+    }
+}
+
+void CountHostWrite(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    countHostWriteBytes(bytes);
+    const auto first = static_cast<std::uintptr_t>(address);
+    const auto stop = static_cast<std::uintptr_t>(address + bytes);
+    // The key a consult compares the slot with (collectWrites), read as it reads it.
+    const auto serial = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    bool current = false;
+    bool older = false;
+    {
+        auto& ring = receiptRing();
+        const std::lock_guard lock(ring.mutex);
+        const ReceiptSlot* newest = nullptr;
+        for (const auto& slot : ring.slots) {
+            if (slot.token != 0 && (newest == nullptr || slot.token > newest->token)) newest = &slot;
+        }
+        for (const auto& slot : ring.slots) {
+            if (slot.token == 0 || slot.serial != serial || slot.mapping != mapping || !rangesOverlap(slot.ranges, first, stop)) continue;
+            if (&slot == newest) current = true;
+            else older = true;
+        }
+    }
+    auto& counters = hostWriteCounters();
+    if (current) counters.covered.fetch_add(1, std::memory_order_relaxed);
+    else if (older) counters.coveredOlder.fetch_add(1, std::memory_order_relaxed);
+}
+
+HostWriteStats TakeHostWriteStats() {
+    auto& counters = hostWriteCounters();
+    HostWriteStats stats;
+    stats.writes = counters.writes.exchange(0, std::memory_order_relaxed);
+    stats.bytes = counters.bytes.exchange(0, std::memory_order_relaxed);
+    stats.outside = counters.outside.exchange(0, std::memory_order_relaxed);
+    stats.covered = counters.covered.exchange(0, std::memory_order_relaxed);
+    stats.coveredOlder = counters.coveredOlder.exchange(0, std::memory_order_relaxed);
+    return stats;
 }
 
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
