@@ -6586,11 +6586,13 @@ void storageUploadLifetimeTests(const Device& device, Recorder& previous, bool f
     std::cout << "Storage upload lifetime" << (failView ? " after view failure" : " after caller release") << ": passed\n";
 }
 
-void refreshProofTests(const Device& device, Recorder& recorder) {
+// LOCAL EXPERIMENT (GPU-OWNED-PLAN L2-1): false when nothing could be tested (--refresh-proof-only
+// then reports a skip).
+bool refreshProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: refresh proofs not tested\n";
-        return;
+        return false;
     }
     constexpr std::uint32_t side = 256;
     constexpr std::size_t surfaceBytes = side * side * 4;
@@ -6599,7 +6601,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
         std::cout << "no write watching: refresh proofs not tested\n";
-        return;
+        return false;
     }
     auto* texels = static_cast<std::uint8_t*>(block);
     auto* keys = texels + surfaceBytes;
@@ -6624,7 +6626,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "no watched host import: refresh proofs not tested\n";
-        return;
+        return false;
     }
     TextureDetiler detiler(base);
     auto context = base;
@@ -6707,6 +6709,191 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
     }
     recorder.Sync();
+    return true;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): refresh proofs while
+// another image is pending over the target with no pending unit inside it. A 1 MiB watched host
+// import; the target T is a 256 KiB R64KBX surface at 256 KiB with its DCC keys at 768 KiB, and O a
+// block-unit image without DCC over the whole 1 MiB (16 units of 64 KiB: T lies in O's units 4-7,
+// its keys in O's unit 12). What a refresh answers follows the switch: unset or 0 never proves T
+// while O is pending, 1 proves it, 2 hands every predicted hit to today's refresh (verified, never
+// proved). With APS5_NO_FLUSH_PRETEST=1 every overlapping pending image has a unit "inside", so no
+// proof is ever unit-checked. False when nothing could be tested.
+bool refreshProofUnitTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: unit-checked refresh proofs not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = std::size_t{1} << 20;
+    constexpr std::size_t targetOffset = 256 * 1024;
+    constexpr std::size_t targetBytes = 256 * 1024;
+    constexpr std::size_t keyOffset = 768 * 1024;
+    constexpr std::size_t keyCount = targetBytes / 256;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: unit-checked refresh proofs not tested\n";
+        return false;
+    }
+    auto* memory = static_cast<std::uint8_t*>(block);
+    std::memset(memory, 0x55, bytes);
+    std::memset(memory + keyOffset, 0xff, keyCount);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "no watched host import: unit-checked refresh proofs not tested\n";
+        return false;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto surface = [](std::uint64_t at, std::uint32_t side, std::uint64_t keys) {
+        GuestTextureResource resource{};
+        resource.baseAddress = at;
+        resource.width = side;
+        resource.height = side;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        resource.dccAddress = keys;
+        return resource;
+    };
+    const auto targetResource = surface(address + targetOffset, 256, address + keyOffset);
+    const auto otherResource = surface(address, 512, 0);
+    Require(DescribeSurface(targetResource).guestBytes == targetBytes && DescribeSurface(otherResource).guestBytes == bytes, "unit-checked proof fixture: unexpected surface sizes");
+    const char* text = std::getenv("APS5_EXPERIMENT_PROOF_UNITS");
+    const auto value = text != nullptr ? std::strtol(text, nullptr, 10) : 0;
+    const int units = value == 0 ? 0 : value == 2 ? 2 : 1;
+    const bool pretest = std::getenv("APS5_NO_FLUSH_PRETEST") == nullptr;
+    // Without the pretest no proof is unit-checked: the refreshes answer as with the switch off.
+    const int mode = pretest ? units : 0;
+    const auto proved = [] { return StorageTexture::RefreshesProved(); };
+    const auto counts = [] { return StorageTexture::ProofUnitTotals(); };
+    const auto start = counts();
+    {
+        auto target = StorageTexture::Create(context, detiler, targetResource, 0);
+        recorder.Keep(target);
+        Require(target->BlockUnits() && target->TrackedUnits() == 4, "unit-checked proof fixture: the target is not four block units");
+        const auto settle = [&] {
+            target->Refresh();
+            target->Refresh();
+        };
+        const auto expectProved = [&](bool expected, const char* what) {
+            const auto before = proved();
+            target->Refresh();
+            Require(proved() == before + (expected ? 1 : 0), what);
+        };
+        settle();
+        expectProved(true, "the target was not proved with nothing else pending");
+        auto other = StorageTexture::Create(context, detiler, otherResource, 0);
+        recorder.Keep(other);
+        Require(other->BlockUnits() && other->TrackedUnits() == 16, "unit-checked proof fixture: the other image is not sixteen block units");
+
+        // 1. O pending outside T and its keys: 1 converts T's proof at once and proves it from then
+        // on, 2 predicts and verifies every refresh, 0 (and no pretest) never proves T.
+        std::vector<bool> outside(16, false);
+        outside[0] = outside[1] = true;
+        other->MarkUnitsWritten(outside);
+        Require(other->Dirty(), "the other image's units were not marked pending");
+        auto before = counts();
+        expectProved(mode == 1, mode == 1 ? "1: the proof was not converted to a unit-checked one" : "a proof held while another image was pending over the target");
+        settle();
+        expectProved(mode == 1, mode == 1 ? "1: the target was not proved after one settle with the other image pending outside it" : "the target was proved with another image pending over it");
+        auto after = counts();
+        if (mode == 1) Require(after.converted == before.converted + 1 && after.hits == before.hits + 4 && after.verified == before.verified, "1: the unit-checked proof was not converted once and used on every refresh");
+        if (mode == 2) Require(after.converted == before.converted + 1 && after.taken == before.taken + 4 && after.verified == before.verified + 4 && after.hits == before.hits, "2: every predicted hit was not verified against today's refresh");
+        // A CPU store into T: the next refresh uploads, the one after takes the proof unit-checked.
+        memory[targetOffset] = 0x11;
+        expectProved(false, "a CPU store into the target was answered from a unit-checked proof");
+        before = counts();
+        settle();
+        expectProved(mode == 1, mode == 1 ? "1: no unit-checked proof was taken after a CPU store" : "the target was proved after a CPU store with another image pending over it");
+        after = counts();
+        if (mode != 0) Require(after.taken >= before.taken + 1, "no unit-checked proof was taken at the unchanged exit");
+
+        // 2. A unit inside T marked in O, already pending: no pending serial moves (the premise of the
+        // per-use check), and T's next refresh is not proved and stores the unit.
+        const auto serial = StorageTexture::PendingSerial();
+        auto inside = outside;
+        inside[5] = true;
+        other->MarkUnitsWritten(inside);
+        Require(StorageTexture::PendingSerial() == serial, "a unit marked in an image already pending moved the pending serial");
+        before = counts();
+        expectProved(false, "a refresh was proved with another image's unit pending inside the target");
+        if (mode != 0) Require(counts().refusedInside == before.refusedInside + 1, "the unit-checked proof was not refused for the unit inside");
+        if (pretest) Require(!StorageTexture::FlushPending(targetResource.baseAddress, targetBytes, target.get(), "unit-checked proof test", PublishScope::None), "the full refresh left the other image's unit inside the target pending");
+
+        // 3. An image of exactly T's surface pending: refused (the flush stores it).
+        settle();
+        auto same = targetResource;
+        same.dccAddress = 0;
+        auto alias = StorageTexture::Create(context, detiler, same, 0);
+        recorder.Keep(alias);
+        alias->MarkDirty();
+        before = counts();
+        expectProved(false, "a refresh was proved with an image of the same surface pending");
+        if (mode != 0) Require(counts().refusedSameRange == before.refusedSameRange + 1, "the unit-checked proof was not refused for the same-range image");
+        Require(!alias->Dirty(), "the full refresh left the same-range image pending");
+
+        // 4. A unit of O inside T's DCC keys only: refused on use, and no proof is taken while it is
+        // pending (stricter than today's proof, which reads no other image's keys).
+        settle();
+        auto keysUnit = outside;
+        keysUnit[12] = true;
+        other->MarkUnitsWritten(keysUnit);
+        before = counts();
+        expectProved(false, "a refresh was proved with another image's unit pending inside the target's keys");
+        if (mode != 0) Require(counts().refusedKeyRange == before.refusedKeyRange + 1, "the unit-checked proof was not refused for the unit inside the keys");
+        settle();
+        expectProved(false, "a proof was taken with another image's unit pending inside the target's keys");
+
+        // The unit scan over ranges around O's pending units (0, 1, 12): only a range meeting one
+        // stores it (=2 checks every scan against the loop over every unit).
+        if (pretest) {
+            Require(!StorageTexture::FlushPending(address + 2 * 65536, 65536, nullptr, "unit-checked proof test", PublishScope::None), "a range of no pending unit stored the other image");
+            Require(!StorageTexture::FlushPending(address + 11 * 65536 + 4096, 65536 - 8192, nullptr, "unit-checked proof test", PublishScope::None), "a range inside a unit that is not pending stored the other image");
+            Require(StorageTexture::FlushPending(address + 2 * 65536 - 1, 1, nullptr, "unit-checked proof test", PublishScope::None), "the last byte of a pending unit did not store it");
+            Require(StorageTexture::FlushPending(address + 12 * 65536 - 1, 2, nullptr, "unit-checked proof test", PublishScope::None), "a range straddling into a pending unit did not store it");
+            Require(StorageTexture::FlushPending(address + 1, 3, nullptr, "unit-checked proof test", PublishScope::None), "a range inside the first pending unit did not store it");
+        } else {
+            StorageTexture::FlushPending(address, bytes, nullptr, "unit-checked proof test", PublishScope::None);
+        }
+        Require(!other->Dirty(), "the other image is still pending");
+        // The stores of unit 12 over T's keys complete, so a key scan is kept as the proof again.
+        recorder.Sync();
+        settle();
+        expectProved(true, "the target was not proved once nothing else was pending");
+        recorder.Sync();
+    }
+    recorder.Sync();
+    const auto end = counts();
+    if (mode == 0) Require(end.taken == start.taken && end.converted == start.converted && end.hits == start.hits && end.verified == start.verified, "a proof was unit-checked with the switch off or without the flush pretest");
+    if (mode == 2) Require(end.hits == start.hits && end.scansChecked > start.scansChecked, "2: a unit-checked proof answered a refresh, or no unit scan was checked against the loop");
+    if (mode == 1) Require(end.scansChecked == start.scansChecked, "1: a unit scan was checked against the loop");
+    Require(end.raced == start.raced && end.keysOnly == start.keysOnly, "a predicted hit was overtaken by a store or differed in the keys");
+    std::cout << "Unit-checked refresh proofs (APS5_EXPERIMENT_PROOF_UNITS=" << units << (pretest ? "" : ", no flush pretest") << "): passed\n";
+    return true;
 }
 
 
@@ -11414,6 +11601,16 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1): both refresh proof suites,
+        // for the switch's rows; skipped (77) when either could not test.
+        if (argc == 2 && std::string_view(argv[1]) == "--refresh-proof-only") {
+            const bool tested = refreshProofTests(device, recorder);
+            if (!refreshProofUnitTests(device, recorder) || !tested) {
+                std::cout << "skipped, the device imports no watched host memory for the refresh proofs\n";
+                return 77;
+            }
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
@@ -11697,6 +11894,7 @@ int main(int argc, char** argv) {
         keyProofTests(device, recorder);
         targetKeyProofTests(device, recorder);
         refreshProofTests(device, recorder);
+        refreshProofUnitTests(device, recorder);
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);

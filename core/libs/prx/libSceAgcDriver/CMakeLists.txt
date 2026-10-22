@@ -1548,6 +1548,22 @@ if(BUILD_TESTING)
         set_tests_properties(agc_storage_clear_hand_over PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS, GPU-OWNED-PLAN L2-1, P1): the refresh proofs and the
+    # unit-checked ones, with the switch off, on, verified (=2: every predicted hit checked against
+    # today's refresh, every unit scan against the loop), and on without the flush pretest (no proof
+    # is unit-checked).
+    add_test(NAME agc_storage_refresh_proof COMMAND agc_driver_recorder_tests --refresh-proof-only)
+    add_test(NAME agc_storage_refresh_proof_units1 COMMAND agc_driver_recorder_tests --refresh-proof-only)
+    add_test(NAME agc_storage_refresh_proof_units2 COMMAND agc_driver_recorder_tests --refresh-proof-only)
+    add_test(NAME agc_storage_refresh_proof_units1_no_pretest COMMAND agc_driver_recorder_tests --refresh-proof-only)
+    set_tests_properties(agc_storage_refresh_proof agc_storage_refresh_proof_units1 agc_storage_refresh_proof_units2 agc_storage_refresh_proof_units1_no_pretest PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_storage_refresh_proof_units1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PROOF_UNITS=1")
+    set_tests_properties(agc_storage_refresh_proof_units2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PROOF_UNITS=2")
+    set_tests_properties(agc_storage_refresh_proof_units1_no_pretest PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_PROOF_UNITS=1;APS5_NO_FLUSH_PRETEST=1")
+    if(WIN32)
+        set_tests_properties(agc_storage_refresh_proof agc_storage_refresh_proof_units1 agc_storage_refresh_proof_units2 agc_storage_refresh_proof_units1_no_pretest PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_storage_integer_clear COMMAND agc_driver_recorder_tests --integer-clear-only)
     set_tests_properties(agc_storage_integer_clear PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
@@ -3101,7 +3117,12 @@ if(BUILD_TESTING)
             # every memo verdict, the first disagreement fatal) and on (=1, with the audit); its own
             # cases are in agc_snapshot_refresh_hash* and the graphics suite's parallel compare tests.
             "snapshot_hash|APS5_EXPERIMENT_SNAPSHOT_HASH=3"
-            "snapshot_hash_on|APS5_EXPERIMENT_SNAPSHOT_HASH=1")
+            "snapshot_hash_on|APS5_EXPERIMENT_SNAPSHOT_HASH=1"
+            # LOCAL EXPERIMENT (GPU-OWNED-PLAN L2-1, P1): unit-checked refresh proofs, verified (=2: every
+            # predicted hit runs today's refresh, which must agree, and every unit scan is checked
+            # against the loop over every unit) and on.
+            "proof_units|APS5_EXPERIMENT_PROOF_UNITS=2"
+            "proof_units_on|APS5_EXPERIMENT_PROOF_UNITS=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

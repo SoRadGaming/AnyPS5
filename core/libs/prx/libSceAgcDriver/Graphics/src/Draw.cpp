@@ -356,6 +356,12 @@ enum SyncReason : std::size_t { SyncNone, SyncNotResident, SyncNoRecorder, SyncD
 constexpr std::array<const char*, SyncCount> SyncReasonNames{"none", "non-resident target", "no recorder", "disabled", "copied writes", "lease"};
 constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawPath::Count);
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled", "index range not fully readable"};
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): what the target lookups' refreshes did (the
+// lookup outcomes of StorageTexture::Refresh on the committer, ThreadLookupOutcomes before and
+// after refreshResidentTarget): proved, unchanged, compared, a pending flush, an upload (direct,
+// CPU or clear).
+enum TargetRefresh : std::size_t { TargetProved, TargetUnchanged, TargetCompared, TargetFlushed, TargetUploads, TargetRefreshCount };
+constexpr std::array<const char*, TargetRefreshCount> TargetRefreshNames{"proved", "unchanged", "compared", "pending flush", "uploads"};
 
 // What became of one draw, for the totals.
 struct DrawOutcome {
@@ -385,11 +391,14 @@ struct DrawOutcome {
     std::uint64_t slowLookups = 0;
     double slowLookupUs = 0;
     // The lookups by whether the draw's scissor covers the whole target (an area-scoped proof
-    // would change nothing for those), the pages their write-watch collects walked and their time.
+    // would change nothing for those), the pages their write-watch collects walked on a memo miss
+    // (GuestMemory::ThreadCollectedBytes; memo hits walk nothing) and their wall time.
     std::uint64_t fullScissorLookups = 0;
     std::uint64_t partialLookups = 0;
-    std::uint64_t pagesWalked = 0;
+    std::uint64_t memoMissPages = 0;
     double lookupUs = 0;
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): their refresh outcomes (TargetRefresh).
+    std::array<std::uint64_t, TargetRefreshCount> targetRefreshes{};
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -412,8 +421,9 @@ struct DrawProfile {
     std::array<std::uint64_t, KindCount> kindCounts{};
     std::uint64_t fullScissorLookups = 0;
     std::uint64_t partialLookups = 0;
-    std::uint64_t pagesWalked = 0;
+    std::uint64_t memoMissPages = 0;
     double lookupUs = 0;
+    std::array<std::uint64_t, TargetRefreshCount> targetRefreshes{};
     std::array<double, PhaseCount> totalsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
@@ -545,8 +555,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.slowLookupUs += outcome.slowLookupUs;
     profile.fullScissorLookups += outcome.fullScissorLookups;
     profile.partialLookups += outcome.partialLookups;
-    profile.pagesWalked += outcome.pagesWalked;
+    profile.memoMissPages += outcome.memoMissPages;
     profile.lookupUs += outcome.lookupUs;
+    for (std::size_t i = 0; i < TargetRefreshCount; ++i) profile.targetRefreshes[i] += outcome.targetRefreshes[i];
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -557,7 +568,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lastReport = now;
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
-    char line[2048];
+    // Room for the L2-0 target refresh outcomes too (LOCAL DEBUG).
+    char line[3072];
     int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
@@ -568,7 +580,11 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
-        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
+        if (i == PhaseReadTarget && room()) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu; memo-miss collect pages %llu; lookup wall %.0f us; refreshes:", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.memoMissPages), profile.lookupUs);
+            for (std::size_t kind = 0; kind < TargetRefreshCount && room(); ++kind) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s %s %llu", kind != 0 ? "," : "", TargetRefreshNames[kind], static_cast<unsigned long long>(profile.targetRefreshes[kind]));
+            if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ")");
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -615,8 +631,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.recordedUs = profile.waitedUs = profile.synchronousUs = 0;
     profile.targetLookups = profile.slowLookups = 0;
     profile.slowLookupUs = 0;
-    profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
+    profile.fullScissorLookups = profile.partialLookups = profile.memoMissPages = 0;
     profile.lookupUs = 0;
+    profile.targetRefreshes.fill(0);
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -1891,6 +1908,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     return inputs;
 }
 
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): takes this thread's refresh outcome counts
+// (ThreadLookupOutcomes) off the draw's target refresh counts before a target lookup and adds them
+// back after it, so the draw's counts receive the lookup's outcomes (modulo 2^64).
+void noteTargetRefreshes(DrawOutcome& outcome, bool after) {
+    const auto& counts = ThreadLookupOutcomes().counts;
+    const std::array<std::uint64_t, TargetRefreshCount> now{counts[LookupOutcomes::RefreshProved], counts[LookupOutcomes::RefreshUnchanged], counts[LookupOutcomes::RefreshCompared], counts[LookupOutcomes::PendingFlush], counts[LookupOutcomes::UploadDirect] + counts[LookupOutcomes::UploadCpu] + counts[LookupOutcomes::UploadClear]};
+    for (std::size_t i = 0; i < TargetRefreshCount; ++i) outcome.targetRefreshes[i] = after ? outcome.targetRefreshes[i] + now[i] : outcome.targetRefreshes[i] - now[i];
+}
+
 // The resident-target proof of one attachment (StorageTexture::Refresh: FlushPending, CollectWrites
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
@@ -1898,9 +1924,21 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): the lookup's refresh outcomes, and the
+    // caller mark for the [proofs] line.
+    if (profile) noteTargetRefreshes(outcome, false);
     std::shared_ptr<StorageTexture> resident;
     try {
-        resident = lookup();
+        {
+            const StorageTexture::TargetLookupScope targetLookup(profile);
+            try {
+                resident = lookup();
+            } catch (...) {
+                if (profile) noteTargetRefreshes(outcome, true);
+                throw;
+            }
+        }
+        if (profile) noteTargetRefreshes(outcome, true);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
@@ -1917,7 +1955,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             outcome.slowLookupUs += lookupUs;
         }
         outcome.lookupUs += lookupUs;
-        outcome.pagesWalked += (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
+        outcome.memoMissPages += (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }
