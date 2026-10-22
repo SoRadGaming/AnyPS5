@@ -98,6 +98,12 @@ bool postPushStops(const void* post) {
     return DrawPipeline::Queue0().Outstanding() <= *static_cast<const std::size_t*>(post);
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, B2): the fetch plan's index scan asks the
+// build's budget between its chunks.
+bool fetchPlanStops(const void* budget) {
+    return static_cast<const HelperBudget*>(budget)->Stop();
+}
+
 // Plans the ranges from the closure's objects and the ticket (Graphics::PlanDrawTicketWalks) into
 // queue 0's list; walks them now only inside a full pipeline wait (every draw with a 0 pre depth,
 // the tests' setting), stopping at the ticket's bail depth: collects first and only, no result
@@ -141,7 +147,9 @@ void skippedTicket(void*, DrawPipeline::PrepareSkip why) {
 // PARALLEL-COMMIT-PLAN B0): the draw's ticket, built by queue 0 inside Enqueue or by a prep helper,
 // in a GuestMemory::PrepareScope and without GpuMutex. The context is the device's without a recorder
 // or copied writers, so any recorder use on this path faults at once; nothing here reads guest
-// bytes. A part whose checks throw is left out (the committer runs them).
+// bytes but the fetch plan's index scan (APS5_EXPERIMENT_HELPER_FETCH_PLAN, through CopyMapped; its
+// result is a prediction the committer checks). A part whose checks throw is left out (the
+// committer runs them).
 std::unique_ptr<Graphics::DrawTicket> BuildTicket(TicketInputs& inputs, const HelperBudget& budget) {
     // A stage without a compiled program fails VulkanDevice::Draw's first check; the checks after
     // it assume programs, so such a draw gets no ticket.
@@ -172,6 +180,11 @@ std::unique_ptr<Graphics::DrawTicket> BuildTicket(TicketInputs& inputs, const He
         if (Graphics::Q0TemplateParts() && !budget.Stop()) Graphics::FillDrawTicketTemplate(*ticket, context, *inputs.state, inputs.parameters, inputs.stages, inputs.prepared);
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS, COMMITTER-SPLIT-PLAN Q2b).
         if (Graphics::Q0WordParts() && !budget.Stop()) Graphics::FillDrawTicketWords(*ticket, context, inputs.stages);
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the fetch plan
+        // for the maxIndex the producer predicts from its own index scan, the last cheap part (before
+        // queue 0's receipt plan, which then walks the plan's copies). Only CopyMapped reads guest
+        // bytes here, never GuestMemory::Read or the flush hook.
+        if (Graphics::HelperFetchPlan() != 0 && !budget.Stop()) Graphics::FillDrawTicketFetchPlan(*ticket, context, *inputs.state, inputs.parameters, inputs.stages, &fetchPlanStops, &budget);
         if (budget.queue0 != nullptr) {
             const auto& prepare = *budget.queue0;
             // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS=3): the byte shadow, in full pipeline waits only.
@@ -302,6 +315,14 @@ void Driver::reportQ0Prep() {
         parts += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[q0prep] tickets (10 s, %s): built %llu, skipped shallow %llu, skipped holding the GPU mutex %llu; refused at the commit: device %llu, pool %llu; parts:%s\n", Graphics::Q0Ticket() == 0 ? "shadow" : Graphics::Q0Ticket() == 2 ? "verify" : "used", count(tickets.built), count(tickets.shallow), count(tickets.locked), count(tickets.refusedDevice), count(tickets.refusedPool), parts.c_str());
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): what the producers
+    // made of the fetch plans (FetchPlanEvent) and what the committer did with them. B2's gate: 0
+    // disagreements (the fetch part above) and accepted on at least 80% of the draws offered one.
+    if (Graphics::HelperFetchPlan() != 0) {
+        const auto fetch = [&](Graphics::FetchPlanEvent event) { return tickets.fetchEvents[static_cast<std::size_t>(event)]; };
+        using Event = Graphics::FetchPlanEvent;
+        AgcDriver::ProfilePrint_nid_no_patch("[q0prep] fetch plans (10 s, %s): producers built %llu; no part: not planned %llu, unmapped page %llu, mapping moved %llu, zero-fetch clamp %llu, a check or the plan threw %llu, cut %llu; committer: offered %llu, accepted %llu (%.1f%%), mismatch %llu, no part %llu\n", Graphics::HelperFetchPlan() == 2 ? "verify" : "used", count(fetch(Event::Built)), count(fetch(Event::Skipped)), count(fetch(Event::Unmapped)), count(fetch(Event::Moved)), count(fetch(Event::Clamp)), count(fetch(Event::Threw)), count(fetch(Event::Cut)), count(fetch(Event::Offered)), count(fetch(Event::Accepted)), percent(fetch(Event::Accepted), fetch(Event::Offered)), count(fetch(Event::Mismatch)), count(fetch(Event::NoPart)));
+    }
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS, PARALLEL-COMMIT-PLAN B0): the helpers' jobs (and
     // where they were dropped), their builds, the tickets they made ready or wasted, the slots as the
     // committer closed them (B0's gate: ready on at least 88% of committed draws), the leads, and

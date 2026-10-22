@@ -2038,6 +2038,23 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_vertex_target_range_copied agc_driver_vertex_target_range_imported PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): a ticket's fetch plan
+    # made as a producer makes it and taken by Draw: accepted while its predicted maxIndex holds,
+    # refused on a mismatch, absent under the zero-fetch clamp and the render-target alias (which
+    # the committer raises at its own place); used (=1), verified (=2, every accepted plan also made
+    # inline and compared) and verified over the ReBAR VRAM draw inputs.
+    set(helperFetchPlanTests agc_helper_fetch_plan agc_helper_fetch_plan_verify agc_helper_fetch_plan_vram1)
+    foreach(helperFetchPlanTest IN LISTS helperFetchPlanTests)
+        add_test(NAME ${helperFetchPlanTest} COMMAND agc_driver_recorder_tests --helper-fetch-plan-only)
+    endforeach()
+    set_tests_properties(${helperFetchPlanTests} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_helper_fetch_plan PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=1;APS5_DEBUG_Q0_PREP_STATS=1")
+    set_tests_properties(agc_helper_fetch_plan_verify PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=2;APS5_DEBUG_Q0_PREP_STATS=1")
+    set_tests_properties(agc_helper_fetch_plan_vram1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_Q0_TICKET=1;APS5_EXPERIMENT_HELPER_FETCH_PLAN=2;APS5_DEBUG_Q0_PREP_STATS=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+    if(WIN32)
+        set_tests_properties(${helperFetchPlanTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
@@ -3016,6 +3033,12 @@ if(BUILD_TESTING)
             # helper delays, so tickets land early, late (wasted) and not at all.
             "prep_helpers|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3"
             "prep_helpers_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1"
+            # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN B2): the tickets' fetch plans, every accepted plan
+            # also made inline at the commit and compared (=2), built by queue 0 inside Enqueue
+            # (helpers off), by three prep helpers, and by helpers with random delays.
+            "fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
+            "prep_helpers_fetch_plan|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
+            "prep_helpers_fetch_plan_stress|APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2,APS5_EXPERIMENT_PREP_HELPERS=3,APS5_EXPERIMENT_PREP_HELPERS_STRESS=1,APS5_EXPERIMENT_HELPER_FETCH_PLAN=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN A3): the queue gate and the present queue, with
             # every queue operation checked (its queue's mutex held, no device-wide wait overlapping;
             # =2 aborts on the first violation, the assertion switch does at =1 too).

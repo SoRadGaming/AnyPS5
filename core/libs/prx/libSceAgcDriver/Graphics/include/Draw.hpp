@@ -42,6 +42,16 @@ void FillDrawTicketChecks(DrawTicket& ticket, const Context& context, const Stat
 // template hint (FindHint, or Probe for a shadow ticket) and, with a hint, its moved-candidate
 // memo, the push block and the store's pipeline (CachedPipelineIfPresent, lookup only).
 void FillDrawTicketTemplate(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const PreparedDraw* prepared);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the FetchPlan part of a
+// direct draw's ticket, made by its producer (a prep helper, or queue 0 inside Enqueue) with a
+// context without a recorder, inside a GuestMemory::PrepareScope: maxIndex as prepareDrawInputs
+// computes it, an indexed draw's highest index from its own scan of the guest index range
+// (GuestMemory::CopyMapped in 64 KiB chunks inside an even, unchanged ForgetSerial bracket; no flush
+// hook, no GuestMemory::Read), then planVertexFetches' plan for it and its zero buffers. No part
+// for a draw without one to plan, an unmapped page, a moved mapping, the zero-fetch clamp, a check
+// that throws (the committer raises it at its own place) or `stop(budget)` holding during the scan
+// (asked every 1 MiB). Counted per FetchPlanEvent.
+void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool (*stop)(const void* budget) = nullptr, const void* budget = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 

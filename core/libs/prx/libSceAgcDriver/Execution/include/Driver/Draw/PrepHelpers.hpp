@@ -9,8 +9,9 @@
 #include <memory>
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS=N, PARALLEL-COMMIT-PLAN B0): prep helper threads
-// agcprep0..N-1 build the Q1/Q2/Q2b ticket parts (BuildTicket) of pipelined draws that are already
-// queued, in place of queue 0, which then passes Enqueue no Prepare and walks no receipts. The
+// agcprep0..N-1 build the Q1/Q2/Q2b ticket parts (BuildTicket; with APS5_EXPERIMENT_HELPER_FETCH_PLAN
+// also B2's fetch plan) of pipelined draws that are already queued, in place of queue 0, which then
+// passes Enqueue no Prepare and walks no receipts. The
 // committer never waits for a helper:
 // - Queue 0 publishes a PrepJob after the draw's Enqueue returned its seq. The job owns a copy of
 //   the draw's TicketInputs (whose views point into the closure) and a pin of the closure (a copy

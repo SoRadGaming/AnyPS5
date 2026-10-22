@@ -1479,6 +1479,10 @@ std::shared_ptr<Buffer> replayZeroBuffer(const Context& context, DrawReplayInput
 
 std::atomic<std::uint64_t> preparedDrawUses{0};
 
+// How far an indexed draw's highest index may pass the first vertex that reads zeros before
+// prepareDrawInputs clamps the indices (a ticket's fetch plan leaves such draws to it).
+constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed. LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): with the ticket's Validated
@@ -1690,7 +1694,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
-        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
         bool clampedCopy = false;
         if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
@@ -1778,16 +1781,50 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         planVertexFetches(context, state, draw, attributes, args, inputs.maxIndex, scratch.planned, nullptr);
         if (!sameFetchPlan(*remembered, scratch.planned)) replayDisagrees("the vertex fetch plan");
     }
-    if (remembered == nullptr) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the ticket's plan
+    // and zero buffers, made by its producer for the maxIndex it predicted from its own scan. The
+    // prediction is never trusted: the plan is a pure function of this closure's state, parameters
+    // and attributes and of maxIndex, so it is today's plan exactly when this draw's own in-order
+    // maxIndex (the scan, a reused copy's derived index or the clamp, all above) equals it; a
+    // replay or an indirect draw plans as before. =2 also plans inline and aborts on a difference.
+    const VertexFetchPlan* predicted = nullptr;
+    if (ticket != nullptr && args == nullptr && !attributes.empty() && HelperFetchPlan() != 0) {
+        const auto fetchUse = TicketPartUse(ticket, DrawTicket::FetchPlan);
+        if (fetchUse == TicketUse::None) {
+            NoteFetchPlanEvent(FetchPlanEvent::NoPart);
+        } else {
+            NoteFetchPlanEvent(FetchPlanEvent::Offered);
+            if (replay == nullptr && ticket->predictedMax == inputs.maxIndex && ticket->zeroBuffers.size() == attributes.size()) {
+                NoteFetchPlanEvent(FetchPlanEvent::Accepted);
+                predicted = &ticket->fetchPlan;
+            } else {
+                NoteFetchPlanEvent(FetchPlanEvent::Mismatch);
+            }
+        }
+        if (predicted != nullptr && fetchUse == TicketUse::Verify) {
+            TicketChecks(fetchUse, DrawTicket::FetchPlan, [&] { planVertexFetches(context, state, draw, attributes, args, inputs.maxIndex, scratch.planned, nullptr); });
+            if (!sameFetchPlan(*predicted, scratch.planned)) TicketDisagrees(DrawTicket::FetchPlan, fetchUse, "the vertex fetch plan");
+            for (std::size_t i = 0; i < attributes.size(); ++i) {
+                const auto& zero = ticket->zeroBuffers[i];
+                if ((predicted->zero[i] != 0) != (zero != nullptr)) TicketDisagrees(DrawTicket::FetchPlan, fetchUse, "which attributes bind a zero vertex buffer");
+                if (zero != nullptr && (zero->Bytes().size() != predicted->zeroBytes[i] || std::any_of(zero->Bytes().begin(), zero->Bytes().end(), [](std::byte value) { return value != std::byte{0}; }))) TicketDisagrees(DrawTicket::FetchPlan, fetchUse, "a zero vertex buffer");
+            }
+        }
+    }
+    if (remembered == nullptr && predicted == nullptr) {
         planVertexFetches(context, state, draw, attributes, args, inputs.maxIndex, scratch.planned, replay == nullptr ? &zeroed : nullptr);
         if (replay != nullptr) keepFetchPlan(*replay, attributes, state, draw, inputs.maxIndex, scratch.planned);
     }
-    const auto& planned = remembered != nullptr ? *remembered : scratch.planned;
+    const auto& planned = remembered != nullptr ? *remembered : predicted != nullptr ? *predicted : scratch.planned;
     if (replay != nullptr) {
         zeroed.assign(attributes.size(), nullptr);
         for (std::size_t i = 0; i < attributes.size(); ++i) {
             if (planned.zero[i] != 0) zeroed[i] = replayZeroBuffer(context, *replay, planned.zeroBytes[i]);
         }
+    } else if (predicted != nullptr) {
+        // The draw binds (and its batch keeps) the ticket's zero buffers; the ticket's own
+        // references go to ReleaseTicketReferences after the draw.
+        zeroed.assign(ticket->zeroBuffers.begin(), ticket->zeroBuffers.end());
     }
     const auto& fetches = planned.fetches;
     const auto& fetchValid = planned.fetchValid;
@@ -3125,6 +3162,120 @@ void FillDrawTicketTemplate(DrawTicket& ticket, const Context& context, const St
         }
     } catch (const std::exception&) {
         ticket.pipeline.reset();
+    }
+}
+
+namespace {
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): a producer's scan of
+// an index range for its highest index, as HighestDrawIndex finds it over the whole range (each
+// chunk holds whole indices, and a chunk of restart indices only adds none). The bytes are copied
+// through GuestMemory::CopyMapped, 64 KiB at a time into the thread's scratch, inside a
+// GuestMemory::ForgetSerial bracket that must be even at its start and unchanged at its end (else
+// the page states the copies consulted may be stale). `stop` is asked every 1 MiB.
+enum class TicketIndexScan : std::uint8_t { Done, Unmapped, Moved, Stopped };
+
+TicketIndexScan scanTicketIndices(std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart, bool (*stop)(const void*), const void* budget, std::optional<std::uint32_t>& highest) {
+    constexpr std::size_t ChunkBytes = 64 * 1024;
+    constexpr std::size_t ChunksPerStop = 16;
+    struct ChunkTag {};
+    auto& chunk = ThreadScratch<std::vector<std::byte>, ChunkTag>();
+    chunk.resize(ChunkBytes);
+    highest.reset();
+    const auto serial = GuestMemory::ForgetSerial();
+    if ((serial & 1u) != 0) return TicketIndexScan::Moved;
+    std::size_t chunks = 0;
+    for (std::size_t offset = 0; offset < bytes; offset += ChunkBytes) {
+        if (stop != nullptr && chunks != 0 && chunks % ChunksPerStop == 0 && stop(budget)) return TicketIndexScan::Stopped;
+        ++chunks;
+        const auto span = std::span(chunk).first(std::min(ChunkBytes, bytes - offset));
+        if (GuestMemory::CopyMapped(address + offset, span) != GuestMemory::Compare::Equal) return TicketIndexScan::Unmapped;
+        if (const auto found = HighestDrawIndex(span, indexSize, skipRestart)) highest = std::max(highest.value_or(0u), *found);
+    }
+    return GuestMemory::ForgetSerial() == serial ? TicketIndexScan::Done : TicketIndexScan::Moved;
+}
+
+}
+
+void FillDrawTicketFetchPlan(DrawTicket& ticket, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool (*stop)(const void* budget), const void* budget) {
+    const TicketPartTimer timer{DrawTicket::FetchPlan};
+    // prepareDrawInputs plans an indirect draw from whole extents, rewrites a quad list's indices
+    // before it plans, returns before planning an empty draw, and a mesh draw fetches no vertices:
+    // none of them gets a part, nor a draw without vertex attributes (nothing to save).
+    if (draw.indirect || state.quadList || state.stages.mesh || draw.indexCount == 0 || draw.instanceCount == 0 || shaders.empty() || shaders.front().program == nullptr || shaders.front().program->vertexAttributes.empty()) {
+        NoteFetchPlanEvent(FetchPlanEvent::Skipped);
+        return;
+    }
+    const auto& attributes = shaders.front().program->vertexAttributes;
+    try {
+        std::uint32_t maxIndex = 0;
+        if (!draw.indexed) {
+            // An auto draw's last vertex; its overflow check (the Validated part's) failing means no part.
+            if (draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) {
+                NoteFetchPlanEvent(FetchPlanEvent::Threw);
+                return;
+            }
+            maxIndex = draw.firstVertex + draw.indexCount - 1u;
+        } else {
+            const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+            if ((draw.indexSize != 2 && draw.indexSize != 4) || indexBytes > std::numeric_limits<std::size_t>::max()) {
+                NoteFetchPlanEvent(FetchPlanEvent::Threw);
+                return;
+            }
+            // The restart rule of prepareDrawInputs' indexed branch (a fan geometry draw is a mesh draw).
+            const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart);
+            std::optional<std::uint32_t> highest;
+            switch (scanTicketIndices(draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart, stop, budget, highest)) {
+            case TicketIndexScan::Done:
+                break;
+            case TicketIndexScan::Unmapped:
+                NoteFetchPlanEvent(FetchPlanEvent::Unmapped);
+                return;
+            case TicketIndexScan::Moved:
+                NoteFetchPlanEvent(FetchPlanEvent::Moved);
+                return;
+            case TicketIndexScan::Stopped:
+                NoteFetchPlanEvent(FetchPlanEvent::Cut);
+                return;
+            }
+            // Every index a restart index: the draw records nothing.
+            if (!highest) {
+                NoteFetchPlanEvent(FetchPlanEvent::Skipped);
+                return;
+            }
+            // The zero-fetch clamp rewrites the indices and lowers the highest one: left to the committer.
+            if (const auto zeroFrom = ZeroFetchVertex(attributes)) {
+                const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
+                if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
+                    NoteFetchPlanEvent(FetchPlanEvent::Clamp);
+                    return;
+                }
+            }
+            // The checks prepareDrawInputs makes on the highest index before it plans.
+            if (*highest > context.limits.maxDrawIndexedIndexValue || draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - *highest) {
+                NoteFetchPlanEvent(FetchPlanEvent::Threw);
+                return;
+            }
+            maxIndex = *highest + draw.firstVertex;
+        }
+        // The plan first, then its zero buffers (planVertexFetches' `zeroed` in one walk would make
+        // buffers before a later attribute's Require threw).
+        planVertexFetches(context, state, draw, attributes, nullptr, maxIndex, ticket.fetchPlan, nullptr);
+        ticket.zeroBuffers.assign(attributes.size(), nullptr);
+        for (std::size_t i = 0; i < attributes.size(); ++i) {
+            if (ticket.fetchPlan.zero[i] != 0) ticket.zeroBuffers[i] = zeroVertexBuffer(context, ticket.fetchPlan.zeroBytes[i]);
+        }
+        ticket.predictedMax = maxIndex;
+        ticket.parts |= DrawTicket::FetchPlan;
+        NoteFetchPlanEvent(FetchPlanEvent::Built);
+    } catch (const std::exception&) {
+        // No buffer is destroyed on a producer: the ones made go to the ticket release list.
+        for (auto& zero : ticket.zeroBuffers) {
+            if (zero != nullptr) ReleaseTicketReference({ticket.device, nullptr, std::move(zero)});
+        }
+        ticket.zeroBuffers.clear();
+        NoteFetchPlanEvent(FetchPlanEvent::Threw);
     }
 }
 
