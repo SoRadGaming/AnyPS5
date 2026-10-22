@@ -2106,6 +2106,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS, PARALLEL-COMMIT-PLAN H): HLE host writes
+    // stamp (=1) or count (=2) their range when they end; unset registers nothing.
+    GuestMemory::InstallHostWriteStamps();
     state->context = buildContext();
     state->contextReady = true;
     if (window != nullptr) {

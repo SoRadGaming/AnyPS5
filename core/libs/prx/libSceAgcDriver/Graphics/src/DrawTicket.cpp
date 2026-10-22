@@ -32,6 +32,7 @@ struct Counters {
     std::array<std::atomic<std::uint64_t>, DrawTicket::PartCount> clear{};
     std::array<std::atomic<std::uint64_t>, DrawTicket::PartCount> disagreed{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TicketEvent::Count)> events{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FetchPlanEvent::Count)> fetchEvents{};
 };
 
 Counters& counters() {
@@ -98,6 +99,11 @@ void takeReferences(DrawTicket& ticket, std::vector<TicketReference>& out) {
     for (auto& words : ticket.wordBuffers) {
         if (words.buffer != nullptr) out.push_back({ticket.device, nullptr, std::move(words.buffer)});
     }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, B2): the fetch plan's zero buffers (a
+    // draw that bound them holds its own references).
+    for (auto& zero : ticket.zeroBuffers) {
+        if (zero != nullptr) out.push_back({ticket.device, nullptr, std::move(zero)});
+    }
     // The memo names the template only by address; it must not outlive the reference.
     ticket.memo.owner = nullptr;
 }
@@ -139,6 +145,28 @@ int Q0WordBuffers() {
 bool Q0WordParts() {
     static const bool parts = Q0WordBuffers() != 0 || (Q0Ticket() == 0 && GuestMemory::Q0PrepStats() >= 2);
     return parts;
+}
+
+int HelperFetchPlan() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_HELPER_FETCH_PLAN");
+        if (text == nullptr || (text[0] == '0' && text[1] == '\0')) return 0;
+        if (Q0Ticket() == 0) {
+            std::fprintf(stderr, "[q0prep] APS5_EXPERIMENT_HELPER_FETCH_PLAN needs APS5_EXPERIMENT_Q0_TICKET: no fetch plans\n");
+            return 0;
+        }
+        return std::strtol(text, nullptr, 10) == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+std::uint64_t HelperFetchPlanScanBytes() {
+    static const std::uint64_t bytes = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB");
+        const auto kib = text != nullptr ? std::strtoull(text, nullptr, 10) : 256ull;
+        return static_cast<std::uint64_t>(std::min<unsigned long long>(kib, 1ull << 30)) * 1024u;
+    }();
+    return bytes;
 }
 
 namespace {
@@ -337,6 +365,13 @@ void PlanDrawTicketWalks(const DrawTicket& ticket, const State& state, const Pm4
     const bool inputCopies = DrawInputsVram() != 0;
     if (draw.indexed && draw.indexCount != 0 && (inputCopies || draw.indexCount >= Recorder::KeptIndexRangeIndices)) add(draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize);
     if (!inputCopies || shaders.empty() || shaders.front().program == nullptr || draw.indexCount == 0 || draw.instanceCount == 0) return;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the copies of the
+    // ticket's fetch plan are the ranges CopyDrawInput collects when the committer's maxIndex equals
+    // the prediction (the solo fetches are read without a collect).
+    if (ticket.Has(DrawTicket::FetchPlan)) {
+        for (const auto& [begin, end] : ticket.fetchPlan.copies.copies) add(begin, end - begin);
+        return;
+    }
     // The vertex fetches as planVertexFetches makes them (from each descriptor's base), with the
     // extent of a vertex-rate fetch in place of the highest index an indexed draw scans for, merged
     // as PlanVertexCopies merges them.
@@ -415,10 +450,10 @@ TicketUse TicketPartUseBuilt(const DrawTicket& ticket, DrawTicket::Part part) {
     }
     if (counting()) counters().used[index].fetch_add(1, std::memory_order_relaxed);
     if (ticket.shadow) return TicketUse::Shadow;
-    // The template parts verify under APS5_EXPERIMENT_Q0_TEMPLATE=2, the others under =2 of
-    // APS5_EXPERIMENT_Q0_TICKET.
+    // The template parts verify under APS5_EXPERIMENT_Q0_TEMPLATE=2, the fetch plan under
+    // APS5_EXPERIMENT_HELPER_FETCH_PLAN=2, the others under =2 of APS5_EXPERIMENT_Q0_TICKET.
     const bool templatePart = part == DrawTicket::Template || part == DrawTicket::Moved || part == DrawTicket::Push || part == DrawTicket::Pipeline;
-    const int mode = part == DrawTicket::WordBuffers ? Q0WordBuffers() : templatePart ? Q0Template() : Q0Ticket();
+    const int mode = part == DrawTicket::WordBuffers ? Q0WordBuffers() : part == DrawTicket::FetchPlan ? HelperFetchPlan() : templatePart ? Q0Template() : Q0Ticket();
     return mode == 2 ? TicketUse::Verify : TicketUse::Use;
 }
 
@@ -461,6 +496,10 @@ void NoteTicketEvent(TicketEvent event) {
     if (counting()) counters().events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
 }
 
+void NoteFetchPlanEvent(FetchPlanEvent event) {
+    if (counting()) counters().fetchEvents[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
 void NoteTicketSkip(TicketSkip skip) {
     if (!counting()) return;
     (skip == TicketSkip::Shallow ? counters().shallow : counters().locked).fetch_add(1, std::memory_order_relaxed);
@@ -495,6 +534,7 @@ TicketCounts TakeTicketCounts() {
         counts.disagreed[index] = all.disagreed[index].exchange(0, std::memory_order_relaxed);
     }
     for (std::size_t index = 0; index < counts.events.size(); ++index) counts.events[index] = all.events[index].exchange(0, std::memory_order_relaxed);
+    for (std::size_t index = 0; index < counts.fetchEvents.size(); ++index) counts.fetchEvents[index] = all.fetchEvents[index].exchange(0, std::memory_order_relaxed);
     return counts;
 }
 

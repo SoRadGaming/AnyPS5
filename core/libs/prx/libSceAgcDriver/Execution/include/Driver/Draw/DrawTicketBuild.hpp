@@ -65,7 +65,11 @@ private:
 };
 // The ticket of `inputs`, or null when a stage has no compiled program or the build failed; a part
 // whose checks throw is only left out (the committer runs them). Nothing here takes GpuMutex,
-// records or reads guest bytes (queue 0's byte shadow only collects).
+// records or reads guest bytes (queue 0's byte shadow only collects; the fetch plan's index scan,
+// APS5_EXPERIMENT_HELPER_FETCH_PLAN, never Read or the flush hook, only predicts: queue 0 copies
+// with GuestMemory::CopyMapped before the push, when the title cannot free the range yet; a helper,
+// after it, with CopyMappedUnpinned, whose kernel copy turns a range the title unmapped meanwhile
+// into an unmapped page instead of a fault, which the ForgetSerial bracket alone cannot prevent).
 std::unique_ptr<Graphics::DrawTicket> BuildTicket(TicketInputs& inputs, const HelperBudget& budget);
 // The Prepare that builds the ticket of `inputs` (which must outlive the Enqueue call).
 DrawPipeline::Prepare DrawTicketPrepare(TicketInputs& inputs);

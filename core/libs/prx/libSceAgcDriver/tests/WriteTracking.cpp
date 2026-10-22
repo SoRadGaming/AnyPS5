@@ -17,11 +17,14 @@
 #include <malloc.h>
 #endif
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1564,7 +1567,288 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
-int main() {
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS, PARALLEL-COMMIT-PLAN H): the driver's hooks
+// installed by hand (the switch only chooses which one device init installs), and what they see.
+void NoteHostWriteHook(std::uintptr_t address, std::size_t bytes) {
+    NoteHostWrite(address, bytes);
+}
+
+void CountHostWriteHook(std::uintptr_t address, std::size_t bytes) {
+    CountHostWrite(address, bytes);
+}
+
+struct HostWriteHookScope {
+    explicit HostWriteHookScope(void (*hook)(std::uintptr_t, std::size_t)) { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(hook); }
+    ~HostWriteHookScope() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr); }
+    HostWriteHookScope(const HostWriteHookScope&) = delete;
+    HostWriteHookScope& operator=(const HostWriteHookScope&) = delete;
+};
+
+// One HLE-style host write: the bytes are stored between the arena's begin and end of the write,
+// and the hook runs at its end.
+void HostWriteBytes(std::uint8_t* destination, std::size_t bytes, std::uint8_t value) {
+    const GuestArena::HostWrite write(destination, bytes);
+    Require(write.Open(), "the host write did not open");
+    std::memset(destination, value, bytes);
+}
+
+struct WatchedRelease {
+    void* memory;
+    std::size_t bytes;
+    ~WatchedRelease() {
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+        munmap(memory, bytes);
+#endif
+    }
+};
+
+// Without the hook a write through GuestArena::HostWrite reads as unchanged until the next walk of
+// its pages (the window a memo or a receipt keeps open); with NoteHostWrite UnchangedSince fails for
+// every check after the write ended, page exact and as a CPU store (not the driver's own), and the
+// next walk does not report the pages again (the stamp consumed their write watch). Writes queued
+// together share one generation, and a lock-free memo hit stamps the queue before it answers. The
+// count-only hook stamps nothing.
+void CheckHostWriteStamps() {
+    constexpr std::size_t bytes = 2 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const WatchedRelease release{memory, bytes};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto synced = CollectWritesUncached(base, bytes);
+    Require(synced != 0 && UnchangedSince(base, bytes, synced), "the host-write block is not collected");
+
+    HostWriteBytes(memory + 64, 32, 0x22);
+    Require(UnchangedSince(base, Block, synced), "a host write without the hook was stamped before a walk of its pages");
+    CollectWritesUncached(base, bytes);
+    Require(!UnchangedSince(base, Block, synced), "a walk after a host write did not see it");
+
+    {
+        const HostWriteHookScope hook(&NoteHostWriteHook);
+        TakeHostWriteStats();
+        const auto before = TrackerGeneration();
+        HostWriteBytes(memory + Block + 128, 32, 0x33);
+        Require(TrackerGeneration() > before, "a host write did not move the tracker generation");
+        Require(!UnchangedSince(base + Block + 128, 32, before), "a write through GuestArena::HostWrite was not stamped when it ended");
+        Require(UnchangedSince(base, Block, before), "a host write stamped a block it did not write");
+        Require(UnchangedSince(base + Block + 8 * 4096, 4096, before), "a host write's stamp is not page exact");
+        const std::array<std::uint64_t, 1> generations{before};
+        std::array<std::uint8_t, 1> changed{};
+        std::array<std::uint8_t, 1> cpu{};
+        Require(ChangedBlocks(base + Block, Block, generations, changed, cpu) && changed[0] == BlockWritten && cpu[0] == 1, "a host write is not stamped as a CPU store");
+        const auto stats = TakeHostWriteStats();
+        Require(stats.writes == 1 && stats.bytes == 32 && stats.outside == 0 && stats.drains == 1 && stats.unconsumed == 0, "the stamped host write was not counted");
+
+        const auto stamped = TrackerGeneration();
+        CollectWritesUncached(base, bytes);
+        Require(UnchangedSince(base + Block + 128, 32, stamped), "the walk after a stamped host write reported its page again (the stamp did not consume its write watch)");
+
+        // Two writes queued before the next tracker lock: one new generation stamps both.
+        TakeHostWriteStats();
+        const auto burst = TrackerGeneration();
+        HostWriteBytes(memory + 4 * 4096, 32, 0x55);
+        HostWriteBytes(memory + Block + 12 * 4096, 32, 0x56);
+        Require(TrackerGeneration() == burst + 1, "two host writes queued together did not share one new generation");
+        Require(!UnchangedSince(base + 4 * 4096, 32, burst) && !UnchangedSince(base + Block + 12 * 4096, 32, burst), "a host write of a burst was not stamped");
+        const auto burstStats = TakeHostWriteStats();
+        Require(burstStats.writes == 2 && burstStats.drains == 1, "a burst of host writes was not stamped in one drain");
+
+        // A memo hit (lock-free) after a host write answers with a generation its stamp does not exceed.
+        BumpCollectEpoch();
+        const auto walked = CollectWrites(base, bytes);
+        HostWriteBytes(memory + 6 * 4096, 32, 0x57);
+        const auto hit = CollectWrites(base, Block);
+        Require(walked != 0 && hit > walked && !UnchangedSince(base + 6 * 4096, 32, walked) && UnchangedSince(base + 6 * 4096, 32, hit), "a memo hit after a host write answered before its stamp");
+    }
+
+    {
+        const HostWriteHookScope hook(&CountHostWriteHook);
+        TakeHostWriteStats();
+        const auto counted = TrackerGeneration();
+        HostWriteBytes(memory + 256, 16, 0x44);
+        Require(TrackerGeneration() == counted && UnchangedSince(base, Block, counted), "the count-only hook stamped a host write");
+        const auto stats = TakeHostWriteStats();
+        Require(stats.writes == 1 && stats.bytes == 16 && stats.covered == 0 && stats.coveredOlder == 0 && stats.ringBusy == 0, "the count-only hook did not count the write, or found a receipt where none was published");
+    }
+}
+
+#ifdef _WIN32
+// A host write over a block whose first and last pages are unwatched (they kept an import's
+// exclusion) and whose middle is watched (fresh backing): the stamp is page by page, so the watched
+// middle fails UnchangedSince (the block part's first and last byte alone would skip the block).
+void CheckHostWriteWatchedMiddle() {
+    constexpr std::size_t granule = 16384;
+    void* memory = GuestArena::GuestArenaAllocate_nid_postfix(Block, Block);
+    GuestArena::GuestArenaCommit_nid_postfix(memory, Block, PAGE_READWRITE, granule);
+    const WatchedRelease release{memory, Block};
+    auto* bytes = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, Block);
+    GuestArena::GuestArenaReset_nid_postfix(bytes + granule, 2 * granule);
+    Unwatch(base, Block);
+    GuestArena::GuestArenaCommit_nid_postfix(bytes + granule, 2 * granule, PAGE_READWRITE, granule);
+    Require(Watched(base + granule, 2 * granule) && !Watched(base, granule) && !Watched(base + 3 * granule, granule), "only the middle of the host-write block is watched");
+    std::memset(bytes + granule, 0x11, 2 * granule);
+    const auto synced = CollectWritesUncached(base + granule, 2 * granule);
+    Require(synced != 0 && UnchangedSince(base + granule, 2 * granule, synced), "the watched middle of the host-write block was not collected");
+    const HostWriteHookScope hook(&NoteHostWriteHook);
+    HostWriteBytes(bytes + granule / 2, 3 * granule, 0x22);
+    Require(TrackerGeneration() > synced && !UnchangedSince(base + granule, 2 * granule, synced), "a host write over a block's watched middle between unwatched ends was not stamped");
+}
+#endif
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS=2; ctest agc_write_tracking_host_write_count, whose
+// environment turns queue 0's walk receipts on): the count-only hook against the receipt ring, this
+// thread publishing as queue 0 does. A host write inside a range walked for the newest token counts
+// as covered and one outside every receipt not at all; once a newer token holds the newest slot
+// elsewhere, the first range counts as an older token's; after an Unwatch moves the serial no slot
+// matches.
+bool CheckHostWriteCount() {
+    if (Q0Receipts() == 0) {
+        std::cout << "host-write count: needs APS5_EXPERIMENT_Q0_RECEIPTS=1 and its prerequisites, skipped\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 3 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const WatchedRelease release{memory, bytes};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const HostWriteHookScope hook(&CountHostWriteHook);
+    const auto walk = [](std::uint64_t token, std::uint64_t first, std::uint64_t stop) {
+        BumpCollectEpoch();
+        SetReceiptOwner(token);
+        ReceiptWalks walks;
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> planned{{{first, stop}}};
+        PlanReceiptWalks(planned, walks);
+        Require(WalkReceipts(token, walks, std::numeric_limits<std::uint64_t>::max(), [](const void*) { return false; }, nullptr, false) && walks.Done(), "the receipt walk did not finish");
+    };
+    constexpr std::uint64_t token = 1000;
+    walk(token, base, base + Block);
+    TakeHostWriteStats();
+    HostWriteBytes(memory + 128, 32, 0x22);
+    auto stats = TakeHostWriteStats();
+    Require(stats.writes == 1 && stats.covered == 1 && stats.coveredOlder == 0 && stats.ringBusy == 0, "a host write inside the newest token's receipt was not counted as covered");
+    HostWriteBytes(memory + Block + 128, 32, 0x23);
+    stats = TakeHostWriteStats();
+    Require(stats.writes == 1 && stats.covered == 0 && stats.coveredOlder == 0, "a host write outside every receipt was counted");
+    walk(token + 1, base + Block, base + 2 * Block);
+    HostWriteBytes(memory + 256, 16, 0x24);
+    stats = TakeHostWriteStats();
+    Require(stats.covered == 0 && stats.coveredOlder == 1, "a host write inside an older token's receipt was not counted as older");
+    HostWriteBytes(memory + Block + 256, 16, 0x25);
+    stats = TakeHostWriteStats();
+    Require(stats.covered == 1 && stats.coveredOlder == 0, "a host write inside the newer token's receipt was not counted as covered");
+    Unwatch(base + 2 * Block, Block);
+    HostWriteBytes(memory + 512, 16, 0x26);
+    HostWriteBytes(memory + Block + 512, 16, 0x27);
+    stats = TakeHostWriteStats();
+    Require(stats.writes == 2 && stats.covered == 0 && stats.coveredOlder == 0, "a host write was counted under a receipt of an older UnwatchSerial");
+    std::cout << "host-write count over walk receipts passed\n";
+    return true;
+}
+
+// A host write outside the arena (host memory) stamps nothing and leaves the generation alone.
+void CheckHostWriteOutsideArena() {
+    std::vector<std::uint8_t> host(2 * 4096, 0);
+    const auto address = reinterpret_cast<std::uint64_t>(host.data());
+    if (GuestArena::GuestArenaContains_nid_postfix(host.data(), host.size()) || Watched(address, host.size())) {
+        std::cout << "host-write stamps outside the arena: the host buffer is inside it, skipped\n";
+        return;
+    }
+    const HostWriteHookScope hook(&NoteHostWriteHook);
+    TakeHostWriteStats();
+    const auto before = TrackerGeneration();
+    const auto newest = NewestStamp(address, host.size());
+    HostWriteBytes(host.data(), host.size(), 0x55);
+    Require(TrackerGeneration() == before && NewestStamp(address, host.size()) == newest, "a host write outside the arena was stamped");
+    const auto stats = TakeHostWriteStats();
+    Require(stats.writes == 1 && stats.outside == 1, "a host write outside the arena was not counted as outside it");
+}
+
+// No lock inversion: the hook runs after the arena released the mappings' mutex (WindowsMappings;
+// the write watch's on macOS) and NoteHostWrite takes no GpuMutex. From inside the hook this thread
+// takes the mappings' mutex (Windows) and walks the written range (the tracker lock, then the
+// mappings' mutex: the order every collect uses), while another thread holds GpuMutex for the whole
+// write; on Windows also over a shared view, whose end walks the views under that mutex. Either
+// inversion hangs, and the watchdog fails the test instead.
+std::atomic<std::uint32_t> lockOrderHookCalls{0};
+
+void LockOrderHook(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    std::uint32_t protection = 0;
+    static_cast<void>(GuestArena::GuestArenaProtection_nid_postfix(address, &protection));
+#endif
+    NoteHostWrite(address, bytes);
+    CollectWritesUncached(address, bytes);
+    lockOrderHookCalls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CheckHostWriteLockOrder() {
+    constexpr std::size_t bytes = Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const WatchedRelease release{memory, bytes};
+    std::memset(memory, 0x11, bytes);
+    std::atomic<bool> finished{false};
+    std::atomic<bool> held{false};
+    std::atomic<bool> unlock{false};
+    std::thread watchdog([&] {
+        for (int tick = 0; tick < 3000 && !finished.load(); ++tick) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (finished.load()) return;
+        std::cerr << "write tracking test failed: a host write's stamp hook hung (a lock inversion with the mappings' mutex or GpuMutex)\n";
+        std::_Exit(1);
+    });
+    std::thread holder([&] {
+        const std::lock_guard gpu(GpuMutex());
+        held.store(true);
+        while (!unlock.load()) std::this_thread::yield();
+    });
+    struct Join {
+        std::atomic<bool>& unlock;
+        std::atomic<bool>& finished;
+        std::thread& holder;
+        std::thread& watchdog;
+        ~Join() {
+            unlock.store(true);
+            holder.join();
+            finished.store(true);
+            watchdog.join();
+        }
+    } join{unlock, finished, holder, watchdog};
+    while (!held.load()) std::this_thread::yield();
+    lockOrderHookCalls.store(0);
+    std::uint32_t expected = 0;
+    {
+        const HostWriteHookScope hook(&LockOrderHook);
+        HostWriteBytes(memory + 512, 64, 0x66);
+        ++expected;
+#ifdef _WIN32
+        HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Block, nullptr);
+        Require(section != nullptr, "cannot create the host write's shared backing");
+        auto* shared = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
+        Require(shared != nullptr, "cannot allocate the host write's shared address");
+        struct SharedRelease {
+            std::uint8_t* shared;
+            HANDLE section;
+            bool mapped = false;
+            ~SharedRelease() {
+                if (mapped) GuestArena::GuestArenaReset_nid_postfix(shared, Block);
+                GuestArena::GuestArenaRelease_nid_postfix(shared, Block);
+                CloseHandle(section);
+            }
+        } sharedRelease{shared, section};
+        GuestArena::GuestArenaMap_nid_postfix(shared, Block, section, 0, PAGE_READWRITE);
+        sharedRelease.mapped = true;
+        HostWriteBytes(shared + 4096 + 32, 64, 0x77);
+        ++expected;
+#endif
+    }
+    Require(lockOrderHookCalls.load() == expected, "the host-write hook was not called at every host write's end");
+}
+
+int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(L"--metadata-commit")) {
@@ -1575,6 +1859,8 @@ int main() {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS=2): in its own receipts environment.
+        if (argc > 1 && std::string_view(argv[1]) == "--host-write-count") return CheckHostWriteCount() ? 0 : 77;
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(HostHoleMode)) {
             CheckHostHole();
@@ -1622,6 +1908,12 @@ int main() {
         CheckHighestIndexMemo();
         CheckLazyGeneration();
         CheckAdoptLatestEpoch();
+        CheckHostWriteStamps();
+#ifdef _WIN32
+        CheckHostWriteWatchedMiddle();
+#endif
+        CheckHostWriteOutsideArena();
+        CheckHostWriteLockOrder();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

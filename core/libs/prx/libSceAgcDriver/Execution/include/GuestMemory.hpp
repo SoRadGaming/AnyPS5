@@ -49,6 +49,13 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes);
 // `out` (Equal), or Unmapped as CompareMapped answers it (the dispatch-cache validation's masked
 // re-read of a differing run).
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): CopyMapped for a
+// reader nothing pins the range for (a prep helper after the item's push, whose commit may already
+// have completed and let the title unmap it): each readable run is copied through the kernel
+// (ReadProcessMemory, process_vm_readv, mach_vm_read_overwrite), so a page unmapped after its state
+// was consulted gives Unmapped instead of an access violation. Unmapped too where the kernel copy
+// is unavailable.
+Compare CopyMappedUnpinned(std::uint64_t address, std::span<std::byte> out);
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment = 1);
 // Stores the parts of `current` that differ from `original` (the guest bytes the GPU started from), so
@@ -91,11 +98,61 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS, PARALLEL-COMMIT-PLAN H): HLE host writes
+// (GuestArena::HostWrite: file, AIO/APR and socket reads into guest memory) stamp their blocks when
+// they end, through the arena's host-write hook, which libc calls after the mappings released their
+// mutex. 1 stamps (NoteHostWrite); 2 counts only (CountHostWrite): per host write, whether a walk
+// receipt of the newest token in the receipt ring, or of an older token still there, covers a page of
+// it under the current UnwatchSerial and allocation generation (a write a served receipt would hide).
+// Both print a [hostwrite] line every 10 s while host writes happen. Unset (or 0) registers no hook:
+// libc then calls nothing. Read once.
+int HostWriteStamps();
+// Registers the hook the switch selects (driver init, VulkanDevice); a no-op while it is off.
+void InstallHostWriteStamps();
+// Queues [address, address + bytes) for its stamp and returns: the writing thread never waits for
+// the tracker lock (it takes only the queue's leaf mutex, and the tracker lock with try_lock to
+// stamp a long queue itself), so guest I/O never waits behind a walk, an import or its settle. The
+// next holder of the tracker lock, or a lock-free memo or receipt hit before it answers, stamps
+// every queued write under one new generation (a burst costs one): each write's pages first have
+// their write watch consumed by a walk (stamping every page it finds written), then the write is
+// stamped whole as a walk stamps a CPU store (page exact, kept apart from the driver's own stores:
+// the bytes are the title's). So UnchangedSince over it fails for every check made after the write
+// ended, even where an epoch memo or a receipt skips the walk, the next walk does not report the
+// pages again, and no consumer refreshes twice for one host write. The consume walk takes the
+// mappings' mutex after the tracker lock, as every collect does, and is followed by no unwatch
+// when it fails (no unwatch hook, no GpuMutex). Outside the watched arena nothing is stamped and
+// the generation stays; over a part the tracker does not cover it notes an unstamped store and
+// stamps the watched pages, as MarkWritten does. The stamp cannot tell a read that wrote nothing
+// (EAGAIN, EOF, a failed read: HostWrite opens before the I/O) from one that wrote its range: both
+// are stamped. Never throws (a lost stamp leaves the write to the next walk, as without the switch).
+void NoteHostWrite(std::uint64_t address, std::size_t bytes);
+// The =2 count: only try_locks the receipt ring (a busy ring is counted apart, not tested), never
+// the tracker lock (the two never nest), so it neither waits nor holds back a waiting ring user.
+void CountHostWrite(std::uint64_t address, std::size_t bytes);
+// The [hostwrite] counts since the last call (reset by it): host writes and their bytes, those
+// outside the watched arena (=1, not stamped), under =1 the queue drains that stamped (one new
+// generation each), those made by the writing thread, and the stamped writes whose write watch was
+// not consumed (uncovered pages, or a walk that failed); under =2 the writes a receipt of the newest
+// token covered, of an older token only, and those not tested because the ring was busy.
+struct HostWriteStats {
+    std::uint64_t writes = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t outside = 0;
+    std::uint64_t drains = 0;
+    std::uint64_t writerDrains = 0;
+    std::uint64_t unconsumed = 0;
+    std::uint64_t covered = 0;
+    std::uint64_t coveredOlder = 0;
+    std::uint64_t ringBusy = 0;
+};
+HostWriteStats TakeHostWriteStats();
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
 // epoch is seen by the next epoch, which is the ordering real hardware gives a CPU write made while a
 // submission runs. The driver's own writes (Write, WriteChanged, MarkWritten) stamp their blocks, so
-// they are never hidden. APS5_NO_COLLECT_MEMO=1 disables the memo. CollectWritesUncached always walks:
+// they are never hidden; under APS5_EXPERIMENT_HOST_WRITE_STAMPS=1 HLE host writes are stamped by the
+// first tracker-lock holder or memo hit after they end (NoteHostWrite), so a check made after a host
+// write's end sees it even where a memo or a receipt skips the walk. APS5_NO_COLLECT_MEMO=1 disables the memo. CollectWritesUncached always walks:
 // for decisions about which blocks the CPU wrote while a GPU result was pending (a stale answer there
 // stores old texels over reused memory).
 // The epoch is per queue worker: BumpCollectEpoch advances the calling thread's epoch to a value no
@@ -113,7 +170,11 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // satisfies the committer's collects while it follows T in the epoch it took for T and S still
 // holds. Only queue 0 advances T, in the same call as its epoch, so such a walk followed T's
 // ordering point. Queue 0 never consults these receipts for its own collects; draw-ahead and
-// speculative walks and threads without a role never publish one.
+// speculative walks and threads without a role never publish one. A host write that ends after the
+// receipt's walk is not in it; under APS5_EXPERIMENT_HOST_WRITE_STAMPS=1 its stamp still fails the
+// stamp checks made after the served collect (a served collect stamps the queued host writes before
+// it returns the current generation), and its consumed write watch keeps it out of the counts of
+// writes a receipt hid (APS5_DEBUG_Q0_VERIFY_WALKS, the =2 stamped would-hits).
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t CollectEpoch();

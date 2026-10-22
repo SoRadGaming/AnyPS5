@@ -113,6 +113,16 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS=1, PARALLEL-COMMIT-PLAN H): the host writes queued
+// for their stamps and those stamped (see drainHostWrites), equal once every host write that ended
+// is stamped; and what a host write's end tests without the tracker lock: 0 until the tracker is
+// initialized, then 1 with the watched arena [hostWriteArenaFirst, hostWriteArenaStop) (Windows;
+// elsewhere the whole address space, the drain asks the write watch), or 2 without write watching.
+std::atomic<std::uint64_t> hostWritesQueued{0};
+std::atomic<std::uint64_t> hostWritesStamped{0};
+std::atomic<std::uint8_t> hostWriteArenaKnown{0};
+std::atomic<std::uintptr_t> hostWriteArenaFirst{0};
+std::atomic<std::uintptr_t> hostWriteArenaStop{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -934,6 +944,9 @@ struct WriteTracker {
 #ifdef _WIN32
         GuestArena::GuestArenaRange_nid_postfix(&base, &size);
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
+        hostWriteArenaFirst.store(base, std::memory_order_relaxed);
+        hostWriteArenaStop.store(base + size, std::memory_order_relaxed);
+        hostWriteArenaKnown.store(watched ? 1 : 2, std::memory_order_release);
         if (!watched) return;
         leaves.resize((size / WriteBlockBytes + LeafBlocks) / LeafBlocks);
         coverage.Initialize(base, size);
@@ -941,6 +954,8 @@ struct WriteTracker {
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
+        hostWriteArenaStop.store(std::numeric_limits<std::uintptr_t>::max(), std::memory_order_relaxed);
+        hostWriteArenaKnown.store(watched ? 1 : 2, std::memory_order_release);
         if (watched) leaves.resize(LeafCount);
 #endif
     }
@@ -1060,7 +1075,10 @@ struct WriteTracker {
 #endif
     }
 
-    void stampWatchedPart(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS): `kind` Cpu stamps a host write's watched
+    // pages as a walk stamps a CPU store (drainHostWrites), each page tested on its own; every other
+    // caller stamps the driver's own, a block whose part starts or ends watched.
+    void stampWatchedPart(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration, StampKind kind = StampKind::Driver) {
 #ifdef _WIN32
         address = std::max<std::uint64_t>(address, base);
         end = std::min<std::uint64_t>(end, base + size);
@@ -1072,9 +1090,23 @@ struct WriteTracker {
         for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
             const auto first = std::max(address, blockBegin(block));
             const auto stop = std::min<std::uint64_t>(end, blockBegin(block) + WriteBlockBytes);
-            if (!blockPartWatched(first, stop)) continue;
-            stamp(block, stampGeneration, StampKind::Driver);
-            noteDriverStore(block, address, end, stampGeneration);
+            if (kind == StampKind::Driver) {
+                if (!blockPartWatched(first, stop)) continue;
+                stamp(block, stampGeneration, kind);
+                noteDriverStore(block, address, end, stampGeneration);
+                continue;
+            }
+            // blockPartWatched tests only the part's first and last byte on Windows: a part whose
+            // end pages are unwatched may still hold watched pages between them.
+            bool watchedPage = false;
+            for (auto page = first & ~std::uint64_t{WritePageBytes - 1}; page < stop; page += WritePageBytes) {
+                const auto from = std::max(page, first);
+                const auto to = std::min<std::uint64_t>(page + WritePageBytes, stop);
+                if (!covers(from, static_cast<std::size_t>(to - from))) continue;
+                noteCpuStore(from, to, stampGeneration);
+                watchedPage = true;
+            }
+            if (watchedPage) stamp(block, stampGeneration, kind);
         }
     }
 
@@ -1232,10 +1264,46 @@ WriteTracker& Tracker() {
     return tracker;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS=1, PARALLEL-COMMIT-PLAN H): the host writes that
+// ended and wait for their stamps. A write's end (NoteHostWrite, on the writing thread) appends its
+// range under `mutex`, a leaf (nothing is taken under it), and bumps hostWritesQueued; it never
+// waits for the tracker lock, so guest I/O never waits behind a walk, an import or its settle. The
+// next holder of the tracker lock (lockTracker) stamps them all under one new generation
+// (drainHostWrites) and only then stores hostWritesStamped; a lock-free memo or receipt hit that
+// finds the two different takes the lock first (hitGeneration). A check made after a write's end
+// therefore sees its stamp, and a burst of writes costs one generation, not one each.
+struct HostWriteQueue {
+    AgcDriver::Mutex mutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    // Under the tracker lock only: the ranges being stamped (kept for their capacity).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stamping;
+};
+HostWriteQueue& hostWriteQueue() {
+    static auto* queue = new HostWriteQueue();
+    return *queue;
+}
+// A queue this long is stamped by the writing thread itself when the tracker lock is free: with no
+// lock holder for a while (a loading screen without draws) it would only grow.
+constexpr std::size_t HostWriteQueueDrainAt = 256;
+bool hostWritesPending() {
+    return hostWritesQueued.load(std::memory_order_acquire) != hostWritesStamped.load(std::memory_order_acquire);
+}
+// The [hostwrite] counts (HostWriteStats).
+struct HostWriteCounters {
+    std::atomic<std::uint64_t> writes{0}, bytes{0}, outside{0}, drains{0}, writerDrains{0}, unconsumed{0}, covered{0}, coveredOlder{0}, ringBusy{0};
+    std::atomic<std::int64_t> windowStartMs{0};
+};
+HostWriteCounters& hostWriteCounters() {
+    static auto* counters = new HostWriteCounters();
+    return *counters;
+}
+// Stamps the queued host writes, under the tracker lock (defined after walkWrites).
+void drainHostWrites(WriteTracker& tracker);
+
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the same per thread role, with the wait timed ([stream]).
-std::unique_lock<AgcDriver::Mutex> lockTracker(WriteTracker& tracker) {
+std::unique_lock<AgcDriver::Mutex> acquireTracker(WriteTracker& tracker) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool counted = profile || StreamStats() != 0;
     if (!counted) return std::unique_lock(tracker.mutex);
@@ -1254,6 +1322,22 @@ std::unique_lock<AgcDriver::Mutex> lockTracker(WriteTracker& tracker) {
     if (profile) trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     if (stream) Stream::Add(Stream::counters.trackerAcquisitions[role]);
     return lock;
+}
+
+// The tracker mutex (acquireTracker), with the host writes that ended meanwhile stamped first
+// (LOCAL EXPERIMENT, APS5_EXPERIMENT_HOST_WRITE_STAMPS=1; without it nothing is ever queued).
+std::unique_lock<AgcDriver::Mutex> lockTracker(WriteTracker& tracker) {
+    auto lock = acquireTracker(tracker);
+    if (hostWritesPending()) drainHostWrites(tracker);
+    return lock;
+}
+
+// A lock-free memo or receipt hit's answer: the current generation, once the host writes that ended
+// before it are stamped (LOCAL EXPERIMENT, APS5_EXPERIMENT_HOST_WRITE_STAMPS=1: the tracker lock
+// stamps them, and a stamp made after the value was read would not fail a check against it).
+std::uint32_t hitGeneration(WriteTracker& tracker) {
+    if (hostWritesPending()) static_cast<void>(lockTracker(tracker));
+    return tracker.generation.load(std::memory_order_acquire);
 }
 
 #ifdef _WIN32
@@ -1395,6 +1479,20 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
 }
 #endif
 
+// The walk of [first, stop) itself, its stamps made as `runs` says (walkWrites' generation rule, or
+// the generation the caller already took).
+bool runWalk(StampRuns& runs, std::uint64_t first, std::uint64_t stop, bool armedOnly) {
+#ifdef _WIN32
+    return collectWindowsWrites(runs, first, stop, armedOnly);
+#else
+    const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
+    const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
+    const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    return complete;
+#endif
+}
+
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_LAZY_GENERATION, COMMITTER-PLAN S7): a walk bumps the generation
 // at its first stamp instead of before it starts, so a walk that finds nothing written leaves
 // TrackerGeneration where it was and the draw snapshot memos keyed by it (Recorder's
@@ -1406,15 +1504,69 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     static const bool lazy = std::getenv("APS5_EXPERIMENT_LAZY_GENERATION") != nullptr;
     if (!lazy) ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window, lazy};
+    return runWalk(runs, first, stop, armedOnly);
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS=1, PARALLEL-COMMIT-PLAN H): stamps the queued
+// host writes under the tracker lock (lockTracker's holder, or the writing thread's own try_lock),
+// with one new generation for the lot. A write in the watched arena that the tracker covers first has
+// its pages' write watch consumed by a walk at that generation (every page it finds written is
+// stamped: the host write's, and a CPU store beside it on those pages; a walk that fails, an
+// uncommitted page, keeps what it stamped and is followed by no unwatch, so no unwatch hook and no
+// GpuMutex), then is stamped whole as a CPU store, page exact. A store before the walk is covered
+// by the stamp and one after it by the watch, so the next walk does not report the host write again
+// (no consumer refreshes twice for it) and the receipt verify counts (hidden pages, stamped
+// would-hits) only count writes no stamp exposed. Over a part the tracker does not cover it notes an
+// unstamped store and stamps the watched pages (stampWatchedPart, page by page); outside the
+// watched arena it is only counted. hostWritesStamped is stored after every stamp, so a lock-free
+// hit that then finds nothing pending sees them. Never throws (a lost stamp leaves its write to
+// the next walk of its pages, as without the switch). The walk takes the mappings' mutex after the
+// tracker lock, as every collect does.
+void drainHostWrites(WriteTracker& tracker) {
+    auto& queue = hostWriteQueue();
+    std::uint64_t queued = 0;
+    {
+        const std::lock_guard lock(queue.mutex);
+        queue.stamping.swap(queue.ranges);
+        queued = hostWritesQueued.load(std::memory_order_relaxed);
+    }
+    auto& counters = hostWriteCounters();
+    try {
+        tracker.initialize();
+        bool bumped = false;
+        for (const auto& [address, end] : queue.stamping) {
+            const auto bytes = static_cast<std::size_t>(end - address);
 #ifdef _WIN32
-    return collectWindowsWrites(runs, first, stop, armedOnly);
+            const bool inArena = tracker.watched && end > tracker.base && address < tracker.base + tracker.size;
 #else
-    const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
-    const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
-    const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
-    if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
-    return complete;
+            const bool inArena = tracker.watched && GuestWriteWatch::GuestWriteWatchOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 #endif
+            if (!inArena) {
+                counters.outside.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (!bumped) {
+                ++tracker.generation;
+                bumped = true;
+                counters.drains.fetch_add(1, std::memory_order_relaxed);
+            }
+            const auto generation = tracker.generation.load(std::memory_order_relaxed);
+            if (!tracker.covers(address, bytes)) {
+                tracker.noteUnstampedStore(address, end);
+                tracker.stampWatchedPart(address, end, generation, StampKind::Cpu);
+                continue;
+            }
+            const auto first = address & ~std::uint64_t{WritePageBytes - 1};
+            const auto stop = (end + WritePageBytes - 1) & ~std::uint64_t{WritePageBytes - 1};
+            StampRuns runs{tracker, StampKind::Cpu, 0, nullptr, false};
+            if (!tracker.covers(first, static_cast<std::size_t>(stop - first)) || !runWalk(runs, first, stop, false)) counters.unconsumed.fetch_add(1, std::memory_order_relaxed);
+            tracker.noteCpuStore(address, end, generation);
+            for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, StampKind::Cpu);
+        }
+    } catch (const std::exception&) {
+    }
+    queue.stamping.clear();
+    hostWritesStamped.store(queued, std::memory_order_release);
 }
 
 // LOCAL DEBUG (APS5_DEBUG_MISS_STATS): why memoized collects walk, per thread, every 10 s.
@@ -1799,14 +1951,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             // checks pending writers must not have this load moved after those checks (a writer
             // that published and stamped in between would pass both, COMMITTER-MAP 3.2 step 2).
             // Free on x86; it only stops the compiler from reordering.
-            return tracker.generation.load(std::memory_order_acquire);
+            return hitGeneration(tracker);
         }
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && found->second.mapping == mapping && stop <= found->second.end) {
                 noteCollectMemoHit();
                 if (missStatsEnabled()) ++threadMissStats().memoHits;
-                return tracker.generation.load(std::memory_order_acquire);
+                return hitGeneration(tracker);
             }
         }
         for (const auto& entry : threadCollectMemo().entries) {
@@ -1816,7 +1968,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // make every later UnchangedSince fail until the epoch ends.
                 noteCollectMemoHit();
                 if (missStatsEnabled()) ++threadMissStats().memoHits;
-                return tracker.generation.load(std::memory_order_acquire);
+                return hitGeneration(tracker);
             }
         }
     }
@@ -1845,7 +1997,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 #ifdef _WIN32
             if (verifyReceiptWalks()) peekHiddenPages(static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
 #endif
-            return tracker.generation.load(std::memory_order_acquire);
+            return hitGeneration(tracker);
         }
         receiptWouldHit = true;
     }
@@ -2359,6 +2511,22 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
 #endif
 }
 
+#ifdef __APPLE__
+namespace {
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS): set while ImportWatched holds the tracker
+// lock across its own GuestArena::HostWrite (the macOS opening of an import window): that write is
+// the import's, not the title's, and its stamp would mark the import window's pages as CPU stores.
+struct HostWriteMuteSlot {};
+using HostWriteMute = HostThreadSlot<bool, HostWriteMuteSlot>;
+struct MuteHostWriteStamps {
+    MuteHostWriteStamps() { HostWriteMute::Set(true); }
+    ~MuteHostWriteStamps() { HostWriteMute::Set(false); }
+    MuteHostWriteStamps(const MuteHostWriteStamps&) = delete;
+    MuteHostWriteStamps& operator=(const MuteHostWriteStamps&) = delete;
+};
+}
+#endif
+
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return import();
     if (!staysWatched) {
@@ -2379,6 +2547,8 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
     const auto runImport = [&] {
 #ifdef __APPLE__
+        // Declared before the write, so it is still set when the write's end calls the hook.
+        const MuteHostWriteStamps mute;
         const GuestArena::HostWrite open(reinterpret_cast<void*>(first), static_cast<std::size_t>(stop - first));
 #endif
         return import();
@@ -2565,6 +2735,171 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation);
     }
     return tracker.generation;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS, PARALLEL-COMMIT-PLAN H): host-write stamps
+// (see the header). Lock order: libc calls the hook after EndHostWrite released the mappings' (or
+// the write watch's) mutex. NoteHostWrite takes the host-write queue's leaf mutex, and the tracker
+// lock only with try_lock (to stamp a long queue itself); the stamps are made by the tracker lock's
+// next holder (drainHostWrites), whose consume walk takes the mappings' mutex after the tracker
+// lock, as every collect does. CountHostWrite only try_locks the receipt ring, a leaf. Neither takes
+// GpuMutex or waits for a lock.
+namespace {
+void countHostWriteBytes(std::size_t bytes) {
+    auto& counters = hostWriteCounters();
+    counters.writes.fetch_add(1, std::memory_order_relaxed);
+    counters.bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+// Whether a run of the merged `ranges` holds a byte of [first, stop).
+bool rangesOverlap(const std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t first, std::uintptr_t stop) {
+    const auto it = ranges.upper_bound(first);
+    if (it != ranges.begin() && std::prev(it)->second > first) return true;
+    return it != ranges.end() && it->first < stop;
+}
+// The [hostwrite] line, printed by the host write that ends a 10 s window (nothing while none
+// happens; the first one only starts the window). Under =1 the drains are the new generations the
+// stamps made (each retires the recorder's unwritten-snapshot memos, as a walk that stamps does).
+void reportHostWrites() {
+    auto& counters = hostWriteCounters();
+    const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto start = counters.windowStartMs.load(std::memory_order_relaxed);
+    if (start == 0) {
+        counters.windowStartMs.compare_exchange_strong(start, nowMs, std::memory_order_relaxed);
+        return;
+    }
+    if (nowMs - start < 10000 || !counters.windowStartMs.compare_exchange_strong(start, nowMs, std::memory_order_relaxed)) return;
+    const auto stats = TakeHostWriteStats();
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    const auto seconds = static_cast<double>(nowMs - start) / 1e3;
+    if (HostWriteStamps() == 1) {
+        AgcDriver::ProfilePrint_nid_no_patch("[hostwrite] (%.1f s, stamped): %llu host writes, %.2f MiB; outside the watched arena (not stamped) %llu; stamped in %llu drains (one new generation each, %.1f per s; %llu by the writing thread), write watch not consumed %llu\n", seconds, count(stats.writes), static_cast<double>(stats.bytes) / 1048576.0, count(stats.outside), count(stats.drains), static_cast<double>(stats.drains) / seconds, count(stats.writerDrains), count(stats.unconsumed));
+        return;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[hostwrite] (%.1f s, count only, receipts %s): %llu host writes, %.2f MiB; under a receipt of the newest token %llu, of an older token only %llu; ring busy (not tested) %llu\n", seconds, Q0Receipts() == 0 ? "off" : Q0Receipts() == 2 ? "count only" : "used", count(stats.writes), static_cast<double>(stats.bytes) / 1048576.0, count(stats.covered), count(stats.coveredOlder), count(stats.ringBusy));
+}
+// The hooks libc calls (std::uintptr_t, which is not std::uint64_t everywhere). From ~HostWrite, so
+// nothing may escape.
+void stampHostWrite(std::uintptr_t address, std::size_t bytes) {
+#ifdef __APPLE__
+    if (HostWriteMute::Get()) return;
+#endif
+    NoteHostWrite(address, bytes);
+    try {
+        reportHostWrites();
+    } catch (const std::exception&) {
+    }
+}
+void countHostWrite(std::uintptr_t address, std::size_t bytes) {
+#ifdef __APPLE__
+    if (HostWriteMute::Get()) return;
+#endif
+    CountHostWrite(address, bytes);
+    try {
+        reportHostWrites();
+    } catch (const std::exception&) {
+    }
+}
+}
+
+int HostWriteStamps() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_HOST_WRITE_STAMPS");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+void InstallHostWriteStamps() {
+    const auto mode = HostWriteStamps();
+    if (mode == 0) return;
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(mode == 1 ? &stampHostWrite : &countHostWrite);
+}
+
+void NoteHostWrite(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    countHostWriteBytes(bytes);
+    const auto end = address + bytes;
+    auto& counters = hostWriteCounters();
+    // Outside the watched arena (once the tracker knows it): nothing to stamp, nothing queued.
+    if (const auto known = hostWriteArenaKnown.load(std::memory_order_acquire); known == 2 || (known == 1 && (end <= hostWriteArenaFirst.load(std::memory_order_relaxed) || address >= hostWriteArenaStop.load(std::memory_order_relaxed)))) {
+        counters.outside.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    bool drainHere = false;
+    try {
+        auto& queue = hostWriteQueue();
+        const std::lock_guard lock(queue.mutex);
+        // A write that continues or overlaps the last one queued joins it (a read in pieces).
+        if (!queue.ranges.empty() && address <= queue.ranges.back().second && queue.ranges.back().first <= end) {
+            queue.ranges.back().first = std::min(queue.ranges.back().first, address);
+            queue.ranges.back().second = std::max(queue.ranges.back().second, end);
+        } else {
+            queue.ranges.emplace_back(address, end);
+        }
+        hostWritesQueued.fetch_add(1, std::memory_order_release);
+        drainHere = queue.ranges.size() >= HostWriteQueueDrainAt;
+    } catch (const std::exception&) {
+        // A write that could not be queued (allocation) is left to the next walk of its pages.
+        return;
+    }
+    if (!drainHere) return;
+    auto& tracker = Tracker();
+    const std::unique_lock lock(tracker.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    counters.writerDrains.fetch_add(1, std::memory_order_relaxed);
+    drainHostWrites(tracker);
+}
+
+void CountHostWrite(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    countHostWriteBytes(bytes);
+    const auto first = static_cast<std::uintptr_t>(address);
+    const auto stop = static_cast<std::uintptr_t>(address + bytes);
+    // The key a consult compares the slot with (collectWrites), read as it reads it.
+    const auto serial = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    bool current = false;
+    bool older = false;
+    {
+        // Only a try_lock, as every ring user the count observes (the committer's consult and
+        // publication, queue 0's skip test): a count that waited for the ring would stall guest I/O,
+        // and a busy ring is counted apart instead of tested.
+        auto& ring = receiptRing();
+        const std::unique_lock lock(ring.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            hostWriteCounters().ringBusy.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const ReceiptSlot* newest = nullptr;
+        for (const auto& slot : ring.slots) {
+            if (slot.token != 0 && (newest == nullptr || slot.token > newest->token)) newest = &slot;
+        }
+        for (const auto& slot : ring.slots) {
+            if (slot.token == 0 || slot.serial != serial || slot.mapping != mapping || !rangesOverlap(slot.ranges, first, stop)) continue;
+            if (&slot == newest) current = true;
+            else older = true;
+        }
+    }
+    auto& counters = hostWriteCounters();
+    if (current) counters.covered.fetch_add(1, std::memory_order_relaxed);
+    else if (older) counters.coveredOlder.fetch_add(1, std::memory_order_relaxed);
+}
+
+HostWriteStats TakeHostWriteStats() {
+    auto& counters = hostWriteCounters();
+    HostWriteStats stats;
+    stats.writes = counters.writes.exchange(0, std::memory_order_relaxed);
+    stats.bytes = counters.bytes.exchange(0, std::memory_order_relaxed);
+    stats.outside = counters.outside.exchange(0, std::memory_order_relaxed);
+    stats.drains = counters.drains.exchange(0, std::memory_order_relaxed);
+    stats.writerDrains = counters.writerDrains.exchange(0, std::memory_order_relaxed);
+    stats.unconsumed = counters.unconsumed.exchange(0, std::memory_order_relaxed);
+    stats.covered = counters.covered.exchange(0, std::memory_order_relaxed);
+    stats.coveredOlder = counters.coveredOlder.exchange(0, std::memory_order_relaxed);
+    stats.ringBusy = counters.ringBusy.exchange(0, std::memory_order_relaxed);
+    return stats;
 }
 
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
@@ -3567,6 +3902,19 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;
         else std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.end - run.begin));
+        return outcome == Compare::Equal;
+    });
+    return queried ? outcome : Compare::Unmapped;
+}
+
+Compare CopyMappedUnpinned(std::uint64_t address, std::span<std::byte> out) {
+    requireNotSpeculative("copy");
+    if (out.empty()) return Compare::Equal;
+    if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+    auto outcome = Compare::Equal;
+    // The page states only skip what is known unreadable; the kernel copy decides the rest.
+    const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
+        if (!run.readable || !copyThroughKernel(run.begin, out.subspan(static_cast<std::size_t>(run.begin - address), static_cast<std::size_t>(run.end - run.begin)))) outcome = Compare::Unmapped;
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;

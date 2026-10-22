@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -38,6 +39,11 @@ struct PreparedDraw;
 // own place after the same side effects. Every part is derived from the draw's own closure
 // objects (its state, parameters and stages) and from build-fixed data only; queue 0 reads no
 // guest bytes, calls no Recorder instance method and never takes GuestMemory::GpuMutex for it.
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): the one exception
+// is the FetchPlan part's index scan (GuestMemory::CopyMapped before the push, CopyMappedUnpinned on
+// a helper after it, where only the kernel copy keeps a page the title unmapped meanwhile from
+// faulting; the ForgetSerial bracket around it only drops bytes read under stale page states),
+// whose answer is only a prediction the committer compares with its own in-order maxIndex.
 struct DrawTicket {
     enum Part : std::uint32_t {
         // Q1: pure checks and target descriptions (APS5_EXPERIMENT_Q0_TICKET).
@@ -58,9 +64,12 @@ struct DrawTicket {
         ByteShadow = 1u << 10,
         // Q2b: `wordBuffers`, the hint's moved data-word buffers (APS5_EXPERIMENT_Q0_WORD_BUFFERS).
         WordBuffers = 1u << 11,
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): `fetchPlan` and
+        // `zeroBuffers` for `predictedMax`, used only when the committer's own maxIndex equals it.
+        FetchPlan = 1u << 12,
     };
-    static constexpr std::size_t PartCount = 12;
-    static constexpr std::array<const char*, PartCount> PartNames{"abi", "stencil", "validated", "aliases", "targets", "writers", "template", "moved", "push", "pipeline", "bytes", "words"};
+    static constexpr std::size_t PartCount = 13;
+    static constexpr std::array<const char*, PartCount> PartNames{"abi", "stencil", "validated", "aliases", "targets", "writers", "template", "moved", "push", "pipeline", "bytes", "words", "fetch"};
     // Identity: the device and buffer pool the ticket was built for (TicketFor refuses another).
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<BufferPool> pool;
@@ -115,6 +124,14 @@ struct DrawTicket {
     ShaderResources::TicketBindings ByteBindings() const { return {true, sliceShadows, pendingSerial, allocationsGeneration, forgetSerial, {}, false, false}; }
     // Q2b: one per data candidate of `memo`, made with the hint's data patches.
     std::vector<ShaderResources::TicketWordBuffer> wordBuffers;
+    // B2: the draw's maxIndex as prepareDrawInputs would compute it from the index bytes the
+    // producer scanned itself (with the first vertex), the plan planVertexFetches makes for it, and
+    // per vertex attribute the zero buffer the plan binds (null where it binds a fetch). A pure
+    // function of the closure's state, parameters and attributes and of that maxIndex: the guest
+    // bytes the prediction came from are never trusted, only its equality with the in-order value.
+    std::uint32_t predictedMax = 0;
+    VertexFetchPlan fetchPlan;
+    std::vector<std::shared_ptr<Buffer>> zeroBuffers;
     DrawTicket() = default;
     DrawTicket(const DrawTicket&) = delete;
     DrawTicket& operator=(const DrawTicket&) = delete;
@@ -148,6 +165,22 @@ bool Q0TemplateParts();
 // (APS5_DEBUG_Q0_PREP_STATS=2) carry the bytes only. Read once.
 int Q0WordBuffers();
 bool Q0WordParts();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2): 0 off (unset or 0); 1 the
+// ticket's producer (a prep helper, or queue 0 inside Enqueue with helpers off) adds the FetchPlan
+// part (FillDrawTicketFetchPlan), and the committer uses its plan and zero buffers only when its
+// own in-order maxIndex equals `predictedMax` and no replay or indirect draw applies, planning
+// inline otherwise; 2 the same with every accepted plan also made inline and compared
+// (sameFetchPlan, and the zero buffers' sizes and bytes; a difference aborts with a [q0ticket]
+// line). Requires APS5_EXPERIMENT_Q0_TICKET (said once; ignored without it). Read once.
+// PARALLEL-COMMIT-PLAN builds B2 on B0 and judges it with prep helpers on; with them off queue 0
+// builds the part inside Enqueue under its PrepareBudget (asked before the part and before every
+// 64 KiB of the scan) and HelperFetchPlanScanBytes caps its scan, so the part only costs queue 0
+// what the bail allows.
+int HelperFetchPlan();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN_SCAN_KIB, B2): the largest index range (in KiB)
+// a FetchPlan part scans; a larger indexed draw gets no part (FetchPlanEvent::Large), so its scan
+// never holds back the ticket's other parts. 256 when unset, 0 no cap. Read once.
+std::uint64_t HelperFetchPlanScanBytes();
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_WORD_BUFFERS): queue 0's WordBuffers part (after the
 // template parts, with the hint's memo).
 void FillDrawTicketWords(DrawTicket& ticket, const Context& context, std::span<const CompiledShader> shaders);
@@ -186,6 +219,9 @@ const Q0PrepDepth& Q0PrepDepths();
 // - under APS5_EXPERIMENT_DRAW_INPUTS_VRAM, the vertex ranges CopyDrawInput collects: exact for a
 //   non-indexed draw, each descriptor's whole extent for an indexed one (its highest index is in
 //   guest bytes, so the extent is the superset; a draw reading past its records walks itself).
+//   LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, B2): with the ticket's FetchPlan part, the
+//   plan's own copies instead, for indexed draws too (exact while the committer's maxIndex equals
+//   the prediction; otherwise only these walks are wasted).
 // A range queue 0 predicts wrong only costs its walk: the committer then walks as today.
 void PlanDrawTicketWalks(const DrawTicket& ticket, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 
@@ -245,6 +281,19 @@ enum class TicketEvent : std::uint8_t { HintUsed, HintUncached, MissFound, MissA
 inline constexpr std::array<const char*, static_cast<std::size_t>(TicketEvent::Count)> TicketEventNames{"hint-used", "hint-uncached", "miss-found", "miss-absent", "revalidate-failed", "other-template", "memo-kept", "memo-rebuilt", "pipeline-accepted", "pipeline-not-lean", "pipeline-stencil", "pipeline-other-template", "pipeline-other-prepared", "pipeline-proxies", "pipeline-abandoned", "push-used", "push-other-template", "words-built", "words-cache-hit", "words-used", "words-unmatched", "words-other-template", "index-offered", "index-other-range", "index-pass", "index-stamp", "index-serials", "slice-offered", "slice-unpredicted", "slice-pass", "slice-stamp", "slice-serials", "slice-copied-today"};
 void NoteTicketEvent(TicketEvent event);
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_HELPER_FETCH_PLAN, PARALLEL-COMMIT-PLAN B2; counted under
+// APS5_DEBUG_Q0_PREP_STATS, the [q0prep] fetch plans line). The producer: the part built, or none
+// because the draw has nothing to plan ahead (an indirect, quad-list, mesh or empty draw, no vertex
+// attributes, or every index a restart index), the index scan found an unmapped page, the mapping
+// moved under it (GuestMemory::ForgetSerial odd or changed), the zero-fetch clamp would rewrite the
+// indices, a check prepareDrawInputs makes after the scan or the plan threw, the budget held before
+// the part or stopped the scan (the queue-0 bail or a helper's item already committing), or the
+// index range is past HelperFetchPlanScanBytes. The committer, at a direct draw with vertex
+// attributes and a ticket: the part offered, accepted (its own maxIndex equals predictedMax),
+// refused on a mismatch (the maxIndex differs, or a replay applies), or absent from the ticket.
+enum class FetchPlanEvent : std::uint8_t { Built, Skipped, Unmapped, Moved, Clamp, Threw, Cut, Large, Offered, Accepted, Mismatch, NoPart, Count };
+void NoteFetchPlanEvent(FetchPlanEvent event);
+
 // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the ticket counters of the [q0prep] line, reset by
 // TakeTicketCounts. Queue 0 counts what it built (and its time per part), the committer what it
 // used, refused and compared.
@@ -260,6 +309,7 @@ struct TicketCounts {
     std::array<std::uint64_t, DrawTicket::PartCount> clear{};
     std::array<std::uint64_t, DrawTicket::PartCount> disagreed{};
     std::array<std::uint64_t, static_cast<std::size_t>(TicketEvent::Count)> events{};
+    std::array<std::uint64_t, static_cast<std::size_t>(FetchPlanEvent::Count)> fetchEvents{};
 };
 enum class TicketSkip : std::uint8_t { Shallow, Locked };
 void NoteTicketSkip(TicketSkip skip);

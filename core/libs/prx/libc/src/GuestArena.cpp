@@ -34,6 +34,7 @@ namespace GuestArena {
 namespace {
 
 std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t)> hostWriteHook{nullptr};
 
 #ifdef _WIN32
 std::atomic<std::uint64_t> commitGeneration{1};
@@ -604,12 +605,22 @@ void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
 }
 #endif
 
+void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {
+    hostWriteHook.store(hook, std::memory_order_release);
+}
+
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HOST_WRITE_STAMPS): after EndHostWrite returned, so outside
+    // the mutex it took (the hook's tracker lock is taken before that mutex everywhere else).
+    if (const auto hook = hostWriteHook.load(std::memory_order_acquire)) {
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        if (address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address) hook(address, bytes);
+    }
 }
 
 #ifndef _WIN32
