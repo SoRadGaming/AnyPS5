@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GdsStream.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
@@ -118,22 +119,76 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        const auto copy = opcode == 0x50 ? Pm4::DecodeMemoryCopy(packet) : std::nullopt;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2; see GdsStream.hpp): a DMA_DATA
+        // that touches the GDS decodes as a copy with the GDS mapped into guest memory
+        // (Pm4::DecodeGdsCopy), which copyBehindPendingSource records when its source has unfinished
+        // writers (R); a store into the GDS resolves (ResolveStore's GDS case) and is recorded only as
+        // WriteLabelOnGpu reason 0 (S). The switch is read at the first such packet. A GDS copy the
+        // decode refused, or whose pending source the GPU path refused, takes today's path whole
+        // (gdsCopyRefused: no GDS store either, so a store into the GDS takes the targeted path).
+        const bool gdsStream = opcode == 0x50 && Pm4::DmaTouchesGds(packet) && GdsStream::On();
+        auto gdsRefusal = Pm4::GdsCopyRefusal::None;
+        const auto copy = opcode == 0x50 ? (gdsStream ? Pm4::DecodeGdsCopy(packet, &gdsRefusal) : Pm4::DecodeMemoryCopy(packet)) : std::nullopt;
+        bool gdsCopyRefused = false;
+        if (gdsStream && gdsRefusal != Pm4::GdsCopyRefusal::None && gdsRefusal != Pm4::GdsCopyRefusal::NotCopy) {
+            gdsCopyRefused = true;
+            GdsStream::CountFallback(gdsRefusal == Pm4::GdsCopyRefusal::HighWord ? GdsStream::Fallback::CopyHighWord : gdsRefusal == Pm4::GdsCopyRefusal::Range ? GdsStream::Fallback::CopyRange : gdsRefusal == Pm4::GdsCopyRefusal::Size ? GdsStream::Fallback::CopySize : GdsStream::Fallback::CopyShape);
+        }
         const auto copyBehindPendingSource = [&] {
-            if (!copy.has_value() || copy->bytes > gpuStoreLimit || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
+            if (!copy.has_value() || copy->bytes > gpuStoreLimit || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+                if (gdsStream && copy.has_value()) {
+                    gdsCopyRefused = true;
+                    GdsStream::CountFallback(copy->bytes > gpuStoreLimit ? GdsStream::Fallback::CopySize : GdsStream::Fallback::CopyInaccessible);
+                }
+                return false;
+            }
             const auto end = copy->source + copy->bytes;
             const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{copy->source, end}}};
             const auto& queued = deferredLabels().labels;
             const bool labelQueued = std::any_of(queued.begin(), queued.end(), [&](const DeferredLabel& label) { return label.address < end && copy->source < label.address + label.size; });
-            if (!labelQueued && !Graphics::Recorder::SnapshotWriteOverlaps(copy->source, copy->bytes) && !Graphics::StorageTexture::AnyPendingOverlaps(range) && !Graphics::AnyShadowedOverlaps(copy->source, copy->bytes)) return false;
+            if (!labelQueued && !Graphics::Recorder::SnapshotWriteOverlaps(copy->source, copy->bytes) && !Graphics::StorageTexture::AnyPendingOverlaps(range) && !Graphics::AnyShadowedOverlaps(copy->source, copy->bytes)) {
+                if (gdsStream) GdsStream::CountIdleCopy();
+                return false;
+            }
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
             if (localDevice == nullptr) return false;
             recordDeferredLabels(localDevice.get(), submission.queue);
-            if (!localDevice->StoresPendingOver(copy->source, copy->bytes) || !localDevice->GpuCopyPossible(copy->destination, copy->source, copy->bytes)) return false;
+            if (!gdsStream) {
+                if (!localDevice->StoresPendingOver(copy->source, copy->bytes) || !localDevice->GpuCopyPossible(copy->destination, copy->source, copy->bytes)) return false;
+            } else {
+                if (!localDevice->StoresPendingOver(copy->source, copy->bytes)) {
+                    GdsStream::CountIdleCopy();
+                    return false;
+                }
+                if (!localDevice->GpuCopyPossible(copy->destination, copy->source, copy->bytes)) {
+                    gdsCopyRefused = true;
+                    GdsStream::CountFallback(localDevice->CopyWaitsOnCompletions(copy->source, copy->bytes) || localDevice->CopyWaitsOnCompletions(copy->destination, copy->bytes) ? GdsStream::Fallback::CopyCompletions : GdsStream::Fallback::CopyNoImport);
+                    return false;
+                }
+            }
+            // LOCAL EXPERIMENT (D2, =2): the bytes the copy must leave, read through the flush hook under
+            // this hold (a locked SyncThrough of the source) before it is recorded.
+            const bool verify = gdsStream && GdsStream::Verify();
+            const auto expected = verify ? GdsStream::ExpectCopy(copy->source, copy->bytes) : GdsStream::Expected{};
+            // The sync ran completions, which can retire an import: decided again (=2 only).
+            if (verify && !localDevice->GpuCopyPossible(copy->destination, copy->source, copy->bytes)) {
+                gdsCopyRefused = true;
+                GdsStream::CountFallback(GdsStream::Fallback::CopyNoImport);
+                return false;
+            }
             const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
             if (outcome.path != 1 && outcome.path != 3) throw std::runtime_error("AGC driver: a DMA_DATA copy of up to 64 KiB that GpuCopyPossible accepted took copy path " + std::to_string(outcome.path));
+            if (gdsStream) {
+                // LOCAL EXPERIMENT (D2): the whole GDS noted as a pending write of the copy's batch
+                // (judge fix 1: the copy notes a GDS source only as a read), under this hold.
+                auto* recorder = Graphics::Recorder::Active();
+                if (recorder == nullptr) throw std::runtime_error("AGC driver: a DMA_DATA copy that touches the GDS was recorded without an active recorder");
+                const auto op = Pm4::DmaSource(packet) != Pm4::DmaSelectGds ? GdsStream::Op::CopyIn : Pm4::DmaDestination(packet) == Pm4::DmaSelectGds ? GdsStream::Op::GdsCopy : GdsStream::Op::Readback;
+                GdsStream::NoteRecorded(*recorder, op, outcome.path);
+                if (verify) GdsStream::VerifyRecorded(*recorder, submission.queue, op, copy->destination, expected);
+            }
             return true;
         };
         // LOCAL DEBUG (DRAIN-PLAN C1, C2): a DMA_DATA's path, for its Drain::PacketRecord (the CPU
@@ -144,7 +199,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto resolveStore = [&] {
             const bool timed = opcode == 0x50 && Drain::PacketCounting();
             const auto before = timed ? Stream::ThreadGpuWait::Get() : 0;
-            auto resolved = Pm4::ResolveStore(packet, queue, gpuStoreLimit);
+            // LOCAL EXPERIMENT (D2): a store into the GDS resolves too, unless its copy was refused.
+            auto resolved = Pm4::ResolveStore(packet, queue, gpuStoreLimit, gdsStream && !gdsCopyRefused);
             sourceWaited = timed && Stream::ThreadGpuWait::Get() != before;
             return resolved;
         };
@@ -170,22 +226,53 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
-                const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (opcode == 0x50) Drain::NoteDmaPath(reason == 0 ? (sourceWaited ? Drain::DmaPath::GpuStoreAfterRead : Drain::DmaPath::GpuStore) : Drain::DmaPath::Fallback, reason);
-                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
-                if (reason == 0 || reason == 5) {
-                    if (reason == 0) ++storesOnGpu;
-                    else ++storesBehindCompletions;
-                    wroteOnGpu = true;
-                    drained = false;
-                } else if (reason == 1) {
-                    GuestMemory::Write(store->address, bytes, 1);
-                    ++storesOnCpu;
-                    wroteOnGpu = true;
-                    drained = false;
+                // LOCAL EXPERIMENT (D2, S): a store into the GDS is taken only when recorded on the GPU
+                // (reason 0); the completion path is refused before anything is recorded (5), and every
+                // refusal leaves the packet drained for the targeted path below.
+                const bool gdsStore = gdsStream && !gdsCopyRefused && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds;
+                // =2: the bytes the store must leave, and the generation before its record.
+                const auto expectedStore = gdsStore && GdsStream::Verify() ? GdsStream::ExpectStore(bytes) : GdsStream::Expected{};
+                const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue, true, !gdsStore) : 4;
+                // A store into the GDS that WriteLabelOnGpu refused is not named here: it takes the
+                // targeted path, which PacketRecord names as today's (cpu-after-wait or cpu-idle), as
+                // every other refusal of a transfer into the GDS; its reason is counted on [gds-stream].
+                if (opcode == 0x50 && !(gdsStore && reason != 0)) Drain::NoteDmaPath(reason == 0 ? (sourceWaited ? Drain::DmaPath::GpuStoreAfterRead : Drain::DmaPath::GpuStore) : Drain::DmaPath::Fallback, reason);
+                if (gdsStore) {
+                    if (reason == 0) {
+                        noteLabelStore(store->address, bytes, stamp, submission.queue);
+                        // The whole GDS noted as a pending write of the store's batch, under this hold.
+                        auto* recorder = Graphics::Recorder::Active();
+                        if (recorder == nullptr) throw std::runtime_error("AGC driver: a DMA_DATA store into the GDS was recorded without an active recorder");
+                        const auto source = Pm4::DmaSource(packet);
+                        const auto op = source == Pm4::DmaSourceData ? GdsStream::Op::Store : source == Pm4::DmaSelectGds ? GdsStream::Op::StoreFromGds : GdsStream::Op::StoreFromMemory;
+                        GdsStream::NoteRecorded(*recorder, op);
+                        if (GdsStream::Verify()) GdsStream::VerifyRecorded(*recorder, submission.queue, op, store->address, expectedStore);
+                        ++storesOnGpu;
+                        wroteOnGpu = true;
+                        drained = false;
+                    } else {
+                        GdsStream::CountFallback(GdsStream::StoreFallback(reason));
+                    }
+                } else {
+                    if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                    if (reason == 0 || reason == 5) {
+                        if (reason == 0) ++storesOnGpu;
+                        else ++storesBehindCompletions;
+                        wroteOnGpu = true;
+                        drained = false;
+                    } else if (reason == 1) {
+                        GuestMemory::Write(store->address, bytes, 1);
+                        ++storesOnCpu;
+                        wroteOnGpu = true;
+                        drained = false;
+                    }
                 }
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
             }
+        } else if (gdsStream && !gdsCopyRefused && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds) {
+            // LOCAL EXPERIMENT (D2): a store into the GDS ResolveStore did not take (not a multiple of 4
+            // bytes, or over 64 KiB): the targeted path below.
+            GdsStream::CountFallback(GdsStream::Fallback::StoreShape);
         }
         if (drained && opcode == 0x50) {
             if (copy.has_value() && copy->bytes > gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
@@ -232,12 +319,17 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             if (const auto localDevice = device.Load()) {
                 recordDeferredLabels(localDevice.get(), submission.queue);
+                if (gdsStream) GdsStream::CountTargetedSync();
                 // Waited for without the mutex where the recorder allows it (as the drain does), so
                 // the other workers keep recording; the recorder is looked up again after each wait.
                 if (auto* recorder = Graphics::Recorder::Active()) {
                     // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): the GDS's unfinished writers
                     // as this sync starts, read under this hold (in the open batch, or in flight).
                     if (Drain::GdsCounting()) Drain::NoteGdsTarget(recorder->OpenWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? Drain::GdsTarget::Open : recorder->PendingWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? Drain::GdsTarget::InFlight : Drain::GdsTarget::Idle);
+                    // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): this sync orders
+                    // a CPU access to the GDS (the store after it): =1's invariant, checked under
+                    // this hold before it waits.
+                    if (gdsStream) GdsStream::CheckTargetedSync(*recorder);
                     recorder->SyncThrough(Pm4::GdsAddress(), Pm4::GdsBytes, true);
                 }
                 const auto source = Pm4::DmaSource(packet);

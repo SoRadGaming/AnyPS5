@@ -287,6 +287,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WrittenBuffers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/CommandValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/DrainStats.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/GdsStream.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketExecution.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketFlush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketHistory.cpp
@@ -2697,6 +2698,42 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(${noteGuardTests} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): GDS transfers recorded in the
+    # stream (tests/execution/GdsInStream.cpp, whose plain run above leaves the switch unset and expects
+    # nothing counted) on (=1), value-checked (=2), on under the D0 stream and GDS counters, on with the
+    # barrier validator's access notes (a smoke run of those paths only: Recorder::NoteAccess counts the
+    # barriers a hazard tracker would emit or skip and checks nothing, and it does not model the trailing
+    # barriers CopyBuffer's and the store runs' merges rely on; ordering is checked by the cases' values,
+    # =1's cpu-gds-access-unnoted and a run under the validation layer), and the two refusals the switch
+    # must resolve to 0: no targeted GDS sync, and APS5_PIPELINE_DMA. The test reads the mode it expects
+    # from the environment. behind_completions runs its --behind-completions mode (WriteLabelOnGpu's
+    # refusal of the completion path on a device of its own; it sets APS5_LABEL_GATE_ALL itself and reads
+    # no switch).
+    set_tests_properties(agc_driver_gds_in_stream PROPERTIES TIMEOUT 120)
+    set(gdsStreamTests)
+    foreach(gdsStreamCase IN ITEMS
+            "on|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1"
+            "verify|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=2"
+            "stream_stats|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1,APS5_DEBUG_STREAM_STATS=1,APS5_DEBUG_GDS_STATS=1"
+            "barrier_validate|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1,APS5_BARRIER_VALIDATE=1"
+            "targeted_only|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1"
+            "no_targeted|APS5_EXPERIMENT_GDS_IN_STREAM=1"
+            "pipeline_dma|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1,APS5_PIPELINE_DMA=1")
+        string(REPLACE "|" ";" gdsStreamCase "${gdsStreamCase}")
+        list(GET gdsStreamCase 0 gdsStreamCaseName)
+        list(GET gdsStreamCase 1 gdsStreamCaseEnvironment)
+        string(REPLACE "," ";" gdsStreamCaseEnvironment "${gdsStreamCaseEnvironment}")
+        set(gdsStreamTest agc_driver_gds_in_stream_${gdsStreamCaseName})
+        add_test(NAME ${gdsStreamTest} COMMAND agc_driver_gds_in_stream_tests)
+        set_tests_properties(${gdsStreamTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${gdsStreamCaseEnvironment}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+        list(APPEND gdsStreamTests ${gdsStreamTest})
+    endforeach()
+    add_test(NAME agc_driver_gds_in_stream_behind_completions COMMAND agc_driver_gds_in_stream_tests --behind-completions)
+    set_tests_properties(agc_driver_gds_in_stream_behind_completions PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    list(APPEND gdsStreamTests agc_driver_gds_in_stream_behind_completions)
+    if(WIN32)
+        set_tests_properties(${gdsStreamTests} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_shader_disk_cache_large_file COMMAND agc_shader_disk_cache_tests --large-file)
     if(Python3_Interpreter_FOUND)
         set(housekeepingModes plain)
@@ -3347,7 +3384,13 @@ if(BUILD_TESTING)
             "dispatch_note_guards|APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=2"
             "dispatch_note_guards_on|APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=1"
             "hidden_write_drain|APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=2"
-            "hidden_write_drain_on|APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=1")
+            "hidden_write_drain_on|APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=1"
+            # LOCAL EXPERIMENT (DRAIN-PLAN D2): GDS transfers recorded in the stream, value-checked (=2)
+            # and on (=1), each with the targeted GDS sync it requires (its path is the fallback); the
+            # pipelined_dma runs set APS5_PIPELINE_DMA, which the switch refuses (they run it off). Its
+            # own cases are in agc_driver_gds_in_stream*.
+            "gds_in_stream|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=2"
+            "gds_in_stream_on|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

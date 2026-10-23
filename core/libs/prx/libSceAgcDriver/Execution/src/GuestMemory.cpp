@@ -3222,6 +3222,15 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
     return false;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM=2, DRAIN-PLAN D2): see GuestMemory.hpp.
+bool CpuWrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+    return cpuStampedSince(tracker, address, address + bytes, generation);
+}
+
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
