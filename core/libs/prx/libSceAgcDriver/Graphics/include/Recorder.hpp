@@ -310,6 +310,15 @@ public:
     bool PendingWriteSettled(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t LastWriteNote(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t NewestWriteNote(std::uint64_t address, std::size_t bytes) const;
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0, DepthLease.hpp): the newest write note
+    // handed out so far; whether an open or in-flight write noted after `note` overlaps the range,
+    // that is NewestWriteNote(range) > note, without its full scan (a batch's notes ascend, so each
+    // batch is scanned from its newest write down to `note`); and the serial through which batches
+    // have finished (they finish in submission order, so it moves exactly when a batch leaves the
+    // in-flight list: a reap, a sync or a wait). Under the GpuMutex; reads only.
+    std::uint64_t WriteNotes() const { return writeNoteCount; }
+    bool WrittenAfterNote(std::uint64_t address, std::size_t bytes, std::uint64_t note) const;
+    std::uint64_t FinishedSerial() const;
     struct PendingWrite {
         std::uint64_t begin;
         std::uint64_t end;

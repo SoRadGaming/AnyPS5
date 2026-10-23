@@ -1628,6 +1628,21 @@ if(BUILD_TESTING)
         set_tests_properties(agc_storage_target_lease agc_storage_target_lease1 agc_storage_target_lease2 agc_storage_target_lease2_profile agc_storage_target_lease1_units2_pin2 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the DepthSurfaceView lease counter: its
+    # classification and counts without a device, then real DepthSurfaceView calls and the recorder
+    # reads the counter uses, counting (profiling, with the epoch coverage that gives the thread a
+    # collect memo key), profiling without a memo key (every call ineligible) and off (nothing counted).
+    add_test(NAME agc_depth_lease_classify COMMAND agc_driver_recorder_tests --depth-lease-classify-only)
+    add_test(NAME agc_depth_lease_counter COMMAND agc_driver_recorder_tests --depth-lease-only)
+    add_test(NAME agc_depth_lease_counter_no_key COMMAND agc_driver_recorder_tests --depth-lease-only)
+    add_test(NAME agc_depth_lease_counter_off COMMAND agc_driver_recorder_tests --depth-lease-only)
+    set_tests_properties(agc_depth_lease_counter agc_depth_lease_counter_no_key agc_depth_lease_counter_off PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_depth_lease_counter PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_depth_lease_counter_no_key PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1")
+    if(WIN32)
+        set_tests_properties(agc_depth_lease_classify agc_depth_lease_counter agc_depth_lease_counter_no_key agc_depth_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_storage_integer_clear COMMAND agc_driver_recorder_tests --integer-clear-only)
     set_tests_properties(agc_storage_integer_clear PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
@@ -3210,8 +3225,9 @@ if(BUILD_TESTING)
             # each with P1 on as the play arms run them.
             "key_pin|APS5_EXPERIMENT_KEY_PIN=2,APS5_EXPERIMENT_PROOF_UNITS=1"
             "key_pin_on|APS5_EXPERIMENT_KEY_PIN=1,APS5_EXPERIMENT_PROOF_UNITS=1"
-            # LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter counting (profiling, with
-            # the epoch coverage that gives the committer's lookups a collect memo key); it changes no draw.
+            # LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0, 9.5 D5-0): the target lease counter and the
+            # DepthSurfaceView lease counter counting (profiling, with the epoch coverage that gives the
+            # committer's lookups a collect memo key); they change no draw.
             "target_lease_counter|APS5_PROFILE_DRAW=1,APS5_DEBUG_COVERAGE=1"
             # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's surface size and key memos
             # verified (=2: every hit computed too, a difference fatal) and on; their own cases are in
