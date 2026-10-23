@@ -3021,9 +3021,9 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, InputLease* lease) {
     GuestMemory::AssertGpuLockHeld("Recorder::ReusableDrawSnapshot");
-    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
-    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.4, I0): row M, predicted and filled only.
-    if (lease != nullptr) noteInputLeaseMap(*lease, address, use, found);
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.4, I0): row M, predicted and filled. LOCAL
+    // EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, L1 row M): held (=1) or verified (=2); see InputLease.cpp.
+    auto found = lease != nullptr ? inputLeaseLookup(*lease, address, bytes, use) : use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {

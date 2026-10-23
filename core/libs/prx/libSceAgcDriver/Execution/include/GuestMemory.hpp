@@ -242,6 +242,12 @@ CollectMemoKey CurrentCollectMemoKey();
 // under its current collect memo key (false without one): its next collect of the range is then a
 // memo hit that walks nothing, and stays one while the key holds (coverage only grows under a key).
 bool CollectCovered(std::uint64_t address, std::size_t bytes);
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 5.6, L1 row C's =2 check): CollectCovered under `key` instead of
+// the thread's current key: whether the thread's coverage, last filled under `key`, holds the range
+// (false for an invalid key or coverage filled under another one). The coverage changes only by the
+// thread's own collects, so between two of them this is the answer CollectCovered gave while `key`
+// was current, even after another thread moved a part of the key.
+bool CollectCoveredUnder(const CollectMemoKey& key, std::uint64_t address, std::size_t bytes);
 // LOCAL EXPERIMENT (REVALIDATE-PLAN 4, built in stage S1): the collect-lease API shared by the
 // draw-input leases (L1 row C) and the template collect lease (L2). A lease {key K, owner O} holds
 // for a range while K is Valid, K == CurrentCollectMemoKey(), O == CollectCoverageOwner() and the
@@ -579,6 +585,10 @@ private:
 };
 bool SpeculativeReadsSupported();
 bool SpeculativeReader();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row E, REVALIDATE-PLAN 5.5): for tests, whether the
+// calling thread's gate mirror (a TEB slot its readers read under the switch) equals the gate's
+// thread_local; true while the mirror is off.
+bool SpeculativeGateMirrored();
 // Moves with every ForgetPages call (the libc invalidator: memory unmapped or re-registered): odd
 // while the call stores its page states, moved past it after, so a reader that loads an even
 // value before consulting the page states and reading directly, and the same value after, knows

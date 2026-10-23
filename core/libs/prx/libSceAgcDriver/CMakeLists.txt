@@ -1663,6 +1663,33 @@ if(BUILD_TESTING)
         set_tests_properties(agc_draw_input_lease_counter agc_draw_input_lease_counter_no_key agc_draw_input_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 5 and 9, L1): the draw-input leases
+    # over real CopyDrawInput calls, every row with the epoch coverage that gives the thread a collect
+    # memo key: unset, on and verify (both with the draw inputs in VRAM, as the play build runs them),
+    # verify while profiling (the plain _2 row proves the =2 checks do not need APS5_PROFILE_DRAW); then
+    # =2's death rows (the coverage dropped under the same key must abort row C, an entry kept without
+    # its set serial's bump row M, each with its [input-lease] line, matched; the test turns abort() into
+    # exit code 3).
+    set(drawInputLeaseTests agc_draw_input_lease agc_draw_input_lease_1 agc_draw_input_lease_2 agc_draw_input_lease_2_profile)
+    foreach(drawInputLeaseTest IN LISTS drawInputLeaseTests)
+        add_test(NAME ${drawInputLeaseTest} COMMAND agc_driver_recorder_tests --input-lease-only)
+    endforeach()
+    set_tests_properties(${drawInputLeaseTests} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_draw_input_lease PROPERTIES ENVIRONMENT "APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_draw_input_lease_1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+    set_tests_properties(agc_draw_input_lease_2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+    set_tests_properties(agc_draw_input_lease_2_profile PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
+    add_test(NAME agc_draw_input_lease_2_death_c COMMAND agc_driver_recorder_tests --input-lease-death-c)
+    set_tests_properties(agc_draw_input_lease_2_death_c PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\\[input-lease\\] APS5_EXPERIMENT_INPUT_LEASES=2: C: [^\r\n]*does not hold the range under that key")
+    add_test(NAME agc_draw_input_lease_2_death_m COMMAND agc_driver_recorder_tests --input-lease-death-m)
+    set_tests_properties(agc_draw_input_lease_2_death_m PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\\[input-lease\\] APS5_EXPERIMENT_INPUT_LEASES=2: M: [^\r\n]*today's lookup finds another entry of the range")
+    list(APPEND drawInputLeaseTests agc_draw_input_lease_2_death_c agc_draw_input_lease_2_death_m)
+    if(WIN32)
+        set_tests_properties(${drawInputLeaseTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     # LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 D5): DepthSurfaceView leases:
     # =2's classification without a device, then real DepthSurfaceView calls (every row with the epoch
     # coverage that gives the calls a collect memo key, but the last): off (nothing counted, today's
@@ -3353,6 +3380,12 @@ if(BUILD_TESTING)
             # is held); its own cases are in agc_driver_resource_cache_collect_lease*.
             "collect_lease|APS5_EXPERIMENT_COLLECT_LEASE=2,APS5_DEBUG_COVERAGE=1"
             "collect_lease_on|APS5_EXPERIMENT_COLLECT_LEASE=1,APS5_DEBUG_COVERAGE=1"
+            # LOCAL EXPERIMENT (REVALIDATE-PLAN 5, L1): the draw-input leases verified (=2: every row's
+            # hold predicted and checked against today's path, which is used) and on, every row of the
+            # mask, with the epoch coverage and the draw inputs in VRAM as the play build runs them; their
+            # own cases are in agc_draw_input_lease*.
+            "input_leases|APS5_EXPERIMENT_INPUT_LEASES=2,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
+            "input_leases_on|APS5_EXPERIMENT_INPUT_LEASES=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
             # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's surface size and key memos
             # verified (=2: every hit computed too, a difference fatal) and on; their own cases are in
             # agc_storage_target_memos*.

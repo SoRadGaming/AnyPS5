@@ -1239,11 +1239,18 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     if (recorder != nullptr && bytes != 0) {
         // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): the lease counters of a direct
         // caller's input. They only observe: the collect is today's, the lookup's lease only records.
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 5.3, L1): with the switch set
+        // the view applies rows C (its Collect) and M (ReusableDrawSnapshot's lease); the registry
+        // generation and the generation are today's on every path (InputLeaseShadow::Collect).
         std::optional<InputLeaseShadow> ownShadow;
-        if (shadow == nullptr && InputLeaseCounting()) shadow = &ownShadow.emplace(recorder, address, bytes, use);
+        if (shadow == nullptr && InputLeaseViewed()) shadow = &ownShadow.emplace(recorder, address, bytes, use);
         GuestMemory::FlushGpuWrites(address, bytes);
-        copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        copy.generation = shadow != nullptr ? shadow->Collect(address, bytes) : GuestMemory::CollectWrites(address, bytes);
+        if (shadow != nullptr) {
+            copy.generation = shadow->Collect(address, bytes, copy.registryGeneration);
+        } else {
+            copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            copy.generation = GuestMemory::CollectWrites(address, bytes);
+        }
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, shadow != nullptr ? shadow->Lease() : nullptr);
         // A kept copy made for narrower bindings lacks the padding this draw needs.
         const bool padding = copy.buffer != nullptr && copy.buffer->Bytes().size() < allocated;
@@ -1731,9 +1738,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): the input's lease counters, probed
-        // before InPlaceDrawInput.
+        // before InPlaceDrawInput. LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, L1): its lease.
         std::optional<InputLeaseShadow> leaseShadow;
-        if (InputLeaseCounting()) leaseShadow.emplace(context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), use);
+        if (InputLeaseViewed()) leaseShadow.emplace(context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), use);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
         if (import == nullptr) {
@@ -1916,9 +1923,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         RequireNoMultisampleTarget(begin, bytes, "a vertex buffer read");
         // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): the input's lease counters, probed
-        // before InPlaceDrawInput (row P's first skip point would be its FlushPending).
+        // before InPlaceDrawInput (row P's first skip point would be its FlushPending). LOCAL
+        // EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, L1): its lease.
         std::optional<InputLeaseShadow> leaseShadow;
-        if (InputLeaseCounting()) leaseShadow.emplace(context.recorder, begin, bytes, Recorder::SnapshotUse::Vertex);
+        if (InputLeaseViewed()) leaseShadow.emplace(context.recorder, begin, bytes, Recorder::SnapshotUse::Vertex);
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
             if (leaseShadow) leaseShadow->InPlace();
             if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::VertexInPlace, bytes);

@@ -4889,6 +4889,262 @@ bool drawInputLeaseCounterTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 9): =2's death rows of L1 (each ends
+// the process through abort(), turned into exit code 3 as for the snapshot hash's =3 case).
+enum class InputLeaseDeath : std::uint8_t { None, C, M };
+
+[[maybe_unused]] void inputLeaseExitOnAbort(int) {
+    std::_Exit(3);
+}
+
+void prepareInputLeaseDeath(const char* what) {
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#else
+    std::signal(SIGABRT, inputLeaseExitOnAbort);
+#endif
+    std::cout << "APS5_EXPERIMENT_INPUT_LEASES=2: " << what << "; the next draw input must abort" << std::endl;
+}
+
+// A speculative read gate that admits every read (row E's mirror test).
+struct InputLeaseTestGate final : AgcDriver::GuestMemory::ISpeculativeReadGate {
+    void Enter() override {}
+    void Leave() override {}
+};
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 5 and 9, L1 rows C, M and E): real
+// CopyDrawInput calls in the switch's mode (every row has the epoch coverage that gives the thread a
+// collect memo key). Every case gives the same observable results in every mode (reuse, buffers,
+// derived values, generations); per step the switch's counts show which rows held: =1 applies them,
+// =2 predicts and verifies them, unset counts nothing. (a) a repeat holds C and M and returns the same
+// buffer and derived value, without walking (profiled rows); (c) an epoch bump makes C miss, the call
+// refills it; (b) a CPU store seen at the next epoch makes UnchangedSince fail, a copy is made, and M
+// misses next time (set serial moved); (d) an unwatch makes C miss, an allocation change makes C miss
+// and erases the entry through sameRegistry; (j) a padding refusal gives the same generation as a
+// collect; (i) a budget eviction of the leased entry makes M miss with no stale iterator used; (h) a
+// vertex lower_bound served by a wider entry holds M, then an in-between size kept makes M miss and
+// return the new entry; (k) a host write queued after the lease is drained by UnchangedSince and a copy
+// is made; (n) a second thread that adopted the epoch and holds the GpuMutex does not take row C
+// (owner mismatch) and walks (profiled rows), and C then misses back on this thread; (m) nested
+// speculative read scopes on a helper thread: the gate's mirror equals the thread_local at every
+// point and a flush is refused inside. `death` (=2): the coverage dropped under the same key (C), or an
+// in-between vertex entry kept without its set serial's bump (M): the next input must abort.
+bool drawInputLeaseTests(const Device& device, Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu, InputLeaseDeath death) {
+    using namespace AgcDriver::GuestMemory;
+    using Use = Recorder::SnapshotUse;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 4 * block;
+    void* memory = AllocateWatched(bytes, block);
+    if (memory == nullptr) {
+        std::cout << "no write watching: the draw input leases not tested\n";
+        return false;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    const int mode = InputLeases();
+    const bool keyed = std::getenv("APS5_DEBUG_COVERAGE") != nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool rowC = InputLeaseRowOn(InputLeaseRow::C);
+    const bool rowM = InputLeaseRowOn(InputLeaseRow::M);
+    const std::uint64_t one = keyed ? 1 : 0;
+    const auto& context = device.GetContext();
+    auto* words = static_cast<std::uint32_t*>(memory);
+    for (std::uint32_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) words[i] = i * 7 + 3;
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    constexpr std::size_t size = 256;
+    BumpCollectEpoch();
+    auto before = InputLeaseExperimentNow();
+    // The step's holds of rows C and M since the last step: each applied at =1, predicted and verified
+    // at =2 (none void: nothing moves a key part between the reads); none counted with the switch unset
+    // or its row off.
+    const auto expect = [&](std::uint64_t c, std::uint64_t m, const char* what) {
+        const auto now = InputLeaseExperimentNow();
+        const auto cRows = rowC ? c : 0;
+        const auto mRows = rowM ? m : 0;
+        if (mode == 1) Require(now.cHeld - before.cHeld == cRows && now.mHeld - before.mHeld == mRows && now.cPredicted == before.cPredicted && now.mPredicted == before.mPredicted, what);
+        else if (mode == 2) Require(now.cPredicted - before.cPredicted == cRows && now.cVerified - before.cVerified == cRows && now.cVoided == before.cVoided && now.mPredicted - before.mPredicted == mRows && now.mVerified - before.mVerified == mRows && now.cHeld == before.cHeld && now.mHeld == before.mHeld, what);
+        else Require(now.cHeld == 0 && now.mHeld == 0 && now.cPredicted == 0 && now.mPredicted == 0, what);
+        before = now;
+    };
+    const auto index = [&](std::size_t bufferBytes = 0) { return CopyDrawInput(context, &recorder, address, size, 4, Use::Index32, bufferBytes); };
+    const auto equalsGuest = [&](const DrawInputCopy& copy) { return std::memcmp(copy.buffer->Bytes().data(), memory, size) == 0; };
+    // (a)
+    const auto first = index();
+    Require(!first.reused && first.generation != 0 && equalsGuest(first), "the first draw input was not copied");
+    expect(0, 0, "the first draw input held a row");
+    KeepDrawInput(&recorder, address, first, Use::Index32, 189);
+    const auto second = index();
+    Require(second.reused && second.buffer == first.buffer && second.derived == 189, "an unchanged draw input was copied again");
+    expect(one, 0, "the repeat did not hold row C alone");
+    const auto walkedBefore = ThreadCollectedBytes();
+    const auto third = index();
+    Require(third.reused && third.buffer == first.buffer && third.derived == 189, "an unchanged draw input was copied a third time");
+    if (profiled) Require(ThreadCollectedBytes() == walkedBefore, "a draw input whose rows held walked");
+    expect(one, 1, "a third use did not hold rows C and M");
+    if (death == InputLeaseDeath::C) {
+        prepareInputLeaseDeath("the coverage is dropped under the same key");
+        DropCollectCoverageForTest();
+        static_cast<void>(index());
+        Require(false, "=2 did not abort on a row C lease its thread's coverage does not hold");
+    }
+    // (c)
+    BumpCollectEpoch();
+    Require(index().reused, "an epoch bump made an unchanged draw input copy");
+    expect(0, 1, "an epoch bump did not make row C miss");
+    Require(index().reused, "an unchanged draw input was copied after an epoch bump");
+    expect(one, 1, "row C did not refill after an epoch bump");
+    // (b)
+    words[5] = 0xdead;
+    BumpCollectEpoch();
+    const auto stored = index();
+    Require(!stored.reused && stored.buffer != first.buffer && equalsGuest(stored), "a draw input outlived a CPU store");
+    expect(0, 1, "a CPU store's draw input did not hold row M, or held row C");
+    KeepDrawInput(&recorder, address, stored, Use::Index32, 7);
+    Require(index().derived == 7, "the copy after the CPU store was not kept");
+    expect(one, 0, "row M held across its entry's replacement");
+    // (d)
+    Unwatch(address + 3 * block, block);
+    Require(index().derived == 7, "an unwatch elsewhere dropped the kept copy");
+    expect(0, 1, "an unwatch did not make row C miss");
+    alignas(64) static std::byte other[64];
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(other, sizeof(other), true, true, true);
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(other);
+    }
+    const auto remapped = index();
+    Require(!remapped.reused && equalsGuest(remapped) && remapped.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix(), "a draw input outlived a registry mutation, or its registry generation is not the current one");
+    expect(0, 1, "an allocation change did not make row C miss, or row M did not find the entry it erased");
+    KeepDrawInput(&recorder, address, remapped, Use::Index32, 9);
+    // (j)
+    const auto padded = index(2 * size);
+    Require(!padded.reused && padded.generation != 0 && padded.buffer->Bytes().size() == 2 * size && equalsGuest(padded), "a kept copy without the padding was reused");
+    if (keyed) Require(padded.generation == CollectWrites(address, size), "a padding refusal's generation is not the collect's");
+    expect(one, 0, "a padding refusal's rows are wrong");
+    Require(index().derived == 9, "the padding refusal dropped the kept copy");
+    expect(one, 1, "the kept copy after a padding refusal did not hold rows C and M");
+    // (i) A budget-sized entry evicts every draw-input entry, the leased one first.
+    recorder.KeepDrawSnapshot(address + 2 * block, Recorder::DrawInputBudget, CollectWrites(address + 2 * block, 4096), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), first.buffer, Use::Vertex);
+    const auto evicted = index();
+    Require(!evicted.reused && equalsGuest(evicted), "a draw input whose kept copy was evicted was reused");
+    expect(one, 0, "row M held across its entry's eviction");
+    KeepDrawInput(&recorder, address, evicted, Use::Index32, 11);
+    Require(index().derived == 11, "the copy after the eviction was not kept");
+    expect(one, 0, "row M held across the copy kept after the eviction");
+    Require(index().derived == 11, "the copy after the eviction was not reused");
+    expect(one, 1, "rows C and M did not hold after the eviction");
+    // (h)
+    const auto pool = address + block;
+    const auto vertex = [&](std::size_t length) { return CopyDrawInput(context, &recorder, pool, length, 1, Use::Vertex); };
+    const auto whole = vertex(12288);
+    Require(!whole.reused, "the vertex pool was reused before it was kept");
+    expect(0, 0, "the first vertex read held a row");
+    KeepDrawInput(&recorder, pool, whole, Use::Vertex, 0);
+    Require(vertex(4096).buffer == whole.buffer, "a shorter vertex read did not reuse the longer snapshot");
+    expect(0, 0, "a new vertex lease held a row");
+    Require(vertex(4096).buffer == whole.buffer, "a shorter vertex read did not reuse the longer snapshot again");
+    expect(one, 1, "a vertex read served by a wider entry did not hold rows C and M");
+    const auto middle = std::make_shared<Buffer>(context, 8192, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    if (death == InputLeaseDeath::M) {
+        prepareInputLeaseDeath("an in-between vertex entry is kept without its set serial's bump");
+        InputLeaseSuppressBumpsForTest(true);
+        recorder.KeepDrawSnapshot(pool, 8192, CollectWrites(pool, 8192), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), middle, Use::Vertex);
+        static_cast<void>(vertex(4096));
+        Require(false, "=2 did not abort on a row M lease whose lookup finds another entry");
+    }
+    recorder.KeepDrawSnapshot(pool, 8192, CollectWrites(pool, 8192), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), middle, Use::Vertex);
+    Require(vertex(4096).buffer == middle, "a vertex read did not take the in-between snapshot kept after its lease");
+    expect(one, 0, "row M held across an in-between vertex snapshot");
+    Require(vertex(4096).buffer == middle, "a vertex read left the in-between snapshot");
+    expect(one, 1, "row M did not refill with the in-between snapshot");
+    // (k) A host write over the index range, queued for the next tracker lock or memo hit (the hook
+    // installed by hand, as APS5_EXPERIMENT_HOST_WRITE_STAMPS=1 installs it).
+    {
+        struct HostWriteHook {
+            HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&note); }
+            ~HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr); }
+            HostWriteHook(const HostWriteHook&) = delete;
+            HostWriteHook& operator=(const HostWriteHook&) = delete;
+            static void note(std::uintptr_t written, std::size_t length) { NoteHostWrite(written, length); }
+        } hook;
+        {
+            auto* target = reinterpret_cast<std::uint8_t*>(address);
+            const GuestArena::HostWrite write(target, 16);
+            Require(write.Open(), "the host write over the draw input did not open");
+            std::memset(target, 0x66, 16);
+        }
+        const auto written = index();
+        Require(!written.reused && equalsGuest(written), "a draw input outlived a host write queued after its lease");
+        expect(one, 1, "a host write's draw input did not hold rows C and M");
+        KeepDrawInput(&recorder, address, written, Use::Index32, 13);
+        Require(index().derived == 13, "the copy after the host write was not kept");
+        expect(one, 0, "row M held across the copy kept after the host write");
+    }
+    // (n) A second thread that adopted this thread's epoch: the same collect memo key, another owner.
+    gpu.unlock();
+    std::string failure;
+    DrawInputCopy adopted;
+    bool adoptedWalked = false;
+    std::thread([&] {
+        try {
+            std::lock_guard lock(GpuMutex());
+            AdoptLatestCollectEpoch();
+            const auto walked = ThreadCollectedBytes();
+            adopted = index();
+            adoptedWalked = ThreadCollectedBytes() != walked;
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+    }).join();
+    gpu.lock();
+    Require(failure.empty(), failure);
+    Require(adopted.reused && adopted.derived == 13, "a thread that adopted the epoch did not reuse the kept copy");
+    if (profiled && keyed) Require(adoptedWalked, "a thread that adopted the epoch did not walk the draw input");
+    expect(0, 1, "a thread that adopted the epoch took row C (another thread's coverage)");
+    Require(index().derived == 13, "the kept copy was not reused after another thread's input");
+    expect(0, 1, "row C held for another thread's coverage owner");
+    Require(index().derived == 13, "the kept copy was not reused on this thread again");
+    expect(one, 1, "rows C and M did not hold again on this thread");
+    // (m) Row E's mirror: nested scopes on a helper thread.
+    std::thread([&] {
+        try {
+            InputLeaseTestGate outer;
+            InputLeaseTestGate inner;
+            const auto check = [](bool reader, const char* what) { Require(SpeculativeReader() == reader && SpeculativeGateMirrored(), what); };
+            check(false, "a new thread reads a speculative gate, or its mirror differs");
+            {
+                const SpeculativeReadScope outerScope(outer);
+                check(true, "the outer speculative scope's gate is not read, or its mirror differs");
+                {
+                    const SpeculativeReadScope innerScope(inner);
+                    check(true, "the inner speculative scope's gate is not read, or its mirror differs");
+                    bool refused = false;
+                    try {
+                        FlushGpuWrites(address, 16);
+                    } catch (const SpeculativeReadRefused&) {
+                        refused = true;
+                    }
+                    Require(refused, "a flush inside a speculative scope was not refused");
+                }
+                check(true, "the outer gate was not restored, or its mirror differs");
+            }
+            check(false, "the gate outlived its scopes, or its mirror differs");
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+    }).join();
+    Require(failure.empty(), failure);
+    Require(!SpeculativeReader() && SpeculativeGateMirrored(), "this thread's speculative gate or its mirror moved");
+    recorder.Sync();
+    return true;
+}
+
 // The =3 death case below must end the process with a plain exit code (see Locks.cpp's
 // PrepareScopeDeath): ctest fails a run that ends in an exception without reading its output.
 [[maybe_unused]] void snapshotHashExitOnAbort(int) {
@@ -14192,6 +14448,19 @@ int main(int argc, char** argv) {
                 return 77;
             }
             std::cout << "draw input lease counter tests passed\n";
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 5 and 9, L1): the draw-input
+        // leases over real CopyDrawInput calls in the switch's mode, and =2's death rows; skipped (77)
+        // without write watching.
+        if (argc == 2 && (std::string_view(argv[1]) == "--input-lease-only" || std::string_view(argv[1]) == "--input-lease-death-c" || std::string_view(argv[1]) == "--input-lease-death-m")) {
+            const std::string_view which = argv[1];
+            const auto death = which == "--input-lease-death-c" ? InputLeaseDeath::C : which == "--input-lease-death-m" ? InputLeaseDeath::M : InputLeaseDeath::None;
+            if (!drawInputLeaseTests(device, recorder, gpu, death)) {
+                std::cout << "skipped, the device watches no memory for the draw input leases\n";
+                return 77;
+            }
+            std::cout << "draw input lease tests passed\n";
             return 0;
         }
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (c)): DepthSurfaceView leases
