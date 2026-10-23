@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthLease.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FieldCount.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -17,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <shared_mutex>
@@ -29,6 +33,7 @@
 #include <set>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -577,6 +582,12 @@ public:
     void NoteMemory() {
         depthMemory = GuestMemory::CollectWrites(target.address, static_cast<std::size_t>(depthBytes()));
         stencilMemory = target.stencilAddress != 0 ? GuestMemory::CollectWrites(target.stencilAddress, static_cast<std::size_t>(stencilBytes())) : 0;
+    }
+
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the depth and stencil ranges with the
+    // generations NoteMemory last took (the stencil range empty without a stencil plane).
+    std::array<GuestMemory::UnchangedQuery, 2> NotedMemory() const {
+        return {{{target.address, static_cast<std::size_t>(depthBytes()), depthMemory}, {target.stencilAddress, target.stencilAddress != 0 ? static_cast<std::size_t>(stencilBytes()) : std::size_t{0}, stencilMemory}}};
     }
 
     bool OverwrittenInMemory() const {
@@ -1797,6 +1808,313 @@ void retireStoringStale(DepthSurface& surface) {
     const auto [begin, end] = surface.UnitHull(units, planeBytes);
     if (StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "depth plane store")) surface.NoteStored(units, GuestMemory::TrackerGeneration());
 }
+
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0, DepthLease.hpp): the DepthSurfaceView lease
+// counter. Read once. Its two serials move only while profiling, under the surfaces mutex: a
+// clearedHtiles entry set (NoteHtileDepthClear), and a surface DepthSurfaceView found retired.
+bool depthLeaseProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+std::uint64_t clearedHtileSets = 0;
+std::uint64_t depthUnretires = 0;
+
+// Relaxed, counted only while profiling; DepthLeaseTotals reads them, the [proofs] line prints deltas.
+struct DepthLeaseCounters {
+    std::atomic<std::uint64_t> calls{0};
+    std::array<std::atomic<std::uint64_t>, DepthLeaseIneligibleCount> ineligible{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DepthLease::Count)> outcomes{};
+    std::atomic<std::uint64_t> hitsWriteGeneration{0};
+    std::atomic<std::uint64_t> missesWriteGeneration{0};
+    std::array<std::atomic<std::uint64_t>, 3> hitWork{};
+    std::atomic<std::uint64_t> evictions{0};
+    std::atomic<std::uint64_t> counterNs{0};
+};
+constinit DepthLeaseCounters depthLeaseCounters;
+
+void countDepthLease(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
+    counter.fetch_add(amount, std::memory_order_relaxed);
+}
+
+// The key holds every DepthTarget field (clearDepth by its bits). A member added by a merge, wherever
+// it lands, fails the field count until it is compared here and the count is raised (FieldCount.hpp).
+static_assert(AggregateFieldCount<DepthTarget, 17>, "a DepthTarget field was added: compare it in sameDepthKey (the D5-0 lease key holds every field)");
+bool sameDepthKey(const DepthTarget& a, const DepthTarget& b) {
+    return a.address == b.address && a.stencilAddress == b.stencilAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && std::bit_cast<std::uint32_t>(a.clearDepth) == std::bit_cast<std::uint32_t>(b.clearDepth) && a.clearStencil == b.clearStencil && a.htileAddress == b.htileAddress && a.htileStencil == b.htileStencil && a.samples == b.samples && a.depthSwizzle == b.depthSwizzle && a.pipeBankXor == b.pipeBankXor && a.firstSlice == b.firstSlice && a.lastSlice == b.lastSlice && a.iterate256 == b.iterate256 && a.htilePipeAligned == b.htilePipeAligned && a.htileVrsEncoding == b.htileVrsEncoding && a.htileDepthOnly == b.htileDepthOnly;
+}
+
+// 16 sets x 4 ways, the set from the target's 64 KiB block, as the D4-0 target lease table. Per thread
+// (ThreadScratch).
+constexpr std::size_t DepthLeaseSets = 16;
+constexpr std::size_t DepthLeaseWays = 4;
+
+struct DepthLeaseEntry {
+    bool valid = false;
+    const Recorder* recorder = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    DepthTarget target{};
+    DepthLeaseMark mark;
+    // What the next call's stamp test reads: the depth and stencil planes with the generations
+    // NoteMemory took, the HTILE with the generation its read proof (htileReads) held at the end.
+    std::array<GuestMemory::UnchangedQuery, 3> ranges{};
+    std::uint64_t used = 0;
+};
+
+struct DepthLeaseTable {
+    std::array<std::array<DepthLeaseEntry, DepthLeaseWays>, DepthLeaseSets> sets{};
+    // Per set, fingerprints of the last keys a set conflict evicted (0 empty).
+    std::array<std::array<std::uint64_t, DepthLeaseWays>, DepthLeaseSets> evicted{};
+    std::array<std::uint8_t, DepthLeaseSets> nextEvicted{};
+    std::uint64_t tick = 0;
+};
+struct DepthLeaseTableTag {};
+
+std::size_t depthLeaseSet(std::uint64_t address) {
+    return static_cast<std::size_t>(((address >> 16u) * 0x9E3779B97F4A7C15ull) >> 60u);
+}
+
+std::uint64_t depthLeaseFingerprint(const Recorder* recorder, VkDevice device, const DepthTarget& target) {
+    std::uint64_t hash = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(recorder)) ^ (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(device)) << 1u);
+    for (const std::uint64_t word : {target.address, target.stencilAddress, target.htileAddress, (std::uint64_t{target.extent.width} << 32u) | target.extent.height, static_cast<std::uint64_t>(static_cast<std::uint32_t>(target.format)) | (std::uint64_t{target.samples} << 32u)}) {
+        hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+    }
+    return hash | 1u;
+}
+
+DepthLeaseEntry* findDepthLease(DepthLeaseTable& table, std::size_t set, const Recorder* recorder, VkDevice device, const DepthTarget& target) {
+    for (auto& way : table.sets[set]) {
+        if (way.valid && way.recorder == recorder && way.device == device && sameDepthKey(way.target, target)) return &way;
+    }
+    return nullptr;
+}
+
+// One DepthSurfaceView call while profiling: depthLeaseStart fills it before any of the call's own
+// work, depthLeaseLocked under the surfaces mutex, the call its un-retire and mirror sync, and
+// depthLeaseEnd classifies, counts and leaves the target's entry.
+struct DepthLeaseUse {
+    std::uint8_t ineligible = DepthLeaseEligible;
+    Recorder* recorder = nullptr;
+    bool found = false;
+    bool evicted = false;
+    DepthLeaseMark previous;
+    std::array<GuestMemory::UnchangedQuery, 3> ranges{};
+    DepthLeaseMark now;
+    DepthLease stamped = DepthLease::WouldHit;
+    bool htileWritten = false;
+    std::uint64_t depthWrites = 0;
+    bool synced = false;
+    std::uint64_t ns = 0;
+};
+
+std::uint64_t depthLeaseNs(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+// Reads only: the memo key, the recorder under the GPU lock (eligibility requires it held) and, while
+// the memo key and the finished serial held, one tracker lock for the stamps (UnchangedSince again
+// per plane only to name a stamped one) and the HTILE's newer writes.
+void depthLeaseStart(DepthLeaseUse& use, const Context& context, const DepthTarget& target, bool native) {
+    const auto start = std::chrono::steady_clock::now();
+    use.recorder = RecorderFor(context);
+    if (target.samples != 1u || native) use.ineligible = DepthLeaseMultisampled;
+    else if (use.recorder != nullptr && !GuestMemory::GpuMutex().HeldByThisThread()) use.ineligible = DepthLeaseUnlocked;
+    else if (use.now.memo = GuestMemory::CurrentCollectMemoKey(); !use.now.memo.Valid()) use.ineligible = DepthLeaseNoMemoKey;
+    if (use.ineligible == DepthLeaseEligible) {
+        use.now.finished = use.recorder != nullptr ? use.recorder->FinishedSerial() : 0;
+        use.now.writeGeneration = Recorder::WriteGeneration();
+        auto& table = ThreadScratch<DepthLeaseTable, DepthLeaseTableTag>();
+        const auto set = depthLeaseSet(target.address);
+        if (const auto* entry = findDepthLease(table, set, use.recorder, context.device, target)) {
+            use.found = true;
+            use.previous = entry->mark;
+            use.ranges = entry->ranges;
+        } else {
+            const auto fingerprint = depthLeaseFingerprint(use.recorder, context.device, target);
+            for (auto& evicted : table.evicted[set]) {
+                if (evicted != fingerprint) continue;
+                evicted = 0;
+                use.evicted = true;
+                break;
+            }
+        }
+    }
+    if (use.found && use.now.memo == use.previous.memo && use.now.finished == use.previous.finished) {
+        std::array<GuestMemory::UnchangedQuery, 3> queries{};
+        std::size_t count = 0;
+        for (const auto& range : use.ranges) {
+            if (range.bytes != 0) queries[count++] = range;
+        }
+        if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), count))) {
+            use.stamped = DepthLease::StampedHtile;
+            for (std::size_t plane = 0; plane < 2; ++plane) {
+                const auto& range = use.ranges[plane];
+                if (range.bytes == 0 || GuestMemory::UnchangedSince(range.address, range.bytes, range.generation)) continue;
+                use.stamped = plane == 0 ? DepthLease::StampedDepth : DepthLease::StampedStencil;
+                break;
+            }
+        } else if (use.recorder != nullptr && use.ranges[2].bytes != 0) {
+            use.htileWritten = use.recorder->WrittenAfterNote(use.ranges[2].address, use.ranges[2].bytes, use.previous.writeNotes);
+        }
+    }
+    use.ns += depthLeaseNs(start);
+}
+
+// The serials today's lookup reads, at the point it takes the surfaces mutex (the HTILE store-back
+// before it moves none of them).
+void depthLeaseLocked(DepthLeaseUse& use) {
+    if (!use.found) return;
+    use.now.surfaces = surfacesSerial.load(std::memory_order_acquire);
+    use.now.planeBinds = planeBinds;
+    use.now.clearedHtiles = clearedHtileSets;
+    use.now.mirrorEpoch = mirrorEpoch;
+}
+
+// Where the call un-retires its surface: the serial moves for a surface found retired (counted in
+// every call while profiling, eligible or not), and an eligible call compares it after its own move.
+void depthLeaseUnretire(DepthLeaseUse& use, bool retired) {
+    if (retired) ++depthUnretires;
+    use.now.unretired = depthUnretires;
+}
+
+// Under the surfaces mutex, at the call's end: classifies against the target's entry, counts, and
+// leaves the entry the state at this end.
+void depthLeaseEnd(DepthLeaseUse& use, const Context& context, const DepthTarget& target, const DepthSurface& surface, bool created, bool storedBack, bool clearedTaken) {
+    const auto start = std::chrono::steady_clock::now();
+    auto& counters = depthLeaseCounters;
+    countDepthLease(counters.calls);
+    countDepthLease(counters.ineligible[use.ineligible]);
+    if (use.ineligible != DepthLeaseEligible) {
+        countDepthLease(counters.counterNs, use.ns + depthLeaseNs(start));
+        return;
+    }
+    if (!use.found) {
+        CountDepthLease({use.evicted ? DepthLease::Evicted : DepthLease::NoEntry, false}, 0);
+    } else {
+        use.now.surface = created ? nullptr : &surface;
+        const auto work = static_cast<std::uint8_t>((storedBack ? DepthLeaseHtileStoreBack : 0) | (clearedTaken ? DepthLeaseClearedHtileTaken : 0) | (use.synced ? DepthLeaseMirrorSync : 0));
+        CountDepthLease(ClassifyDepthLease(use.previous, use.now, use.stamped, use.htileWritten), work);
+    }
+    DepthLeaseMark mark;
+    mark.surface = &surface;
+    mark.memo = GuestMemory::CurrentCollectMemoKey();
+    mark.surfaces = surfacesSerial.load(std::memory_order_acquire);
+    mark.unretired = depthUnretires;
+    mark.planeBinds = planeBinds;
+    mark.clearedHtiles = clearedHtileSets;
+    mark.mirrorEpoch = mirrorEpoch;
+    mark.finished = use.recorder != nullptr ? use.recorder->FinishedSerial() : 0;
+    mark.writeNotes = use.recorder != nullptr ? use.recorder->WriteNotes() : 0;
+    mark.writeGeneration = Recorder::WriteGeneration();
+    const auto noted = surface.NotedMemory();
+    std::array<GuestMemory::UnchangedQuery, 3> ranges{noted[0], noted[1], GuestMemory::UnchangedQuery{0, 0, 0}};
+    if (target.htileAddress != 0) {
+        std::uint64_t generation = 0;
+        {
+            std::lock_guard lock(htileReadsMutex());
+            if (const auto found = htileReads().find(target.htileAddress); found != htileReads().end()) generation = found->second;
+        }
+        ranges[2] = {target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)), generation};
+    }
+    auto& table = ThreadScratch<DepthLeaseTable, DepthLeaseTableTag>();
+    const auto set = depthLeaseSet(target.address);
+    auto* entry = findDepthLease(table, set, use.recorder, context.device, target);
+    if (entry == nullptr) {
+        entry = &table.sets[set][0];
+        for (auto& way : table.sets[set]) {
+            if (!way.valid) {
+                entry = &way;
+                break;
+            }
+            if (way.used < entry->used) entry = &way;
+        }
+        if (entry->valid) {
+            countDepthLease(counters.evictions);
+            table.evicted[set][table.nextEvicted[set]++ % DepthLeaseWays] = depthLeaseFingerprint(entry->recorder, entry->device, entry->target);
+        }
+        entry->valid = true;
+        entry->recorder = use.recorder;
+        entry->device = context.device;
+        entry->target = target;
+    }
+    entry->mark = mark;
+    entry->ranges = ranges;
+    entry->used = ++table.tick;
+    countDepthLease(counters.counterNs, use.ns + depthLeaseNs(start));
+}
+}
+
+DepthLeaseVerdict ClassifyDepthLease(const DepthLeaseMark& previous, const DepthLeaseMark& now, DepthLease stamped, bool htileWritten) {
+    DepthLeaseVerdict verdict;
+    verdict.writeGenerationMoved = now.writeGeneration != previous.writeGeneration;
+    auto& outcome = verdict.outcome;
+    if (now.surface == nullptr || now.surface != previous.surface) outcome = DepthLease::Identity;
+    else if (now.memo.epoch != previous.memo.epoch) outcome = DepthLease::Epoch;
+    else if (now.memo.mapping != previous.memo.mapping) outcome = DepthLease::Allocations;
+    else if (now.memo.unwatched != previous.memo.unwatched) outcome = DepthLease::Unwatch;
+    else if (now.surfaces != previous.surfaces) outcome = DepthLease::Surfaces;
+    else if (now.unretired != previous.unretired) outcome = DepthLease::Unretired;
+    else if (now.planeBinds != previous.planeBinds) outcome = DepthLease::PlaneBinds;
+    else if (now.clearedHtiles != previous.clearedHtiles) outcome = DepthLease::ClearedHtile;
+    else if (now.mirrorEpoch != previous.mirrorEpoch) outcome = DepthLease::MirrorEpoch;
+    else if (now.finished != previous.finished) outcome = DepthLease::Reaped;
+    else if (stamped != DepthLease::WouldHit) outcome = stamped;
+    else if (htileWritten) outcome = DepthLease::HtileNote;
+    return verdict;
+}
+
+void CountDepthLease(const DepthLeaseVerdict& verdict, std::uint8_t work) {
+    auto& counters = depthLeaseCounters;
+    countDepthLease(counters.outcomes[static_cast<std::size_t>(verdict.outcome)]);
+    if (verdict.outcome != DepthLease::WouldHit) {
+        if (verdict.writeGenerationMoved) countDepthLease(counters.missesWriteGeneration);
+        return;
+    }
+    if (verdict.writeGenerationMoved) countDepthLease(counters.hitsWriteGeneration);
+    for (std::size_t bit = 0; bit < counters.hitWork.size(); ++bit) {
+        if ((work & (1u << bit)) != 0) countDepthLease(counters.hitWork[bit]);
+    }
+}
+
+DepthLeaseCounts DepthLeaseTotals() {
+    const auto& counters = depthLeaseCounters;
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    DepthLeaseCounts totals;
+    totals.calls = load(counters.calls);
+    for (std::size_t i = 0; i < DepthLeaseIneligibleCount; ++i) totals.ineligible[i] = load(counters.ineligible[i]);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(DepthLease::Count); ++i) totals.outcomes[i] = load(counters.outcomes[i]);
+    totals.hitsWriteGeneration = load(counters.hitsWriteGeneration);
+    totals.missesWriteGeneration = load(counters.missesWriteGeneration);
+    for (std::size_t i = 0; i < 3; ++i) totals.hitWork[i] = load(counters.hitWork[i]);
+    totals.evictions = load(counters.evictions);
+    totals.counterNs = load(counters.counterNs);
+    return totals;
+}
+
+const char* DepthLeaseName(DepthLease lease) {
+    constexpr std::array<const char*, static_cast<std::size_t>(DepthLease::Count)> names{"would-hit", "no entry", "evicted by a set conflict", "identity", "memo key moved: epoch", "allocations", "unwatch", "surfaces serial", "un-retired", "plane binds", "cleared HTILE set", "mirror epoch", "reaped", "stamped: depth", "stencil", "HTILE", "HTILE note"};
+    const auto index = static_cast<std::size_t>(lease);
+    return index < names.size() ? names[index] : "?";
+}
+
+std::string DepthLeaseReport() {
+    static DepthLeaseCounts reported;
+    const auto now = DepthLeaseTotals();
+    const auto delta = [](std::uint64_t value, std::uint64_t before) { return static_cast<unsigned long long>(value - before); };
+    std::string line;
+    char text[512];
+    std::snprintf(text, sizeof(text), "; depth view leases (D5-0): eligible %llu of %llu calls (ineligible: multisampled or native owner %llu, unlocked %llu, no memo key %llu), would-hit %llu (writeGeneration moved in %llu; today's call still did work: HTILE stored back %llu, cleared HTILE taken %llu, mirror synced %llu), misses by reason:",
+                  delta(now.ineligible[DepthLeaseEligible], reported.ineligible[DepthLeaseEligible]), delta(now.calls, reported.calls), delta(now.ineligible[DepthLeaseMultisampled], reported.ineligible[DepthLeaseMultisampled]), delta(now.ineligible[DepthLeaseUnlocked], reported.ineligible[DepthLeaseUnlocked]),
+                  delta(now.ineligible[DepthLeaseNoMemoKey], reported.ineligible[DepthLeaseNoMemoKey]), delta(now.outcomes[0], reported.outcomes[0]), delta(now.hitsWriteGeneration, reported.hitsWriteGeneration), delta(now.hitWork[0], reported.hitWork[0]), delta(now.hitWork[1], reported.hitWork[1]), delta(now.hitWork[2], reported.hitWork[2]));
+    line += text;
+    for (std::size_t i = 1; i < static_cast<std::size_t>(DepthLease::Count); ++i) {
+        std::snprintf(text, sizeof(text), "%s %s %llu", i == 1 ? "" : ",", DepthLeaseName(static_cast<DepthLease>(i)), delta(now.outcomes[i], reported.outcomes[i]));
+        line += text;
+    }
+    std::snprintf(text, sizeof(text), "; writeGeneration moved in %llu of the classified misses; table evictions %llu; counter time %.1f ms (in the [draws] prepare phase)", delta(now.missesWriteGeneration, reported.missesWriteGeneration), delta(now.evictions, reported.evictions), static_cast<double>(now.counterNs - reported.counterNs) / 1e6);
+    line += text;
+    reported = now;
+    return line;
 }
 
 std::uint64_t DepthSurfacesSerial() {
@@ -1902,9 +2220,15 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
-    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    const bool native = RoutesToNativeDepthOwner(target);
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0, DepthLease.hpp): the lease counter, while
+    // profiling only; its start reads the state the call's own work begins from.
+    std::optional<DepthLeaseUse> lease;
+    if (depthLeaseProfiled()) depthLeaseStart(lease.emplace(), context, target, native);
+    const auto htileCleared = native ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
+    if (lease) depthLeaseLocked(*lease);
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
     for (const auto& candidate : surfaces()) {
@@ -1947,6 +2271,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         }
         surface = surfaces().back().get();
     }
+    if (lease) depthLeaseUnretire(*lease, surface->retired);
     surface->retired = false;
     const auto owner = depthOwners().find({context.device, target.address});
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
@@ -1959,7 +2284,9 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
+    if (lease) lease->depthWrites = depthWrites;
     if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
+    if (lease) lease->synced = depthWrites != lease->depthWrites;
     surface->ApplyFastClear();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
@@ -1982,6 +2309,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         noteStalePlane(plane, plane + planeBytes);
     }
     drawnDepth = surface;
+    if (lease) depthLeaseEnd(*lease, context, target, *surface, created, htileCleared != 0, cleared);
     return surface->view;
 }
 
@@ -2213,7 +2541,11 @@ void NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::siz
         surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
         existing = true;
     }
-    if (!existing) clearedHtiles()[htileAddress] = bytes;
+    if (!existing) {
+        clearedHtiles()[htileAddress] = bytes;
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the clearedHtiles insert serial.
+        if (depthLeaseProfiled()) ++clearedHtileSets;
+    }
 }
 
 void ClearDepthSurfaces(VkDevice device) {

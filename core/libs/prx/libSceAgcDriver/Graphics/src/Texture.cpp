@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/General.hpp"
@@ -288,6 +289,10 @@ void reportProofs() {
     // and misses (TargetLease.cpp); counted outside the [draws] lookup wall, which stays comparable
     // with r70's.
     line += TargetLeaseReport();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the DepthSurfaceView lease counter's
+    // would-hits and misses (DepthLease.hpp, DepthSurface.cpp), with its own time, which the [draws]
+    // prepare phase carries.
+    line += DepthLeaseReport();
     AgcDriver::ProfilePrint_nid_no_patch("[proofs] storage refresh proofs per 10 s (target lookups/other callers): %s\n", line.c_str());
 }
 

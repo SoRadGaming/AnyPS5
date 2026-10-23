@@ -3589,6 +3589,26 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     return newest;
 }
 
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): see Recorder.hpp. noteWrite and
+// noteWriteOn append each write with ++writeNoteCount, so a batch's notes ascend and its scan stops
+// at the first write not newer than `note`.
+bool Recorder::WrittenAfterNote(std::uint64_t address, std::size_t bytes, std::uint64_t note) const {
+    if (bytes == 0 || note >= writeNoteCount) return false;
+    const auto end = address + bytes;
+    const auto scan = [&](const Batch& batch) {
+        for (auto i = std::min(batch.writes.size(), batch.writeNotes.size()); i-- != 0 && batch.writeNotes[i] > note;) {
+            if (address < batch.writes[i].second && batch.writes[i].first < end) return true;
+        }
+        return false;
+    };
+    if (open != nullptr && scan(*open)) return true;
+    return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return scan(*batch); });
+}
+
+std::uint64_t Recorder::FinishedSerial() const {
+    return inFlight.empty() ? submissions : inFlight.front()->serial - 1;
+}
+
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
     std::vector<PendingWrite> found;
     if (bytes == 0) return found;

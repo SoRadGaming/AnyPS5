@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawTicket.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FieldCount.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -12169,6 +12170,265 @@ void targetMemoTests() {
     std::cout << "target memo tests passed (APS5_EXPERIMENT_TARGET_MEMOS=" << mode << ")\n";
 }
 
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the DepthSurfaceView lease counter's
+// classification and counts, without a device. Each condition moved alone misses by its own reason;
+// with every condition from one on moved, the call misses by that one (the order of DepthLease); a
+// writeGeneration move is no reason but is counted apart; the work a call still did is counted for
+// would-hits only; and the [proofs] part prints the counts since its last call.
+void depthLeaseClassifyTests() {
+    int surfaceObject = 0;
+    int otherSurface = 0;
+    DepthLeaseMark previous;
+    previous.surface = &surfaceObject;
+    previous.memo = {5, 6, 7};
+    previous.surfaces = 10;
+    previous.unretired = 11;
+    previous.planeBinds = 12;
+    previous.clearedHtiles = 13;
+    previous.mirrorEpoch = 14;
+    previous.finished = 15;
+    previous.writeNotes = 16;
+    previous.writeGeneration = 17;
+    const auto expect = [](const DepthLeaseVerdict& verdict, DepthLease outcome, bool moved, const std::string& what) {
+        Require(verdict.outcome == outcome && verdict.writeGenerationMoved == moved, "D5-0 classification: " + what + ": " + DepthLeaseName(verdict.outcome) + (verdict.writeGenerationMoved ? " with" : " without") + " a writeGeneration move, where " + DepthLeaseName(outcome) + (moved ? " with" : " without") + " one was expected");
+    };
+    expect(ClassifyDepthLease(previous, previous, DepthLease::WouldHit, false), DepthLease::WouldHit, false, "nothing moved");
+    auto moved = previous;
+    moved.writeNotes = 99;
+    expect(ClassifyDepthLease(previous, moved, DepthLease::WouldHit, false), DepthLease::WouldHit, false, "a newer write note (only the HTILE test reads it)");
+    moved = previous;
+    moved.writeGeneration = 18;
+    expect(ClassifyDepthLease(previous, moved, DepthLease::WouldHit, false), DepthLease::WouldHit, true, "writeGeneration moved alone");
+    const auto single = [&](auto move, DepthLease outcome, const char* what) {
+        auto now = previous;
+        move(now);
+        expect(ClassifyDepthLease(previous, now, DepthLease::WouldHit, false), outcome, false, what);
+    };
+    single([&](DepthLeaseMark& now) { now.surface = &otherSurface; }, DepthLease::Identity, "another surface");
+    single([](DepthLeaseMark& now) { now.surface = nullptr; }, DepthLease::Identity, "a surface the call created");
+    single([](DepthLeaseMark& now) { ++now.memo.epoch; }, DepthLease::Epoch, "an epoch bump");
+    single([](DepthLeaseMark& now) { ++now.memo.mapping; }, DepthLease::Allocations, "an allocation change");
+    single([](DepthLeaseMark& now) { ++now.memo.unwatched; }, DepthLease::Unwatch, "an unwatch");
+    single([](DepthLeaseMark& now) { ++now.surfaces; }, DepthLease::Surfaces, "a surface created or cleared");
+    single([](DepthLeaseMark& now) { ++now.unretired; }, DepthLease::Unretired, "a surface un-retired");
+    single([](DepthLeaseMark& now) { ++now.planeBinds; }, DepthLease::PlaneBinds, "a plane bound");
+    single([](DepthLeaseMark& now) { ++now.clearedHtiles; }, DepthLease::ClearedHtile, "a cleared HTILE set");
+    single([](DepthLeaseMark& now) { ++now.mirrorEpoch; }, DepthLease::MirrorEpoch, "a mirror created");
+    single([](DepthLeaseMark& now) { ++now.finished; }, DepthLease::Reaped, "a batch finished");
+    for (const auto stamp : {DepthLease::StampedDepth, DepthLease::StampedStencil, DepthLease::StampedHtile}) expect(ClassifyDepthLease(previous, previous, stamp, false), stamp, false, std::string("a stamp (") + DepthLeaseName(stamp) + ")");
+    expect(ClassifyDepthLease(previous, previous, DepthLease::WouldHit, true), DepthLease::HtileNote, false, "a write over the HTILE noted");
+    auto all = previous;
+    all.surface = nullptr;
+    ++all.memo.epoch;
+    ++all.memo.mapping;
+    ++all.memo.unwatched;
+    ++all.surfaces;
+    ++all.unretired;
+    ++all.planeBinds;
+    ++all.clearedHtiles;
+    ++all.mirrorEpoch;
+    ++all.finished;
+    ++all.writeGeneration;
+    auto stamped = DepthLease::StampedDepth;
+    bool written = true;
+    constexpr std::array order{DepthLease::Identity, DepthLease::Epoch, DepthLease::Allocations, DepthLease::Unwatch, DepthLease::Surfaces, DepthLease::Unretired, DepthLease::PlaneBinds, DepthLease::ClearedHtile, DepthLease::MirrorEpoch, DepthLease::Reaped, DepthLease::StampedDepth, DepthLease::HtileNote, DepthLease::WouldHit};
+    for (std::size_t step = 0; step < order.size(); ++step) {
+        expect(ClassifyDepthLease(previous, all, stamped, written), order[step], true, std::string("every condition from ") + DepthLeaseName(order[step]) + " on moved");
+        switch (step) {
+        case 0: all.surface = previous.surface; break;
+        case 1: all.memo.epoch = previous.memo.epoch; break;
+        case 2: all.memo.mapping = previous.memo.mapping; break;
+        case 3: all.memo.unwatched = previous.memo.unwatched; break;
+        case 4: all.surfaces = previous.surfaces; break;
+        case 5: all.unretired = previous.unretired; break;
+        case 6: all.planeBinds = previous.planeBinds; break;
+        case 7: all.clearedHtiles = previous.clearedHtiles; break;
+        case 8: all.mirrorEpoch = previous.mirrorEpoch; break;
+        case 9: all.finished = previous.finished; break;
+        case 10: stamped = DepthLease::WouldHit; break;
+        case 11: written = false; break;
+        default: break;
+        }
+    }
+    static_cast<void>(DepthLeaseReport());
+    const auto before = DepthLeaseTotals();
+    CountDepthLease({DepthLease::WouldHit, true}, DepthLeaseHtileStoreBack | DepthLeaseMirrorSync);
+    CountDepthLease({DepthLease::WouldHit, false}, 0);
+    CountDepthLease({DepthLease::PlaneBinds, true}, DepthLeaseClearedHtileTaken);
+    CountDepthLease({DepthLease::NoEntry, false}, 0);
+    const auto after = DepthLeaseTotals();
+    const auto delta = [&](DepthLease lease) { return after.outcomes[static_cast<std::size_t>(lease)] - before.outcomes[static_cast<std::size_t>(lease)]; };
+    std::uint64_t counted = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(DepthLease::Count); ++i) counted += after.outcomes[i] - before.outcomes[i];
+    Require(delta(DepthLease::WouldHit) == 2 && delta(DepthLease::PlaneBinds) == 1 && delta(DepthLease::NoEntry) == 1 && counted == 4, "D5-0 counts: the outcomes were not counted once each");
+    Require(after.hitsWriteGeneration - before.hitsWriteGeneration == 1 && after.missesWriteGeneration - before.missesWriteGeneration == 1, "D5-0 counts: the writeGeneration moves were not counted apart for the would-hits and the misses");
+    Require(after.hitWork[0] - before.hitWork[0] == 1 && after.hitWork[1] == before.hitWork[1] && after.hitWork[2] - before.hitWork[2] == 1, "D5-0 counts: the work of the would-hits' calls was not counted as such (or a miss's was)");
+    Require(after.calls == before.calls && after.ineligible[DepthLeaseEligible] == before.ineligible[DepthLeaseEligible], "D5-0 counts: counting an outcome counted a call");
+    const auto report = DepthLeaseReport();
+    for (const char* part : {"would-hit 2 (writeGeneration moved in 1; today's call still did work: HTILE stored back 1, cleared HTILE taken 0, mirror synced 1)", "misses by reason: no entry 1,", ", plane binds 1,", "writeGeneration moved in 1 of the classified misses"}) {
+        Require(report.find(part) != std::string::npos, std::string("D5-0 report: '") + part + "' is not in: " + report);
+    }
+    Require(DepthLeaseReport().find("would-hit 0 (") != std::string::npos, "D5-0 report: a second report did not start from the first one's counts");
+    std::cout << "depth lease classification tests passed\n";
+}
+
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the lease counter over real DepthSurfaceView
+// calls on a watched block, and the recorder reads it uses (WrittenAfterNote against NewestWriteNote,
+// FinishedSerial against the batches finished). Without APS5_PROFILE_DRAW nothing is counted; with it
+// but no collect memo key (no APS5_DEBUG_COVERAGE=1) every call is ineligible for that reason; with
+// both, a second call of a target would hit and each condition moved between two calls misses by its
+// reason. A step across which the memo key moved by itself (an unwatch or an allocation change made
+// elsewhere) is tried again. False when the device watches no memory.
+bool depthLeaseCounterTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 8 * block;
+    void* memory = AllocateWatched(bytes, block);
+    if (memory == nullptr) {
+        std::cout << "no write watching: the depth lease counter not tested\n";
+        return false;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    const auto& context = device.GetContext();
+    struct Clear {
+        VkDevice device;
+        ~Clear() { ClearDepthSurfaces(device); }
+    } clear{context.device};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    constexpr VkExtent2D extent{64, 64};
+    const auto htileBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    auto* words = static_cast<std::uint8_t*>(memory);
+    std::memset(words, 0, bytes);
+    // HTILE words with no clear code (HtileFillClears reads the low nibble).
+    std::memset(words + 3 * block, 0xff, htileBytes);
+    std::memset(words + 4 * block, 0xff, htileBytes);
+    DepthTarget a{base, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    a.htileAddress = base + 3 * block;
+    const DepthTarget b{base + block, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    DepthTarget c{base + 2 * block, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    c.htileAddress = base + 4 * block;
+    const auto unrelated = base + 5 * block;
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+
+    settle();
+    const auto finished = recorder.FinishedSerial();
+    const auto notes = recorder.WriteNotes();
+    Require(!recorder.WrittenAfterNote(unrelated, block, notes), "D5-0 recorder: a write newer than the newest note");
+    recorder.NotePendingWrite(unrelated, 256);
+    Require(recorder.WriteNotes() == notes + 1 && recorder.NewestWriteNote(unrelated, block) == notes + 1, "D5-0 recorder: a noted write did not take the next note");
+    Require(recorder.WrittenAfterNote(unrelated, block, notes) && !recorder.WrittenAfterNote(unrelated, block, notes + 1) && !recorder.WrittenAfterNote(unrelated + 256, 256, notes), "D5-0 recorder: WrittenAfterNote does not answer NewestWriteNote(range) > note for a noted write");
+    recorder.NotePendingWrite(base + 6 * block, 256);
+    Require(recorder.WrittenAfterNote(unrelated, block, notes) && !recorder.WrittenAfterNote(unrelated, block, notes + 1) && recorder.WrittenAfterNote(base + 6 * block, 256, notes + 1), "D5-0 recorder: a newer write elsewhere changed WrittenAfterNote's answer over the first one");
+    Require(recorder.FinishedSerial() == finished, "D5-0 recorder: noting writes moved the finished serial");
+    recorder.Submit();
+    Require(recorder.FinishedSerial() == finished && recorder.WrittenAfterNote(unrelated, block, notes), "D5-0 recorder: a submitted batch read as finished, or its write as gone");
+    device.WaitQueue();
+    recorder.Sync();
+    Require(recorder.FinishedSerial() > finished && !recorder.WrittenAfterNote(unrelated, block, notes) && recorder.NewestWriteNote(unrelated, block) == 0, "D5-0 recorder: a finished batch did not move the finished serial, or its write was still found");
+
+    const bool profiling = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    BumpCollectEpoch();
+    const bool keyed = CurrentCollectMemoKey().Valid();
+    const auto start = DepthLeaseTotals();
+    const auto view = [&](const DepthTarget& target) { Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "D5-0: the depth surface has no view"); };
+    const auto outcomes = [](const DepthLeaseCounts& counts) {
+        std::uint64_t total = 0;
+        for (const auto count : counts.outcomes) total += count;
+        return total;
+    };
+    if (!profiling || !keyed) {
+        view(a);
+        view(a);
+        view(b);
+        view(a);
+        const auto now = DepthLeaseTotals();
+        if (!profiling) Require(now.calls == start.calls && outcomes(now) == outcomes(start) && now.counterNs == start.counterNs, "D5-0: calls were counted without APS5_PROFILE_DRAW");
+        else Require(now.calls == start.calls + 4 && now.ineligible[DepthLeaseNoMemoKey] == start.ineligible[DepthLeaseNoMemoKey] + 4 && outcomes(now) == outcomes(start), "D5-0: calls without a collect memo key were not ineligible for that reason");
+        settle();
+        std::cout << "depth lease counter tests passed (" << (profiling ? "no collect memo key: every call ineligible" : "not profiling: nothing counted") << ")\n";
+        return true;
+    }
+    // One call of `target` after `action`: the outcome it counted. A step across which the memo key
+    // moved by itself is tried again (up to three times), after a call that renews the entry.
+    const auto outcomeOf = [&](const DepthTarget& target, auto&& action) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const auto key = CurrentCollectMemoKey();
+            const auto before = DepthLeaseTotals();
+            action();
+            view(target);
+            const auto after = DepthLeaseTotals();
+            Require(after.calls == before.calls + 1 && after.ineligible[DepthLeaseEligible] == before.ineligible[DepthLeaseEligible] + 1, "D5-0: a call of a single-sample target under the GPU lock with a memo key was not counted eligible");
+            auto outcome = DepthLease::Count;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(DepthLease::Count); ++i) {
+                if (after.outcomes[i] == before.outcomes[i]) continue;
+                Require(outcome == DepthLease::Count && after.outcomes[i] == before.outcomes[i] + 1, "D5-0: a call counted more than one outcome");
+                outcome = static_cast<DepthLease>(i);
+            }
+            Require(outcome != DepthLease::Count, "D5-0: an eligible call counted no outcome");
+            if (CurrentCollectMemoKey() == key) return outcome;
+            view(target);
+        }
+        throw std::runtime_error("D5-0: the collect memo key kept moving by itself");
+    };
+    const auto none = [] {};
+    const auto expect = [&](const DepthTarget& target, auto&& action, DepthLease expected, const char* what) {
+        const auto outcome = outcomeOf(target, action);
+        Require(outcome == expected, std::string("D5-0: ") + what + ": " + DepthLeaseName(outcome) + " where " + DepthLeaseName(expected) + " was expected");
+    };
+    // The first call misses (no entry, or an entry an earlier test's surface at this address left).
+    Require(outcomeOf(a, none) != DepthLease::WouldHit, "D5-0: the first call of a target would hit");
+    expect(a, none, DepthLease::WouldHit, "a second call");
+    expect(a, [&] { MarkWritten(a.address + 4096, 64); }, DepthLease::StampedDepth, "a driver stamp over the depth plane");
+    expect(a, none, DepthLease::WouldHit, "the call after the depth plane stamp");
+    expect(a, [&] { MarkWritten(a.htileAddress, 4); }, DepthLease::StampedHtile, "a driver stamp over the HTILE");
+    expect(a, none, DepthLease::WouldHit, "the call after the HTILE stamp");
+    expect(a, [&] { recorder.NotePendingWordFill(a.htileAddress, htileBytes, 0xffffffffu); }, DepthLease::HtileNote, "a GPU fill over the HTILE noted");
+    expect(a, none, DepthLease::WouldHit, "the call after the HTILE fill (still pending)");
+    expect(a, settle, DepthLease::Reaped, "the batch holding the HTILE fill finished");
+    expect(a, none, DepthLease::WouldHit, "the call after the reap");
+    {
+        const auto before = DepthLeaseTotals();
+        expect(a, [&] { recorder.NotePendingWrite(unrelated, 256); }, DepthLease::WouldHit, "a write noted outside the target");
+        Require(DepthLeaseTotals().hitsWriteGeneration > before.hitsWriteGeneration, "D5-0: a would-hit across a writeGeneration move was not counted apart");
+    }
+    Require(outcomeOf(b, none) != DepthLease::WouldHit, "D5-0: the first call of a second target would hit");
+    expect(a, none, DepthLease::Surfaces, "another target's surface created");
+    expect(b, none, DepthLease::PlaneBinds, "the first target bound its planes");
+    expect(a, none, DepthLease::PlaneBinds, "the second target bound its planes");
+    expect(a, none, DepthLease::WouldHit, "a call after the other target's");
+    expect(a, [&] { RetireDepthSurfaces(context.device, a.address, block); }, DepthLease::Unretired, "the surface retired, then un-retired by the call");
+    expect(a, none, DepthLease::WouldHit, "the call after the un-retire");
+    expect(a, [&] { NoteHtileDepthClear(c.htileAddress, htileBytes); }, DepthLease::ClearedHtile, "a cleared HTILE set for no resident surface");
+    // The third target takes that cleared HTILE (it lies over its HTILE), so nothing stays behind.
+    Require(outcomeOf(c, none) != DepthLease::WouldHit, "D5-0: the first call of a third target would hit");
+    expect(a, none, DepthLease::Surfaces, "the third target's surface created");
+    expect(a, none, DepthLease::WouldHit, "a call after the third target's");
+    {
+        const auto before = DepthLeaseTotals();
+        BumpCollectEpoch();
+        view(a);
+        const auto after = DepthLeaseTotals();
+        Require(after.outcomes[static_cast<std::size_t>(DepthLease::Epoch)] == before.outcomes[static_cast<std::size_t>(DepthLease::Epoch)] + 1 && outcomes(after) == outcomes(before) + 1, "D5-0: an epoch bump did not miss as one");
+    }
+    expect(a, none, DepthLease::WouldHit, "the call after the epoch bump");
+    expect(a, [&] {
+        settle();
+        ClearDepthSurfaces(context.device);
+    }, DepthLease::Identity, "the surface cleared and created again");
+    const auto end = DepthLeaseTotals();
+    Require(end.hitWork[0] == start.hitWork[0] && end.hitWork[1] == start.hitWork[1] && end.hitWork[2] == start.hitWork[2], "D5-0: a would-hit's call still did work a lease would skip");
+    settle();
+    std::cout << "depth lease counter tests passed\n";
+    return true;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -12197,6 +12457,12 @@ int main(int argc, char** argv) {
         // surface size and key memos, without a device; the mode comes from the environment.
         if (argc == 2 && std::string_view(argv[1]) == "--target-memos-only") {
             targetMemoTests();
+            return 0;
+        }
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the DepthSurfaceView lease counter's
+        // classification and counts, without a device.
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-lease-classify-only") {
+            depthLeaseClassifyTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
@@ -12330,6 +12596,15 @@ int main(int argc, char** argv) {
             const bool keys = keyPinProofTests(device, recorder);
             if (!refreshKeyPinTests(device, recorder) || !keys) {
                 std::cout << "skipped, the device watches no memory or imports no watched host memory for the pinned key proofs\n";
+                return 77;
+            }
+            return 0;
+        }
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the lease counter over real
+        // DepthSurfaceView calls, as the environment sets it up; skipped (77) without write watching.
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-lease-only") {
+            if (!depthLeaseCounterTests(device, recorder)) {
+                std::cout << "skipped, the device watches no memory for the depth lease counter\n";
                 return 77;
             }
             return 0;
@@ -12623,6 +12898,8 @@ int main(int argc, char** argv) {
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
+        depthLeaseClassifyTests();
+        static_cast<void>(depthLeaseCounterTests(device, recorder));
         multisampleGuestAccessTests(device, recorder);
         tiledResolveTests(device, recorder);
         fmaskDecompressMsaaTests(device, recorder);
