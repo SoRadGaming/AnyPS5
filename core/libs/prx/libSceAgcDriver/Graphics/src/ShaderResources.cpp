@@ -3116,7 +3116,11 @@ void reportCollectLeaseExperiment() {
 // =2's check of one record the lease predicts held, just before today's collect of it: under the
 // proof's key the record's range must be covered (the coverage is this thread's and only grows under
 // a key, so nothing races it); a key moved since the proof's start voids the prediction (=1 would fail
-// that proof at its end).
+// that proof at its end). The coverage is tested under the key just compared, not a second read of it
+// (CollectCoveredUnder): another thread's unwatch or mapping move landing between the compare and a
+// second read would test the coverage, still filled under the proof's key (no collect of this thread
+// ran between), against the new key, and abort on a difference =1 cannot have (its skip took that
+// move as landing just after today's collect).
 void verifyCollectLease(const void* object, const GuestMemory::CollectMemoKey& key, std::uint32_t gen, std::uint64_t address, std::size_t bytes, bool storage, std::size_t record) {
     auto& e = CollectLeaseExperiments();
     e.predicted.fetch_add(1, std::memory_order_relaxed);
@@ -3126,7 +3130,7 @@ void verifyCollectLease(const void* object, const GuestMemory::CollectMemoKey& k
         if (e.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[collect-lease] APS5_EXPERIMENT_COLLECT_LEASE=2: void: object %p %s record %zu (0x%llx+0x%zx) was predicted held under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which moved to {epoch %llu, unwatch %llu, mapping %llu} before its collect\n", object, storage ? "storage" : "sampled", record, static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(key.epoch), static_cast<unsigned long long>(key.unwatched), static_cast<unsigned long long>(key.mapping), static_cast<unsigned long long>(now.epoch), static_cast<unsigned long long>(now.unwatched), static_cast<unsigned long long>(now.mapping));
         return;
     }
-    if (!GuestMemory::CollectCovered(address, bytes)) {
+    if (!GuestMemory::CollectCoveredUnder(key, address, bytes)) {
         std::fprintf(stderr, "[collect-lease] APS5_EXPERIMENT_COLLECT_LEASE=2: object %p %s record %zu (0x%llx+0x%zx) is leased at generation %u under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which still holds, but the thread's coverage does not hold its range: today's collect would not be the coverage hit =1 replaces it with\n", object, storage ? "storage" : "sampled", record, static_cast<unsigned long long>(address), bytes, static_cast<unsigned>(gen), static_cast<unsigned long long>(key.epoch), static_cast<unsigned long long>(key.unwatched), static_cast<unsigned long long>(key.mapping));
         std::fflush(stderr);
         std::abort();
@@ -3315,11 +3319,12 @@ std::uint64_t ShaderResources::leaseCollect(CollectLeaseProof& proof, std::uint3
         } else if (held) {
             profile.wouldSkip.fetch_add(1, std::memory_order_relaxed);
             // The =2 check, as a counter (V0, switch unset; =2 checks it itself, =1 skips the collect):
-            // under the proof's key the range must still be covered.
+            // under the proof's key the range must still be covered (tested under that key, not a
+            // second read of it, which another thread's move could turn into a false W).
             if (proof.mode == 0) {
                 if (GuestMemory::CurrentCollectMemoKey() != proof.key) {
                     profile.voided.fetch_add(1, std::memory_order_relaxed);
-                } else if (!GuestMemory::CollectCovered(address, bytes)) {
+                } else if (!GuestMemory::CollectCoveredUnder(proof.key, address, bytes)) {
                     profile.wrong.fetch_add(1, std::memory_order_relaxed);
                     if (profile.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[collect-lease] W: object %p would skip the collect of 0x%llx+0x%llx under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which does not cover it\n", static_cast<const void*>(this), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(proof.key.epoch), static_cast<unsigned long long>(proof.key.unwatched), static_cast<unsigned long long>(proof.key.mapping));
                 }

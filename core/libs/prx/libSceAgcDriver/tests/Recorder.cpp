@@ -4940,8 +4940,14 @@ struct InputLeaseTestGate final : AgcDriver::GuestMemory::ISpeculativeReadGate {
 // image over a vertex range: P does not hold and today's path flushes it; (f) an image dirty only in
 // another slice: P does not hold over the slice with no pending unit, nor after units are added there
 // without a PendingSerial bump; (o) with no flush hook installed the hook arguments are cleared on
-// return, and a later hook does not skip; (p) an addition without the GpuMutex turns row P off for
-// good (the next input holds no point; =2 prints U and does not abort; last, as the switch stays off).
+// return, and a later hook does not skip, at the S they would carry nor at another; (p) a storage image
+// marked dirty by a thread without the GpuMutex (markLayersPending's real addition site) turns row P
+// off for good (counted once; the next vertex input over it holds no point and today's path flushes
+// it; =2 prints U and does not abort), and so does MarkShadowed's call made directly from such a
+// thread (last, as the switch stays off). Not tested here (open gaps): (g) MarkShadowed over the range
+// (a unit-shadow slab needs a watched host import), and (l) that FlushDepthPlanes still runs where row
+// P holds, with and without HookFlushCpuBlocks (no depth plane fixture in this test; the
+// _hook_flush rows check only the holds).
 // `death` (=2): the coverage dropped under the same key (C); an in-between vertex entry kept without its
 // set serial's bump (M); a pending image hidden from row P's query (P1), and the same with a removal's
 // PendingSerial bump between the prediction and today's call (P2), which must not excuse it: the next
@@ -5295,14 +5301,42 @@ bool drawInputLeaseTests(const Device& device, Recorder& recorder, std::unique_l
     Require(!InputLeaseHookArgsSet(), "(o) the flush hook's arguments outlived CopyDrawInput's FlushGpuWrites");
     Require(equalsGuest(unhooked), "(o) a draw input without a flush hook differs from guest memory");
     expectRows(Any, Any, 0, 1, "(o) row P held without a flush hook");
+    // First at the S arguments left behind would still carry (a hold or prediction there could only be
+    // theirs), then at another S.
+    FlushGpuWrites(address, size);
+    expectRows(0, 0, 0, 0, "(o) a later flush hook at the same S skipped with arguments left behind");
     StorageTexture::BumpPendingSerial();
     FlushGpuWrites(address, size);
-    expectRows(0, 0, 0, 0, "(o) a later flush hook skipped with arguments left behind");
-    // (p) The kill switch (last: it stays on).
+    expectRows(0, 0, 0, 0, "(o) a later flush hook at another S skipped with arguments left behind");
+    // (p) The kill switch (last: it stays on), first through a real addition site: markLayersPending's
+    // push, counted before it lands whenever InputLeaseViewed() (so without APS5_PROFILE_DRAW too).
+    const bool killed = mode != 0 && rowP;
+    {
+        auto image = pendingImage(flat);
+        const auto killedBefore = InputLeaseExperimentNow().pKilled;
+        std::thread([&] {
+            try {
+                Require(!GpuMutex().HeldByThisThread(), "(p) the marking thread holds the GpuMutex");
+                image->MarkDirty();
+            } catch (const std::exception& error) {
+                failure = error.what();
+            }
+        }).join();
+        Require(failure.empty(), failure);
+        Require(image->Dirty(), "(p) the storage image marked dirty without the GpuMutex did not go pending");
+        Require(PendingRowOff() == killed && InputLeaseExperimentNow().pKilled - killedBefore == (killed ? 1u : 0u), "(p) a storage image marked dirty without the GpuMutex did not turn row P off once, or turned it off with the switch unset or row P left out");
+        static_cast<void>(vertexInput(images, 4096));
+        expectRows(Any, Any, 0, 1, "(p) row P held over a storage image marked dirty without the GpuMutex");
+        Require(!image->Dirty(), "(p) the storage image marked dirty without the GpuMutex was not flushed");
+        recorder.Sync();
+    }
+    // MarkShadowed's site cannot be driven here: its call, made directly from a thread without the
+    // GpuMutex, counts one more kill while the switch applies row P.
+    const auto killedBefore = InputLeaseExperimentNow().pKilled;
     std::thread([] { NotePendingAddition(PendingAdditionSite::Shadow); }).join();
-    Require(PendingRowOff() == (mode != 0 && rowP), "(p) an addition without the GpuMutex did not turn row P off, or turned it off with the switch unset");
+    Require(PendingRowOff() == killed && InputLeaseExperimentNow().pKilled - killedBefore == (killed ? 1u : 0u), "(p) MarkShadowed's addition without the GpuMutex was not counted, or turned row P off with the switch unset or row P left out");
     Require(equalsGuest(index()), "(p) a draw input after the kill switch differs from guest memory");
-    if (mode != 0 && rowP) {
+    if (killed) {
         expectRows(Any, Any, 0, 1, "(p) row P held after the kill switch");
     } else {
         expectRows(Any, Any, 1, 1, "(p) row P stopped holding without the switch");

@@ -1068,9 +1068,9 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     // publish is all FlushPending would do (one registry scan, not two).
     bool stored = false;
     std::size_t images = 0, evicted = 0;
-    // Row P: nothing pending, flushing or shadowed over the input at S, so the branch below would
-    // keep, store and publish nothing (=2 runs it and checks that).
-    const auto nothingPendingAt = leaseSkip.At();
+    // Row P: nothing pending, flushing or shadowed over the input at S, so the branch below would keep,
+    // store and publish nothing (=2 runs it and checks that; FlushPending decides after FlushDepthPlanes).
+    const auto nothingPendingAt = leaseSkip.At(HookFlushCpuBlocks());
     const bool kept = nothingPendingAt == 0 && !HookFlushCpuBlocks() && StorageTexture::AccessKeptByCpu(address, bytes, &images, &evicted);
     if (nothingPendingAt != 0 && !HookFlushCpuBlocks()) {
     } else if (kept || (images == 0 && !HookFlushCpuBlocks())) {

@@ -219,7 +219,8 @@ public:
     // overlapping pending image, as before). `nothingPendingAt` (LOCAL EXPERIMENT,
     // APS5_EXPERIMENT_INPUT_LEASES row P, REVALIDATE-PLAN 5.2): a draw input's S; while it holds
     // (PendingRowStill) nothing is pending, flushing or shadowed over the range, so the call returns
-    // after FlushDepthPlanes, as the scan would (0, the default: today's call).
+    // after FlushDepthPlanes, as the scan would (0, the default: today's call). At =2 it never
+    // returns there: the caller's prediction is taken there (PendingRowSkip), and today's call runs.
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, std::uint64_t nothingPendingAt = 0);
     static void FlushAllPending(const char* reason);
     static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);

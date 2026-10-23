@@ -62,6 +62,21 @@ using OwnAdditions = HostThreadSlot<std::uint64_t, OwnAdditionsTag>;
 struct HookArgsTag {};
 using HookArgsSlot = HostThreadSlot<const InputLeaseHookArgs::Data*, HookArgsTag>;
 std::atomic<void (*)()> pendingProbeHook{nullptr};
+// =2: the PendingDecision armed for the thread's next FlushPending skip point (PendingRowSkip).
+struct DecisionTag {};
+using DecisionSlot = HostThreadSlot<InputLeaseShadow::PendingDecision*, DecisionTag>;
+
+// Arms `decision` for the scope; the slot's previous value comes back at its end.
+class ArmedDecision {
+public:
+    explicit ArmedDecision(InputLeaseShadow::PendingDecision& decision) : previous(DecisionSlot::Get()) { DecisionSlot::Set(&decision); }
+    ~ArmedDecision() { DecisionSlot::Set(previous); }
+    ArmedDecision(const ArmedDecision&) = delete;
+    ArmedDecision& operator=(const ArmedDecision&) = delete;
+
+private:
+    InputLeaseShadow::PendingDecision* previous;
+};
 
 Experiment& experiment() {
     static auto* counts = new Experiment();
@@ -147,13 +162,20 @@ void reportInputLeases() {
     const auto mTotal = n.mWould + n.mNoLease + n.mMoved;
     const double projection = 1.5 * ratio(n.pMemo, pTotal) + 0.85 * ratio(n.pQuery, pTotal) - 0.5 * ratio(n.pPending + n.pFlushing + n.pShadow, pTotal) + 0.4 * ratio(n.cWould, cTotal) + 0.8 * ratio(n.mWould, mTotal) + 0.31 - 0.2;
     using U = unsigned long long;
-    AgcDriver::ProfilePrint_nid_no_patch("[input-lease] (10 s): calls index %llu vertex %llu (in place %llu): reused %llu, copied %llu, padding refusals %llu; probes: present %llu, inserted %llu, evicted %llu, without the GpuMutex %llu; P: memo would-hold %llu, query nothing-over %llu, overlap pending %llu flushing %llu shadow %llu, query refused: serial moved %llu, serial 0 %llu, PendingSerial bumps %llu, PendingAdditions bumps %llu, U mark %llu lent %llu reconcile %llu shadow %llu; C: would-hold %llu, misses: no key %llu, owner %llu, epoch %llu, unwatch %llu, mapping %llu, not covered %llu; W %llu; M: would-hold %llu, misses: no lease %llu, set serial moved %llu; wrong %llu; held together %llu; projection %.2f points\n",
+    // LOCAL EXPERIMENT (L1): W and M `wrong` are shadow checks of a row the switch does not apply: n/a
+    // while it applies the row (=1 takes the hold unchecked, =2 aborts on a difference instead), not a
+    // 0 that reads as a passed check.
+    char wrongC[24] = "n/a";
+    char wrongM[24] = "n/a";
+    if (!InputLeaseRowOn(InputLeaseRow::C)) std::snprintf(wrongC, sizeof(wrongC), "%llu", static_cast<U>(n.cWrong));
+    if (!InputLeaseRowOn(InputLeaseRow::M)) std::snprintf(wrongM, sizeof(wrongM), "%llu", static_cast<U>(n.mWrong));
+    AgcDriver::ProfilePrint_nid_no_patch("[input-lease] (10 s): calls index %llu vertex %llu (in place %llu): reused %llu, copied %llu, padding refusals %llu; probes: present %llu, inserted %llu, evicted %llu, without the GpuMutex %llu; P: memo would-hold %llu, query nothing-over %llu, overlap pending %llu flushing %llu shadow %llu, query refused: serial moved %llu, serial 0 %llu, PendingSerial bumps %llu, PendingAdditions bumps %llu, U mark %llu lent %llu reconcile %llu shadow %llu; C: would-hold %llu, misses: no key %llu, owner %llu, epoch %llu, unwatch %llu, mapping %llu, not covered %llu; W %s; M: would-hold %llu, misses: no lease %llu, set serial moved %llu; wrong %s; held together %llu; projection %.2f points\n",
         static_cast<U>(n.indexCalls), static_cast<U>(n.vertexCalls), static_cast<U>(n.inPlace), static_cast<U>(n.reused), static_cast<U>(n.copied), static_cast<U>(n.padding),
         static_cast<U>(n.present), static_cast<U>(n.inserted), static_cast<U>(n.evicted), static_cast<U>(n.withoutGpuMutex),
         static_cast<U>(n.pMemo), static_cast<U>(n.pQuery), static_cast<U>(n.pPending), static_cast<U>(n.pFlushing), static_cast<U>(n.pShadow), static_cast<U>(n.pMoved), static_cast<U>(n.pNoSerial), static_cast<U>(serialBumps), static_cast<U>(additionBumps),
         static_cast<U>(n.unlocked[0]), static_cast<U>(n.unlocked[1]), static_cast<U>(n.unlocked[2]), static_cast<U>(n.unlocked[3]),
-        static_cast<U>(n.cWould), static_cast<U>(n.cNoKey), static_cast<U>(n.cOwner), static_cast<U>(n.cEpoch), static_cast<U>(n.cUnwatch), static_cast<U>(n.cMapping), static_cast<U>(n.cNotCovered), static_cast<U>(n.cWrong),
-        static_cast<U>(n.mWould), static_cast<U>(n.mNoLease), static_cast<U>(n.mMoved), static_cast<U>(n.mWrong), static_cast<U>(n.held), projection);
+        static_cast<U>(n.cWould), static_cast<U>(n.cNoKey), static_cast<U>(n.cOwner), static_cast<U>(n.cEpoch), static_cast<U>(n.cUnwatch), static_cast<U>(n.cMapping), static_cast<U>(n.cNotCovered), wrongC,
+        static_cast<U>(n.mWould), static_cast<U>(n.mNoLease), static_cast<U>(n.mMoved), wrongM, static_cast<U>(n.held), projection);
 }
 
 // LOCAL EXPERIMENT (L1): the =2 line every 10 s (from the first input on), with or without
@@ -313,6 +335,23 @@ std::uint64_t OwnPendingAdditions() {
 
 bool PendingRowStill(std::uint64_t serial) {
     return serial != 0 && !pendingRowOff.load(std::memory_order_seq_cst) && StorageTexture::PendingSerial() == serial;
+}
+
+bool PendingRowSkip(std::uint64_t serial) {
+    const int mode = InputLeases();
+    if (mode == 1) {
+        if (!PendingRowStill(serial)) return false;
+        add(experiment().pHeld);
+        return true;
+    }
+    if (mode == 2) {
+        if (auto* decision = DecisionSlot::Get(); decision != nullptr) {
+            DecisionSlot::Set(nullptr);
+            decision->prediction = decision->shadow->PredictPending();
+            decision->taken = true;
+        }
+    }
+    return false;
 }
 
 bool PendingRowOff() {
@@ -479,13 +518,16 @@ InputLeaseShadow::InputLeaseShadow(Recorder* recorder, std::uint64_t address, st
     if (lease == nullptr) return;
     lease->mapHeld = false;
     // LOCAL EXPERIMENT (L1 row P): the S the row holds the input at, from the lease or the query.
-    if (InputLeases() != 0) {
-        if (InputLeaseRowOn(InputLeaseRow::P)) pAt = pendingRowAt(*lease, address, bytes, counting);
+    if (InputLeaseRowOn(InputLeaseRow::P) && !PendingRowOff()) {
+        pAt = pendingRowAt(*lease, address, bytes, counting);
         pHeld = pAt != 0;
         return;
     }
-    // I0's row P (PendingRowAt), a shadow prediction, only with the switch unset: the lease's answer
-    // while PendingSerial is still the S it held at, else the query, whose answer the lease keeps.
+    // I0's row P (PendingRowAt), a shadow prediction, while the row is not applied (the switch unset,
+    // row P left out of APS5_EXPERIMENT_INPUT_LEASE_ROWS, or turned off by the kill switch; pAt stays
+    // 0, so nothing skips), so the P columns and `held` keep counting what the row would hold: the
+    // lease's answer while PendingSerial is still the S it held at, else the query, whose answer the
+    // lease keeps.
     if (!counting) return;
     if (lease->pendingAt != 0 && StorageTexture::PendingSerial() == lease->pendingAt) {
         add(c.pMemo);
@@ -537,16 +579,23 @@ void InputLeaseShadow::InPlace() {
 
 void InputLeaseShadow::FlushPending(std::uint64_t address, std::size_t bytes) {
     const int mode = pAt != 0 ? InputLeases() : 0;
+    // =1: FlushPending decides the skip, and counts it, after its FlushDepthPlanes (PendingRowSkip).
     if (mode == 1) {
-        if (PendingRowStill(pAt)) add(experiment().pHeld);
         static_cast<void>(StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input", PublishScope::Whole, nullptr, pAt));
         return;
     }
+    // =2: today's call, passed S under an armed decision: the prediction is taken at =1's decision
+    // point, after FlushDepthPlanes (a plane store there moves PendingSerial, and =1 then does not
+    // skip), where the call never returns at =2. A call that did not reach it is not checked.
     if (mode == 2) {
-        const auto prediction = PredictPending();
+        PendingDecision decision{this};
         bool published = false;
-        const bool stored = StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input", PublishScope::Whole, &published);
-        VerifyPending(prediction, stored || published, "InPlaceDrawInput's FlushPending (skip point (a))");
+        bool stored = false;
+        {
+            const ArmedDecision armed(decision);
+            stored = StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input", PublishScope::Whole, &published, pAt);
+        }
+        if (decision.taken) VerifyPending(decision.prediction, stored || published, "InPlaceDrawInput's FlushPending (skip point (a))");
         return;
     }
     static_cast<void>(StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input"));
@@ -607,20 +656,44 @@ InputLeaseHookSkip::InputLeaseHookSkip(std::uint64_t address, std::size_t bytes)
     if (data->address == address && data->bytes == bytes) args = data;
 }
 
-std::uint64_t InputLeaseHookSkip::At() {
+InputLeaseHookSkip::~InputLeaseHookSkip() {
+    if (armed) DecisionSlot::Set(previous);
+}
+
+std::uint64_t InputLeaseHookSkip::At(bool flushBlocks) {
     if (args == nullptr) return 0;
     if (InputLeases() == 1) {
         if (!PendingRowStill(args->serial)) return 0;
-        add(experiment().pHeld);
+        // Without HookFlushCpuBlocks the hook skips here; with it FlushPending decides, and counts, after
+        // its FlushDepthPlanes.
+        if (!flushBlocks) add(experiment().pHeld);
         return args->serial;
     }
-    prediction = args->shadow->PredictPending();
-    return 0;
+    // =2: the skip point is here without HookFlushCpuBlocks; with it, FlushPending's decision point
+    // (PendingRowSkip, after FlushDepthPlanes, never a skip at =2), reached by passing S, where the
+    // decision armed here takes the prediction.
+    if (!flushBlocks) {
+        prediction = args->shadow->PredictPending();
+        return 0;
+    }
+    decision = {args->shadow};
+    previous = DecisionSlot::Get();
+    DecisionSlot::Set(&decision);
+    armed = true;
+    return args->serial;
 }
 
 void InputLeaseHookSkip::Verify(bool stored, bool published, bool kept, std::size_t images) {
     if (args == nullptr || InputLeases() != 2) return;
-    args->shadow->VerifyPending(prediction, stored || published || kept || images != 0, "the flush hook of CopyDrawInput's FlushGpuWrites (skip point (b))");
+    const bool effect = stored || published || kept || images != 0;
+    const char* point = "the flush hook of CopyDrawInput's FlushGpuWrites (skip point (b))";
+    if (armed) {
+        DecisionSlot::Set(previous);
+        armed = false;
+        if (decision.taken) args->shadow->VerifyPending(decision.prediction, effect, point);
+        return;
+    }
+    args->shadow->VerifyPending(prediction, effect, point);
 }
 
 std::uint64_t InputLeaseShadow::countedCollect(std::uint64_t address, std::size_t bytes) {
@@ -631,9 +704,11 @@ std::uint64_t InputLeaseShadow::countedCollect(std::uint64_t address, std::size_
     const auto owner = GuestMemory::CollectCoverageOwner();
     if (countCollectRow(c, *lease, key, owner)) {
         cHeld = true;
-        // The =2 check, as a counter (I0, the switch unset): the coverage is this thread's, so nothing
-        // races it.
-        if (InputLeases() == 0 && !GuestMemory::CollectCovered(address, bytes)) {
+        // The =2 check, as a counter (I0, row C not applied: the switch unset or the row left out of
+        // APS5_EXPERIMENT_INPUT_LEASE_ROWS): the coverage is this thread's, so nothing races it; tested
+        // under the key read above, not a second read, which another thread's move could turn into a
+        // false W.
+        if (!GuestMemory::CollectCoveredUnder(key, address, bytes)) {
             add(c.cWrong);
             if (printWrong()) AgcDriver::ProfilePrint_nid_no_patch("[input-lease] W: the lease of 0x%llx+0x%llx held under collect memo key {epoch %llu, unwatch %llu, mapping %llu} but its range is not covered\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(key.epoch), static_cast<unsigned long long>(key.unwatched), static_cast<unsigned long long>(key.mapping));
         }

@@ -4588,8 +4588,9 @@ void waitForIdlePublish(const char* reason) {
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, std::uint64_t nothingPendingAt) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
-    // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row P, 5.2): nothing over the range at S.
-    if (nothingPendingAt != 0 && PendingRowStill(nothingPendingAt)) return false;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row P, 5.2): nothing over the range at S (=2: the
+    // prediction is taken here, after FlushDepthPlanes, and the call goes on).
+    if (nothingPendingAt != 0 && PendingRowSkip(nothingPendingAt)) return false;
     if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
         queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
         return false;

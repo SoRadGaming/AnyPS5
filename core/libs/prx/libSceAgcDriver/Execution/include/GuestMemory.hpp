@@ -242,7 +242,8 @@ CollectMemoKey CurrentCollectMemoKey();
 // under its current collect memo key (false without one): its next collect of the range is then a
 // memo hit that walks nothing, and stays one while the key holds (coverage only grows under a key).
 bool CollectCovered(std::uint64_t address, std::size_t bytes);
-// LOCAL EXPERIMENT (REVALIDATE-PLAN 5.6, L1 row C's =2 check): CollectCovered under `key` instead of
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 5.6 and 6: the =2 checks of L1 row C and L2, and the I0/V0 W
+// counters): CollectCovered under `key` instead of
 // the thread's current key: whether the thread's coverage, last filled under `key`, holds the range
 // (false for an invalid key or coverage filled under another one). The coverage changes only by the
 // thread's own collects, so between two of them this is the answer CollectCovered gave while `key`
