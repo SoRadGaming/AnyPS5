@@ -32,14 +32,20 @@ inline bool On() {
     return on;
 }
 
-// LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): the GPU-wait clock below (ThreadGpuWait) also
-// runs under the GDS counters, whose per-packet CPU wait it gives without APS5_PROFILE_DRAW (the
-// spans Recorder::ThreadWaitedMs counts only under that switch). Read once.
-inline bool WaitClockOn() {
-    static const bool on = On() || [] {
+// LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): the GDS counters' switch, read once (Drain::GdsOn
+// reads it too). The GPU-wait clock below (ThreadGpuWait) also runs under it, giving the per-packet
+// CPU wait without APS5_PROFILE_DRAW (the spans Recorder::ThreadWaitedMs counts only under that
+// switch).
+inline bool GdsStatsOn() {
+    static const bool on = [] {
         const char* text = std::getenv("APS5_DEBUG_GDS_STATS");
         return text != nullptr && text[0] != '\0' && text[0] != '0';
     }();
+    return on;
+}
+
+inline bool WaitClockOn() {
+    static const bool on = On() || GdsStatsOn();
     return on;
 }
 
@@ -166,13 +172,26 @@ inline constinit Counters counters;
 struct ThreadGpuWaitTag {};
 using ThreadGpuWait = HostThreadSlot<std::uint64_t, ThreadGpuWaitTag>;
 
+// LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): the queue slot + 1 of the GDS DMA_DATA record
+// armed on this thread (Drain::PacketRecord; 0: none, and always 0 without the GDS counters). Its
+// GPU waits also run that slot's GDS-wait clock as they end (NoteGdsGpuWait, DrainStats.cpp), which
+// the 0x93 blame reads over a queue-0 wait.
+struct ThreadGdsSlotTag {};
+using ThreadGdsSlot = HostThreadSlot<std::uint32_t, ThreadGdsSlotTag>;
+void NoteGdsGpuWait(std::uint32_t slot, std::uint64_t ns);
+
 // Times one GPU wait onto ThreadGpuWait (under either switch of WaitClockOn); off, nothing beyond
 // the switch's branch.
 class GpuWaitScope {
 public:
     GpuWaitScope() : startNs(WaitClockOn() ? NowNs() : 0) {}
     ~GpuWaitScope() {
-        if (startNs != 0) ThreadGpuWait::Set(ThreadGpuWait::Get() + (NowNs() - startNs));
+        if (startNs == 0) return;
+        const auto ns = NowNs() - startNs;
+        ThreadGpuWait::Set(ThreadGpuWait::Get() + ns);
+        if (GdsStatsOn()) {
+            if (const auto gds = ThreadGdsSlot::Get(); gds != 0) NoteGdsGpuWait(gds - 1u, ns);
+        }
     }
     GpuWaitScope(const GpuWaitScope&) = delete;
     GpuWaitScope& operator=(const GpuWaitScope&) = delete;

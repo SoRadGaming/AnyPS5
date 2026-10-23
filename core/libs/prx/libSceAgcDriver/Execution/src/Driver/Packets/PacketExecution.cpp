@@ -272,6 +272,9 @@ void Driver::execute(const Submission& submission) {
             const auto value = DrawPipeline::Queue0().PendingLabel(awaited, awaitedBytes);
             if (value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
                 ++waitOutcomes().fromRecorderSameQueue;
+                // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a GDS readback destination's
+                // touch, answered from a label queued after it (WaitHow::Queued).
+                Drain::NoteWaitTouch(submission.queue, awaited, awaitedBytes, Drain::WaitHow::Queued);
                 gateOpened() = true;
                 recent.Record(cursor);
                 cursor = nextCursor;
@@ -280,6 +283,8 @@ void Driver::execute(const Submission& submission) {
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet)) {
                 bumpEpoch(&EpochBumps::waits);
                 ++waitOutcomes().atEntry;
+                // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): as above, read from memory at entry.
+                Drain::NoteWaitTouch(submission.queue, awaited, awaitedBytes, Drain::WaitHow::Entry);
                 gateOpened() = true;
                 recent.Record(cursor);
                 cursor = nextCursor;

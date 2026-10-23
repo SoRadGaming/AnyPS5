@@ -127,6 +127,49 @@ int main() {
         Require(Contains(exact, depth.address, depth.address + depthBytes) && !Touches(exact, depth.address + depthBytes, depth.address + depthBytes + 1), "the exact depth range is not DepthSliceBytes");
         Require(Contains(exact, depth.stencilAddress, depth.stencilAddress + stencilBytes) && !Touches(exact, depth.stencilAddress + stencilBytes, depth.stencilAddress + stencilBytes + 1), "the exact stencil range is not DepthSliceBytes");
         for (const auto& [begin, end] : exact) Require(Contains(estimated, begin, end), "an exact range is not inside the estimates");
+        // DRAIN-PLAN D1 (O5): DrawHiddenWrites, the writes a queued draw may make outside the ranges
+        // above (its Enqueue flag), and a dispatch's written image table (unbounded).
+        {
+            using AgcDriver::DriverDetail::DrawHiddenWrites;
+            using Role = ShaderRecompiler::DescriptorRole;
+            const auto hidden = [](Role role, std::vector<bool> written, std::uint32_t bdaAbiVersion) {
+                ShaderRecompiler::RecompileResult shader;
+                shader.bdaAbiVersion = bdaAbiVersion;
+                ShaderRecompiler::DescriptorBinding binding{};
+                binding.kind = role == Role::ImageTable || role == Role::ImageStorageTable ? ShaderRecompiler::DescriptorKind::StorageImage : ShaderRecompiler::DescriptorKind::StorageBuffer;
+                binding.role = role;
+                binding.count = written.empty() ? 1u : static_cast<std::uint32_t>(written.size());
+                binding.imageWritten = std::move(written);
+                shader.bindings.push_back(binding);
+                const std::array<AgcDriver::Graphics::CompiledShader, 1> one{{{ShaderRecompiler::ShaderStage::Fragment, &shader, 0}}};
+                return DrawHiddenWrites(AgcDriver::Graphics::State{}, one);
+            };
+            Require(!DrawHiddenWrites(state, stages), "a draw whose only stores are declared storage images has hidden writes");
+            Require(hidden(Role::Gds, {}, 0), "a draw with a GDS binding has no hidden writes");
+            Require(hidden(Role::BdaPagetable, {}, 1), "a draw with a BDA page table has no hidden writes");
+            Require(!hidden(Role::FaultBuffer, {}, 1), "a rect-list fault buffer alone (an internal buffer) counts as a hidden write");
+            Require(hidden(Role::ImageTable, {false, true}, 0), "a draw storing through an image table element has no hidden writes");
+            Require(hidden(Role::ImageStorageTable, {true}, 0), "a draw storing through an image storage table has no hidden writes");
+            Require(!hidden(Role::ImageTable, {false, false}, 0), "a draw only sampling an image table has hidden writes");
+            Require(!DrawHiddenWrites(targets, none), "a depth target without HTILE is a hidden write");
+            auto htile = targets;
+            htile.depth->htileAddress = 0x500000000ull;
+            Require(DrawHiddenWrites(htile, none), "a depth target's HTILE is not a hidden write");
+            ShaderRecompiler::RecompileResult tableShader;
+            ShaderRecompiler::DescriptorBinding table{};
+            table.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+            table.role = Role::ImageTable;
+            table.count = 2;
+            table.imageWritten = {false, true};
+            tableShader.bindings.push_back(table);
+            bool tableBounded = true;
+            std::uint32_t tableRoles = 0;
+            static_cast<void>(AgcDriver::DriverDetail::DispatchWriteRanges(tableShader, tableBounded, &tableRoles));
+            Require(!tableBounded && (tableRoles & AgcDriver::DriverDetail::DispatchUnbounded::Image) != 0, "a dispatch storing through an image table is bounded");
+            tableShader.bindings[0].imageWritten = {false, false};
+            static_cast<void>(AgcDriver::DriverDetail::DispatchWriteRanges(tableShader, tableBounded, &tableRoles));
+            Require(tableBounded, "a dispatch only sampling an image table is unbounded");
+        }
         std::printf("draw write ranges: color %zu bytes (estimate %llu), depth %llu, stencil %llu\n", color.bytes, static_cast<unsigned long long>(2 * color.bytes + 65536), static_cast<unsigned long long>(depthBytes), static_cast<unsigned long long>(stencilBytes));
         std::puts("draw write ranges tests passed");
         return 0;

@@ -63,6 +63,13 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
             bounded = false;
             roles |= binding.role == ShaderRecompiler::DescriptorRole::Gds ? DispatchUnbounded::Gds : binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer ? DispatchUnbounded::Fault : DispatchUnbounded::Pagetable;
         }
+        // DRAIN-PLAN D1 (O5): stores through an image table (its written elements, bound as storage
+        // images over guest surfaces) are not declared here: unbounded, as an image without a full
+        // descriptor (A1 queues no item for it; the [stream] shadow classes count it as Image).
+        if (WritesImageTable(binding)) {
+            bounded = false;
+            roles |= DispatchUnbounded::Image;
+        }
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
@@ -181,13 +188,20 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     return ranges;
 }
 
+bool WritesImageTable(const ShaderRecompiler::DescriptorBinding& binding) {
+    if (binding.role != ShaderRecompiler::DescriptorRole::ImageTable && binding.role != ShaderRecompiler::DescriptorRole::ImageStorageTable) return false;
+    return std::find(binding.imageWritten.begin(), binding.imageWritten.end(), true) != binding.imageWritten.end();
+}
+
 bool DrawHiddenWrites(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
     if (graphics.depth && graphics.depth->htileAddress != 0) return true;
     for (const auto& stage : stages) {
         if (stage.program == nullptr) continue;
-        if (stage.program->bdaAbiVersion != 0) return true;
+        // A fault buffer alone (and the BDA ABI version that comes with it) is rect-list validation:
+        // an internal device buffer, never a guest address (DispatchClass::UnboundedFaultOnly). A page
+        // table is what lets a stage store through guest addresses.
         for (const auto& binding : stage.program->bindings) {
-            if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) return true;
+            if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || WritesImageTable(binding)) return true;
         }
     }
     return false;

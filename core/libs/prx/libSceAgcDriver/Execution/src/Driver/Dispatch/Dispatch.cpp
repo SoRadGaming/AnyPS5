@@ -131,7 +131,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (address == SkippedShader() && address != 0) return;
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
-    if (!registeredShader) registeredShader = ReadRawShader(address);
+    // DRAIN-PLAN D1: a queue-0 dispatch's prologue read is the one the hidden-write guard covers.
+    if (!registeredShader) registeredShader = ReadRawShader(address, submission.queue == 0);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
@@ -212,6 +213,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         // clear state), with no drain of their own when this dispatch is not first after a gate.
         // G-msaa and G-vfill drain queue 0 first (=1) or count (=2); C3's window exits there. Both
         // matchers read only code and user data, so no queued write changes whether a guard fires.
+        // Queue 0 only: another queue's dispatch has no record-order relation to queue 0's queued
+        // draws (labels order them, and a label queued behind a draw lands only at its commit).
         const int noteGuards = Drain::NoteGuards();
         const auto guardNote = [&](bool matched, Drain::Guard guard, Drain::GateExit exit) {
             if (!matched) return;
@@ -221,7 +224,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             Drain::NoteGuard(guard, drain);
             if (drain) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture, 0x15);
         };
-        const bool guardsLook = (noteGuards != 0 || Stream::On()) && indirectArguments == 0;
+        const bool guardsLook = (noteGuards != 0 || Stream::On()) && indirectArguments == 0 && submission.queue == 0;
         const auto guardsQueued = [&] { return (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) || (Stream::On() && Drain::GateWindowOpen()); };
         if (guardsLook && guardsQueued()) guardNote(Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads).has_value(), Drain::Guard::Msaa, Drain::GateExit::MsaaGuard);
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {

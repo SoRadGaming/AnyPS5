@@ -70,7 +70,7 @@ public:
     // `reads` are the guest ranges the commit reads (a draw's vertex and index data, a DMA copy's
     // source) that a deferred store must not change while the item is queued (HeldReads).
     // `hiddenWrites` (DRAIN-PLAN D1, from DrawHiddenWrites) says the commit may write guest memory
-    // that `writes` leaves out (BDA, fault-buffer or GDS stores, depth HTILE): HiddenWritesQueued.
+    // that `writes` leaves out (page-table, GDS or image-table stores, depth HTILE): HiddenWritesQueued.
     std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr, bool hiddenWrites = false);
     // An item without held reads that names its kind (label enqueues, the pipelined CPU-path
     // indirect draw).

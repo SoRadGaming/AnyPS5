@@ -3222,7 +3222,7 @@ if(BUILD_TESTING)
             # (whose preparation runs inside a PrepareScope).
             "stream_stats|APS5_DEBUG_STREAM_STATS=1"
             # LOCAL DEBUG (DRAIN-PLAN section 6, D0): the drain counters C0-C7 with the GDS counters
-            # (their per-packet GpuMutex hold, readback rings and wait records) on.
+            # (their per-packet records, readback rings, wait records and GDS-wait clocks) on.
             "drain_counters|APS5_DEBUG_STREAM_STATS=1,APS5_DEBUG_GDS_STATS=1"
             "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the

@@ -1066,9 +1066,14 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
     lock.unlock();
     const auto totals = takeStreamTotals();
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
-    // LOCAL DEBUG (DRAIN-PLAN C0): the window's tag (menu, entry, hold) from its presents and the
-    // draws committed per present; every D0 line of the window carries it.
-    const auto window = Drain::ClassifyWindow(totals.presents, counts.draws);
+    // LOCAL DEBUG (DRAIN-PLAN C0): the window's tag (menu, entry, hold; Drain::ClassifyWindow) from
+    // the draws committed per present, the window before, and the flush guard's queue-0 GPU wait
+    // for address-based leases (the guard's counts, section 11 below, are taken here for it); every
+    // D0 line of the window carries it.
+    const auto flushGuard = Graphics::TakeFlushGuardCounts();
+    std::uint64_t leaseQueue0Ns = 0;
+    for (std::size_t kind = 0; kind < Graphics::FlushWaitKinds; ++kind) leaseQueue0Ns += flushGuard.queue0GpuNs[kind][static_cast<std::size_t>(Graphics::FlushWaitClass::Lease)];
+    const auto window = Drain::TagWindow(totals.presents, counts.draws, leaseQueue0Ns);
     const auto* windowName = Drain::WindowName(window);
     std::string line;
     // Cells of one section are separated by commas, sections by semicolons.
@@ -1084,7 +1089,7 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
     const auto drainIdleNs = std::min(counts.drainIdleNs, counts.idleNs);
     const double busyDifference = counts.commitNs == 0 ? 0.0 : 100.0 * (static_cast<double>(busyNs) - static_cast<double>(counts.commitNs)) / static_cast<double>(counts.commitNs);
     const bool busyMatches = counts.commitNs != 0 && busyDifference <= 5.0 && busyDifference >= -5.0;
-    appendStream(line, "[stream] window=%s (%llu presents, %.0f draws per present)", windowName, count(totals.presents), totals.presents == 0 ? 0.0 : static_cast<double>(counts.draws) / static_cast<double>(totals.presents));
+    appendStream(line, "[stream] window=%s (%llu presents, %.0f draws per present, queue-0 lease waits %.1f ms)", windowName, count(totals.presents), totals.presents == 0 ? 0.0 : static_cast<double>(counts.draws) / static_cast<double>(totals.presents), streamMs(leaseQueue0Ns));
     appendStream(line, " (10 s, %.2f s measured) committer: busy %.1f ms (draws %.1f, labels %.1f, other %.1f)", static_cast<double>(wallNs) / 1e9, streamMs(busyNs), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Draw)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Label)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Other)]));
     appendStream(line, " vs [draw] pipelined commit time %.1f ms in %llu commits: %+.1f%%, %s", streamMs(counts.commitNs), count(counts.commits), busyDifference, busyMatches ? "within 5%" : "OFF BY MORE THAN 5%");
     appendStream(line, "; idle %.1f ms (%llu waits on an empty queue): drains %.1f ms (%.1f ms of it waking after the push)", streamMs(counts.idleNs), count(counts.idleWaits), streamMs(drainIdleNs), streamMs(counts.wakeNs));
@@ -1279,7 +1284,7 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
     // matched; and every condition that held per wait (no-import is looked for only when nothing
     // else held).
     {
-        const auto guard = Graphics::TakeFlushGuardCounts();
+        const auto& guard = flushGuard;
         appendStream(line, "; flush guard waits (wait/class n, wall ms, GPU ms, queue-0 GPU ms):");
         first = true;
         std::uint64_t skipWaits = 0, skipWallNs = 0, skipGpuNs = 0, skipQueue0Ns = 0;

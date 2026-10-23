@@ -30,19 +30,27 @@ inline bool GdsCounting() {
     static const bool on = GdsOn();
     return on;
 }
-// Either switch: the per-packet records of C1, C2 and C7 open.
+// Either switch: the per-packet records of C1, C2 and C7 open (and the thread's GPU-wait clock,
+// Stream::WaitClockOn, runs).
 inline bool PacketCounting() {
     static const bool on = Stream::On() || GdsCounting();
     return on;
 }
 
-// C0: what a [stream] window covers, from its presents and the draws committed per present: the
-// 60 Hz menu (many light frames), the hold (heavy frames), and the hub-entry transient between them
-// (and windows without presents: loading). The thresholds are MenuPresents and HoldDrawsPerPresent.
+// C0: what a [stream] window covers. Menu: light frames (fewer than LightDrawsPerPresent draws
+// committed per present; the boot and menu windows run 23-48) or no presents (loading). Entry: the
+// hub-entry transient, a heavy window that follows a light one, or one whose flush guard waited
+// EntryLeaseWaitNs or more of queue-0 GPU time for address-based leases (finish/lease: the cold
+// dispatch builds of DRAIN-PLAN S10; 786-841 ms in the r71/r72 transients, 0 in the hold). Hold:
+// every other heavy window. Neither draws per present nor presents part the transient from the hold:
+// its fly-in frames are as heavy (1,986-2,108 draws per present against the hold's 2,096-2,262),
+// and hold windows run 71-118 presents. ClassifyWindow is the rule; TagWindow applies it in window
+// order (the window before the first one counts as light).
 enum class Window : std::uint8_t { Menu, Entry, Hold, Count };
-inline constexpr std::uint64_t MenuPresents = 300;
-inline constexpr std::uint64_t HoldDrawsPerPresent = 2000;
-Window ClassifyWindow(std::uint64_t presents, std::uint64_t draws);
+inline constexpr std::uint64_t LightDrawsPerPresent = 200;
+inline constexpr std::uint64_t EntryLeaseWaitNs = 50'000'000;
+Window ClassifyWindow(std::uint64_t presents, std::uint64_t draws, std::uint64_t leaseQueue0Ns, Window previous);
+Window TagWindow(std::uint64_t presents, std::uint64_t draws, std::uint64_t leaseQueue0Ns);
 const char* WindowName(Window window);
 // Prints the window's D0 lines ([dma0], [gate-skip], [dispatch-guards], [zpass], [recipe] dispatch,
 // [dispatch-cache] indirect, and [gds] when APS5_DEBUG_GDS_STATS is on) and starts the next window.
@@ -52,13 +60,16 @@ void ReportWindow(Window window, bool print = true);
 
 // C1/C2: a DMA_DATA by what it moves (source to destination; Prefetch has no destination) and by the
 // way it went: Item (queued on the committer, APS5_PIPELINE_DMA), Nothing (no bytes, or ordered
-// already without a store), GpuStore (WriteLabelOnGpu reason 0), GpuCopy (CopyBuffer paths 1/3),
-// GpuFill (a DMA fill), CpuAfterWait / CpuIdle (moved on the CPU: a targeted GDS sync, a device
-// drain or a host copy, then Pm4::Execute or GuestMemory::Write; after a GPU wait or not), and
-// Fallback (WriteLabelOnGpu refused, its reason kept: 1 CPU store, 3/4/6 drained, 5 behind
-// completions).
+// already without a store), GpuStore (WriteLabelOnGpu reason 0, its bytes read on the CPU without a
+// GPU wait), GpuStoreAfterRead (the same after ResolveStore's CPU read of the source waited for the
+// GPU: a GDS readback's hook sync), GpuCopy (CopyBuffer paths 1/3), GpuFill (a DMA fill),
+// CpuAfterWait / CpuIdle (moved on the CPU: a targeted GDS sync or a host copy, then Pm4::Execute or
+// GuestMemory::Write; after a GPU wait or not), DeviceDrain (preparePacketMemory drained the device
+// for it, nothing named before), and Fallback (WriteLabelOnGpu refused, its reason kept: 1 CPU store,
+// 3/4/6 drained, 5 behind completions). A record's GPU wait is the thread's GPU-wait clock plus the
+// device drain's unlocked wait (NoteDeviceDrain), which that clock does not see.
 enum class DmaKind : std::uint8_t { ImmToMem, MemToMem, ImmToGds, MemToGds, GdsToMem, GdsToGds, Prefetch, Count };
-enum class DmaPath : std::uint8_t { Item, Nothing, GpuStore, GpuCopy, GpuFill, CpuAfterWait, CpuIdle, Fallback, Count };
+enum class DmaPath : std::uint8_t { Item, Nothing, GpuStore, GpuStoreAfterRead, GpuCopy, GpuFill, CpuAfterWait, CpuIdle, DeviceDrain, Fallback, Count };
 constexpr std::size_t DmaKinds = static_cast<std::size_t>(DmaKind::Count);
 constexpr std::size_t DmaPaths = static_cast<std::size_t>(DmaPath::Count);
 constexpr std::size_t FallbackReasons = 8;
@@ -72,14 +83,30 @@ void noteDmaPath(DmaPath path, int reason);
 inline void NoteDmaPath(DmaPath path, int reason = 0) {
     if (PacketCounting()) noteDmaPath(path, reason);
 }
+// C1: the GDS's unfinished writers (GdsTarget) as a store into the GDS starts its targeted sync,
+// sampled under that path's own GpuMutex hold (PacketMemory). Without it the record keeps the
+// lock-free snapshot it took at Arm (idle, or pending: in flight or open, not split).
+enum class GdsTarget : std::uint8_t { Idle, InFlight, Open, Pending, Count };
+void noteGdsTarget(GdsTarget target);
+inline void NoteGdsTarget(GdsTarget target) {
+    if (GdsCounting()) noteGdsTarget(target);
+}
+// C1, C2, C7: preparePacketMemory drained the device for the packet; `unlockedWaitNs` is its unlocked
+// wait for the recorded work (VulkanDevice::WaitRecorded, outside every Stream::GpuWaitScope). Names
+// the path DeviceDrain when nothing named it before, and adds the wait to the open record's GPU wait
+// (and to its queue's GDS-wait clock for a GDS packet).
+void noteDeviceDrain(std::uint64_t unlockedWaitNs);
+inline void NoteDeviceDrain(std::uint64_t unlockedWaitNs) {
+    if (PacketCounting()) noteDeviceDrain(unlockedWaitNs);
+}
 
 // One packet's record, on the queue worker that executes it (PacketExecution): a DMA_DATA (C2 on
 // queue 0 under stream stats; C1 for one that touches the GDS under GDS stats) or a ZPASS_DONE
 // sample dump (C7, queue 0 under stream stats). Start opens it, NoteDrain keeps the packet drain
 // (PacketExecution's queue-0 drain before the packet: its wait and the drain episode it opened), Arm
 // starts the packet's own part (after that drain: queue 0's work and GPU waits from here on; C1's
-// GDS writers then), Finish files it. A record destroyed without Finish (a predicated packet that
-// was skipped) counts nothing.
+// GDS writers then, from the lock-free pending-write snapshot: Arm takes no lock), Finish files it. A
+// record destroyed without Finish (a predicated packet that was skipped) counts nothing.
 class PacketRecord {
 public:
     PacketRecord() = default;
@@ -104,12 +131,13 @@ private:
     bool gds = false;
     bool drained = false;
     DmaKind kind = DmaKind::Prefetch;
-    std::uint8_t target = 0;
+    GdsTarget target = GdsTarget::Idle;
     std::uint32_t queue = 0;
     std::uint64_t drainWaitNs = 0;
     std::uint64_t episode = 0;
     std::uint64_t startNs = 0;
     std::uint64_t gpuWaitNs = 0;
+    std::uint64_t deviceDrainNs = 0;
     std::uint64_t destination = 0;
     std::size_t bytes = 0;
 };
@@ -128,12 +156,22 @@ void FileTaggedEpisode(std::uint16_t tag, std::uint64_t idleNs, std::uint64_t se
 // producer queue, the oldest aging out). Wait is a WAIT_REG_MEM on it (by the waiting queue and how
 // it was satisfied); DispatchArguments readDispatchArguments; CondExec a COND_EXEC; Predication a
 // predicated packet's test; DmaSource a later DMA_DATA's source; HookRead any other guest access
-// through the flush hook; Overwritten a CPU store or a label store over it first.
+// through the flush hook; Overwritten a CPU store or a label store over it first. Every wait counts
+// as a CPU use of the readback's value (gate (c), DRAIN-PLAN D2 fix 4: with the readback recorded on
+// the GPU no wait knows the value at record time, the recorder's label table included) except
+// Queued: queue 0's fast path answered it from a label queued after the readback (its value, not the
+// readback's).
 enum class Touch : std::uint8_t { Wait, DispatchArguments, CondExec, Predication, DmaSource, HookRead, Overwritten, AgedOut, Count };
-enum class WaitHow : std::uint8_t { Entry, Held, Stored, Table, Polled, Count };
+enum class WaitHow : std::uint8_t { Entry, Held, Stored, Table, Polled, Queued, Count };
 void noteTouch(Touch touch, std::uint64_t address, std::size_t bytes);
 inline void NoteTouch(Touch touch, std::uint64_t address, std::size_t bytes) {
     if (GdsCounting()) noteTouch(touch, address, bytes);
+}
+// A WAIT_REG_MEM that ended without Driver::waitMemory (queue 0's same-queue fast paths in
+// PacketExecution: Queued, or Entry when satisfied at entry), filed as a Wait touch.
+void noteWaitTouch(std::uint32_t queue, std::uint64_t address, std::size_t bytes, WaitHow how);
+inline void NoteWaitTouch(std::uint32_t queue, std::uint64_t address, std::size_t bytes, WaitHow how) {
+    if (GdsCounting()) noteWaitTouch(queue, address, bytes, how);
 }
 // GuestMemory's flush hook: a CPU access (a store when `store`).
 void noteGuestAccess(std::uint64_t address, std::size_t bytes, bool store);
@@ -142,8 +180,10 @@ inline void NoteGuestAccess(std::uint64_t address, std::size_t bytes, bool store
 }
 // Driver::waitMemory's record: the readback destinations it reads (taken at once, filed under Wait
 // with how it ended), and for queue 0 the 0x93 blame of a wait that polled: the producer queue of
-// the label that satisfied it and whether that queue spent time in a GDS DMA_DATA's GPU wait
-// meanwhile. The caller sets `how`, `producer` and `polled` before it returns.
+// the label that satisfied it, and how much of the wait that queue's GDS DMA_DATAs spent in GPU
+// waits meanwhile (its GDS-wait clock's advance over the wait, capped at the wait: waits are added
+// as they end, so one that began before this wait counts whole up to that cap). The caller sets
+// `how`, `producer` and `polled` before it returns.
 class WaitRecord {
 public:
     WaitRecord(std::uint32_t queueId, std::uint64_t awaited, std::size_t bytes) : active(GdsCounting()), queue(queueId) {
@@ -169,7 +209,6 @@ private:
     std::uint32_t taken = 0;
     std::uint64_t startNs = 0;
     std::array<std::uint64_t, QueueSlots> gdsWaitNs{};
-    std::array<bool, QueueSlots> inGds{};
 };
 
 // C3 (APS5_DEBUG_STREAM_STATS): DRAIN-PLAN D4's shadow. The queue-0 gate drain before a 0x15 that
@@ -191,13 +230,15 @@ bool GateWindowOpen();
 void GateCapture(std::uint64_t address, std::size_t bytes);
 void GateClose(GateExit exit);
 
-// LOCAL EXPERIMENT (DRAIN-PLAN D1): the queue-0 ordering guards. APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS
-// drains before TakeMultisampledSingleClear and NoteMemoryValueFill when items are queued (G-msaa,
-// G-vfill: both notes read guest memory and change state queued draws read at their commit);
-// APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN drains before an unregistered code read (ReadRawShader) or a
-// fill's input reads (drainPendingInputWrites) when a draw that may write guest memory it does not
-// declare is queued (HiddenWritesQueued). Each =1 drains, =2 only counts (C6); unset (or 0) is
-// today. Read once.
+// LOCAL EXPERIMENT (DRAIN-PLAN D1): the queue-0 ordering guards, on queue-0 dispatches only (other
+// queues have no record-order relation to queue 0's queued draws).
+// APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS drains before TakeMultisampledSingleClear and
+// NoteMemoryValueFill when items are queued (G-msaa, G-vfill: both notes read guest memory and change
+// state queued draws read at their commit); APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN drains before the
+// dispatch prologue's unregistered code read (ReadRawShader from Dispatch.cpp; its other callers,
+// draw decode and draw-cache validation, are not guarded) or a fill's input reads
+// (drainPendingInputWrites) when a draw that may write guest memory it does not declare is queued
+// (HiddenWritesQueued). Each =1 drains, =2 only counts (C6); unset (or 0) is today. Read once.
 int noteGuardMode();
 int hiddenWriteMode();
 inline int NoteGuards() {
@@ -212,9 +253,9 @@ inline int HiddenWriteDrain() {
 // C6: D1's guard conditions met with items queued (a hit), and the drains D1 made for them
 // (APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=1, APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=1). Counted under
 // stream stats or the guard's switch. Msaa: TakeMultisampledSingleClear's kernel; ValueFill: NoteMemoryValueFill's; the hidden
-// ones: an unregistered code read (ReadRawShader) or fill inputs (drainPendingInputWrites) with a
-// hidden-write draw queued and no overlap drain. Cumulative totals for the tests; the [dispatch-guards]
-// line prints each window's share.
+// ones: a queue-0 dispatch's unregistered code read (ReadRawShader) or fill inputs
+// (drainPendingInputWrites) with a hidden-write draw queued and no overlap drain. Cumulative totals
+// for the tests; the [dispatch-guards] line prints each window's share.
 enum class Guard : std::uint8_t { Msaa, ValueFill, HiddenShader, HiddenFill, Count };
 constexpr std::size_t Guards = static_cast<std::size_t>(Guard::Count);
 void NoteGuard(Guard guard, bool drained);

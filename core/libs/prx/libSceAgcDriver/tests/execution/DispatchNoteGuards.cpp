@@ -5,8 +5,8 @@
 //           that a queued draw's commit would consume early;
 //   G-vfill (the same switch): NoteMemoryValueFill reads a value a queued commit writes;
 //   hidden  (APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN): a queued draw that may write guest memory it does
-//           not declare (BDA, fault-buffer or GDS stores, depth HTILE: Enqueue's hiddenWrites) before
-//           an unregistered code read or a fill's input reads.
+//           not declare (page-table, GDS or image-table stores, depth HTILE: Enqueue's hiddenWrites)
+//           before a queue-0 dispatch's unregistered code read or a fill's input reads.
 // =1 drains (one drain, and the late reader sees the committed state), =2 and the [stream] counters
 // (APS5_DEBUG_STREAM_STATS=1) only count (Drain::GuardTotals), unset counts nothing. A blocker item
 // holds the committer until the test sees the guard; the dispatch under test follows a fill that
@@ -51,6 +51,10 @@ using namespace AgcDriver::DriverDetail;
 namespace Drain = AgcDriver::Drain;
 
 alignas(256) constexpr auto FillCode = PatternFillKernel;
+// The pattern fill kernel again at its own address, registered (RegisterFillCode) for the second
+// HiddenFill run: a dispatch of a registered program reads no raw code, so the fill's input reads are
+// its only guarded read.
+alignas(256) std::array<std::uint32_t, PatternFillKernel.size()> RegisteredFillCode = PatternFillKernel;
 alignas(256) std::array<std::uint32_t, 4> Pattern{};
 alignas(256) std::array<std::uint32_t, 4> Control{};
 alignas(256) std::array<std::uint32_t, 260> Output{};
@@ -110,15 +114,15 @@ std::array<std::uint32_t, 4> Descriptor(const void* pointer, std::uint32_t strid
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (stride << 16u), count, format};
 }
 
-void AppendPatternFill(std::vector<std::uint32_t>& words, const void* pattern, const void* control, void* output) {
+void AppendPatternFill(std::vector<std::uint32_t>& words, const void* pattern, const void* control, void* output, const void* code = FillCode.data()) {
     std::vector<std::uint32_t> data;
     for (const auto& descriptor : {Descriptor(pattern, 4, 4, 0x14004u), Descriptor(output, 4, 256, 0x14004u), Descriptor(control, 16, 1, 0x4dfacu)}) data.insert(data.end(), descriptor.begin(), descriptor.end());
-    Program(words, FillCode.data(), {64, 1, 1}, data);
+    Program(words, code, {64, 1, 1}, data);
     words.insert(words.end(), {0xc0031500u, 4, 1, 1, 0x41u | 0x8000u});
 }
 
-void AppendScratchFill(std::vector<std::uint32_t>& words) {
-    AppendPatternFill(words, ScratchPattern.data(), ScratchControl.data(), Scratch.data());
+void AppendScratchFill(std::vector<std::uint32_t>& words, const void* code = FillCode.data()) {
+    AppendPatternFill(words, ScratchPattern.data(), ScratchControl.data(), Scratch.data(), code);
 }
 
 // Holds the committer until released, then runs `then` (outside the GPU mutex) and takes the
@@ -256,15 +260,21 @@ void GuardValueFill(const Modes& modes) {
     for (std::size_t i = 0; i < 256; ++i) Require(ValueOutput[i] == New, "G-vfill: the fill did not store the value the queued commit wrote, at " + std::to_string(i));
 }
 
-void HiddenFill(const Modes& modes) {
+// A fill whose pattern a queued item rewrites at its commit (no writes declared, flagged hidden),
+// behind the gate-first scratch fill. Unregistered fill code: the dispatch prologue's raw code read
+// is the first guarded read and drains (=1), which leaves nothing queued for the input guard.
+// Registered (both fills; RegisterFillCode): no raw code read, so drainPendingInputWrites' hidden
+// branch is the guard that drains.
+void HiddenFill(const Modes& modes, bool registered) {
     constexpr std::uint32_t Old = 0x5a5a5a5au;
     constexpr std::uint32_t New = 0x3c3c3c3cu;
     Output.fill(0xcafebabeu);
     Pattern = {Old, 0, 0, 0};
     Control = {256, 0, 0, 0};
+    const void* code = registered ? static_cast<const void*>(RegisteredFillCode.data()) : static_cast<const void*>(FillCode.data());
     std::vector<std::uint32_t> words;
-    AppendScratchFill(words);
-    AppendPatternFill(words, Pattern.data(), Control.data(), Output.data());
+    AppendScratchFill(words, code);
+    AppendPatternFill(words, Pattern.data(), Control.data(), Output.data(), code);
     const auto before = Drain::GuardTotals();
     const auto shader = static_cast<std::size_t>(Drain::Guard::HiddenShader);
     const auto inputs = static_cast<std::size_t>(Drain::Guard::HiddenFill);
@@ -280,22 +290,47 @@ void HiddenFill(const Modes& modes) {
         const auto now = Drain::GuardTotals();
         return now.hits[shader] + now.hits[inputs] != before.hits[shader] + before.hits[inputs];
     };
+    const std::string name = registered ? "hidden write (registered fill)" : "hidden write";
     ReleaseWhen(blocker, seen, std::chrono::milliseconds(modes.CountsHidden() ? 10000 : 1500));
-    Finish("hidden write");
+    Finish(name.c_str());
     AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output.data()), sizeof(Output));
     const auto after = Drain::GuardTotals();
-    const auto hits = after.hits[shader] + after.hits[inputs] - before.hits[shader] - before.hits[inputs];
-    const auto drains = after.drains[shader] + after.drains[inputs] - before.drains[shader] - before.drains[inputs];
-    std::printf("dispatch note guards: hidden-write hits %llu, drains %llu, fill 0x%08x\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(drains), Output[0]);
-    Require(modes.CountsHidden() ? hits >= 1 : hits == 0, "hidden write: " + std::to_string(hits) + " hidden-write hits");
-    Require(drains == (modes.hidden == 1 ? 1u : 0u), "hidden write: " + std::to_string(drains) + " hidden-write drains, expected " + (modes.hidden == 1 ? "one" : "none"));
+    const auto shaderHits = after.hits[shader] - before.hits[shader];
+    const auto shaderDrains = after.drains[shader] - before.drains[shader];
+    const auto fillHits = after.hits[inputs] - before.hits[inputs];
+    const auto fillDrains = after.drains[inputs] - before.drains[inputs];
+    std::printf("dispatch note guards: %s: code-read hits %llu, drains %llu; fill-input hits %llu, drains %llu; fill 0x%08x\n", name.c_str(), static_cast<unsigned long long>(shaderHits), static_cast<unsigned long long>(shaderDrains), static_cast<unsigned long long>(fillHits), static_cast<unsigned long long>(fillDrains), Output[0]);
+    // The guard that meets the queued item first, and the other one.
+    const auto firstHits = registered ? fillHits : shaderHits;
+    const auto firstDrains = registered ? fillDrains : shaderDrains;
+    const auto laterHits = registered ? shaderHits : fillHits;
+    const auto laterDrains = registered ? shaderDrains : fillDrains;
+    const char* firstName = registered ? "fill-input" : "code-read";
+    const char* laterName = registered ? "code-read" : "fill-input";
+    Require(modes.hidden == 1 ? firstHits == 1 : modes.CountsHidden() ? firstHits >= 1 : firstHits == 0, name + ": " + std::to_string(firstHits) + " " + firstName + " hits");
+    Require(firstDrains == (modes.hidden == 1 ? 1u : 0u), name + ": " + std::to_string(firstDrains) + " " + firstName + " drains, expected " + (modes.hidden == 1 ? "one" : "none"));
+    Require(laterDrains == 0, name + ": " + std::to_string(laterDrains) + " " + laterName + " drains after the first guard");
+    // Under =1 the first guard's drain committed the item; a registered program reads no raw code.
+    // Counting only, the item is released at the first hit, so a later input read may still see it.
+    if (modes.hidden == 1 || !modes.CountsHidden() || registered) Require(laterHits == 0, name + ": " + std::to_string(laterHits) + " " + laterName + " hits after the first guard");
     if (modes.hidden == 1) {
-        for (std::size_t i = 0; i < 256; ++i) Require(Output[i] == New, "hidden write: the fill read its pattern ahead of the queued hidden write, at " + std::to_string(i));
+        for (std::size_t i = 0; i < 256; ++i) Require(Output[i] == New, name + ": the fill read its pattern ahead of the queued hidden write, at " + std::to_string(i));
     }
 }
 
+void RegisterFillCode() {
+    alignas(8) static ::Shader shader{};
+    shader.file_header = 0x34333231u;
+    shader.version = 0x18;
+    shader.header_size = sizeof(::Shader);
+    shader.shader_size = sizeof(RegisteredFillCode);
+    shader.code = RegisteredFillCode.data();
+    AgcDriverRegisterShader_nid_postfix(&shader);
+}
+
 // The raw code read alone, without a device (as tests/execution/QueuedRawShader.cpp): a queued item
-// flagged hidden that rewrites the code word.
+// flagged hidden that rewrites the code word. A read outside a queue-0 dispatch prologue (draw
+// decode, draw-cache validation, another queue's dispatch) is not guarded; the prologue's is.
 void HiddenRawShader(const Modes& modes) {
     alignas(256) static std::array<std::uint32_t, 64> code{};
     code.fill(0xbf810000u);
@@ -313,25 +348,32 @@ void HiddenRawShader(const Modes& modes) {
     }, {}, 0, {}, {}, DrawPipeline::ItemKind::Other, nullptr, true);
     while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
     Require(DrawPipeline::Queue0().HiddenWritesQueued() == 1, "hidden raw shader: a hidden-write item was not counted while queued");
-    // Released from here when the read drains (=1): the drain waits for this item.
-    std::thread releaser([&] {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(modes.hidden == 1 ? 10000 : 200);
-        while (Drain::GuardTotals().drains[shader] == before.drains[shader] && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        release.store(true, std::memory_order_release);
-    });
     const bool active = DrawPipeline::Active();
     DrawPipeline::Active() = true;
+    std::shared_ptr<const ShaderSnapshot> unguarded;
     std::shared_ptr<const ShaderSnapshot> read;
+    std::thread releaser;
     try {
-        read = ReadRawShader(address);
+        // Not a queue-0 dispatch prologue's read: nothing counted or drained, the code as it is.
+        unguarded = ReadRawShader(address);
+        const auto between = Drain::GuardTotals();
+        Require(between.hits[shader] == before.hits[shader] && between.drains[shader] == before.drains[shader], "hidden raw shader: a read outside a queue-0 dispatch prologue was guarded");
+        // Released from here when the prologue's read drains (=1): the drain waits for this item.
+        releaser = std::thread([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(modes.hidden == 1 ? 10000 : 200);
+            while (Drain::GuardTotals().drains[shader] == before.drains[shader] && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            release.store(true, std::memory_order_release);
+        });
+        read = ReadRawShader(address, true);
     } catch (...) {
         DrawPipeline::Active() = active;
         release.store(true, std::memory_order_release);
-        releaser.join();
+        if (releaser.joinable()) releaser.join();
         throw;
     }
     DrawPipeline::Active() = active;
     releaser.join();
+    Require(unguarded->code.front() == 0x7e000200u, "hidden raw shader: the unguarded read did not see the code as it was");
     DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     const auto after = Drain::GuardTotals();
     Require(DrawPipeline::Queue0().HiddenWritesQueued() == 0, "hidden raw shader: a committed hidden-write item is still counted");
@@ -341,6 +383,33 @@ void HiddenRawShader(const Modes& modes) {
     Require(hits == (modes.CountsHidden() ? 1u : 0u), "hidden raw shader: " + std::to_string(hits) + " hits");
     Require(drains == (modes.hidden == 1 ? 1u : 0u), "hidden raw shader: " + std::to_string(drains) + " drains");
     if (modes.hidden == 1) Require(read->code.front() == 0x7e0002f2u, "hidden raw shader: the raw code read ran ahead of a queued hidden write to the code");
+}
+
+// LOCAL DEBUG (DRAIN-PLAN C0): the [stream] window tag on the r71/r72 stats runs' windows (presents,
+// draws committed, flush-guard queue-0 lease wait, the window before).
+void WindowTags() {
+    using Drain::Window;
+    constexpr std::uint64_t Ms = 1'000'000;
+    struct Case {
+        const char* what;
+        std::uint64_t presents, draws, leaseNs;
+        Window previous, expected;
+    };
+    constexpr std::array<Case, 9> cases{{
+        {"boot menu (r71-stats L2098)", 294, 7028, 0, Window::Menu, Window::Menu},
+        {"menu with lease waits (r72-on-stats L42409)", 287, 14019, 0, Window::Menu, Window::Menu},
+        {"no presents (loading)", 0, 5000, 0, Window::Hold, Window::Menu},
+        {"menu frames then fly-in (r71-stats L52559)", 113, 39984, 897 * Ms, Window::Menu, Window::Entry},
+        {"hub entry as heavy as the hold (r71-on-stats L52071)", 45, 91553, 841 * Ms, Window::Menu, Window::Entry},
+        {"hub entry after a heavy window, lease waits", 50, 105401, 786 * Ms, Window::Hold, Window::Entry},
+        {"hold right after the entry (r71-on-stats L53274)", 110, 238848, 0, Window::Entry, Window::Hold},
+        {"hold with 72 presents and one lease wait (r71-stats L63457)", 72, 162119, 3 * Ms, Window::Entry, Window::Hold},
+        {"hold with 71 presents (r72-on-stats L62862)", 71, 157919, 0, Window::Hold, Window::Hold},
+    }};
+    for (const auto& item : cases) {
+        const auto tagged = Drain::ClassifyWindow(item.presents, item.draws, item.leaseNs, item.previous);
+        Require(tagged == item.expected, std::string("window tag: ") + item.what + " is tagged " + Drain::WindowName(tagged) + ", not " + Drain::WindowName(item.expected));
+    }
 }
 
 }
@@ -357,6 +426,7 @@ int main() {
         modes.hidden = Drain::HiddenWriteDrain();
         modes.stream = AgcDriver::Stream::On();
         std::printf("dispatch note guards: guards=%d hidden=%d stream=%d\n", modes.guards, modes.hidden, modes.stream ? 1 : 0);
+        WindowTags();
         if (DrawPipeline::Depth() == 0) return 77;
         HiddenRawShader(modes);
         {
@@ -370,7 +440,9 @@ int main() {
             std::puts("dispatch note guards: G-msaa not run, no memory at a 0x2'xxxx'xxxx address");
         }
         GuardValueFill(modes);
-        HiddenFill(modes);
+        HiddenFill(modes, false);
+        RegisterFillCode();
+        HiddenFill(modes, true);
         AgcDriverShutdown_nid_postfix();
         std::puts("dispatch note guards tests passed");
         return 0;

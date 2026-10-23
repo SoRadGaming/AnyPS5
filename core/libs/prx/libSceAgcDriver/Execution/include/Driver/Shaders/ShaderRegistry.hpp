@@ -182,7 +182,9 @@ struct ShaderSnapshot {
 };
 
 
-std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address);
+// `queue0Dispatch`: the read is a queue-0 dispatch prologue's (Dispatch.cpp), the only one
+// APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN guards (DRAIN-PLAN D1).
+std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address, bool queue0Dispatch = false);
 std::shared_ptr<const ShaderSnapshot> ReadUserDataTailContinuation(std::span<const std::uint32_t> code, std::uint32_t userDataBase, std::span<const std::uint32_t> userData);
 std::shared_ptr<const ShaderSnapshot> ProgramSnapshot(const ShaderRegistry& shaders, std::uint64_t address, std::initializer_list<std::uint8_t> types);
 void NoteRawGraphicsDraw(const ShaderSnapshot& snapshot);

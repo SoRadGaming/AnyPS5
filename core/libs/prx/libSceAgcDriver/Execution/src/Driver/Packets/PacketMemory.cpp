@@ -137,13 +137,23 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             return true;
         };
         // LOCAL DEBUG (DRAIN-PLAN C1, C2): a DMA_DATA's path, for its Drain::PacketRecord (the CPU
-        // paths are named there by whether the packet waited for the GPU).
+        // paths are named there by whether the packet waited for the GPU). A store's bytes are read
+        // on the CPU by ResolveStore (a GDS readback reads the GDS through the flush hook): whether
+        // that read waited for the GPU names a GPU store after it apart.
+        bool sourceWaited = false;
+        const auto resolveStore = [&] {
+            const bool timed = opcode == 0x50 && Drain::PacketCounting();
+            const auto before = timed ? Stream::ThreadGpuWait::Get() : 0;
+            auto resolved = Pm4::ResolveStore(packet, queue, gpuStoreLimit);
+            sourceWaited = timed && Stream::ThreadGpuWait::Get() != before;
+            return resolved;
+        };
         if (copyBehindPendingSource()) {
             ++copiesBehindPendingSources;
             wroteOnGpu = true;
             drained = false;
             if (opcode == 0x50) Drain::NoteDmaPath(Drain::DmaPath::GpuCopy);
-        } else if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        } else if (const auto store = resolveStore()) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
@@ -161,7 +171,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (opcode == 0x50) Drain::NoteDmaPath(reason == 0 ? Drain::DmaPath::GpuStore : Drain::DmaPath::Fallback, reason);
+                if (opcode == 0x50) Drain::NoteDmaPath(reason == 0 ? (sourceWaited ? Drain::DmaPath::GpuStoreAfterRead : Drain::DmaPath::GpuStore) : Drain::DmaPath::Fallback, reason);
                 if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
@@ -224,7 +234,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 // Waited for without the mutex where the recorder allows it (as the drain does), so
                 // the other workers keep recording; the recorder is looked up again after each wait.
-                if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(Pm4::GdsAddress(), Pm4::GdsBytes, true);
+                if (auto* recorder = Graphics::Recorder::Active()) {
+                    // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): the GDS's unfinished writers
+                    // as this sync starts, read under this hold (in the open batch, or in flight).
+                    if (Drain::GdsCounting()) Drain::NoteGdsTarget(recorder->OpenWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? Drain::GdsTarget::Open : recorder->PendingWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? Drain::GdsTarget::InFlight : Drain::GdsTarget::Idle);
+                    recorder->SyncThrough(Pm4::GdsAddress(), Pm4::GdsBytes, true);
+                }
                 const auto source = Pm4::DmaSource(packet);
                 if (source != Pm4::DmaSelectGds && source != 2) {
                     const auto from = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
@@ -289,8 +304,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             }
             if (epoch == 0) draining.reset();
         }
+        // LOCAL DEBUG (DRAIN-PLAN C1, C2, C7): the unlocked wait below is outside every
+        // Stream::GpuWaitScope (Recorder::WaitSerial); the packet's record takes it as a device drain.
+        std::uint64_t unlockedWaitNs = 0;
         if (epoch != 0) {
             ++unlockedDrains;
+            const auto waitStartNs = Drain::PacketCounting() ? Stream::NowNs() : 0;
             try {
                 draining->WaitRecorded(epoch);
             } catch (...) {
@@ -300,11 +319,13 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 draining.reset();
                 throw;
             }
+            if (waitStartNs != 0) unlockedWaitNs = Stream::NowNs() - waitStartNs;
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             draining->ReapRecorded(epoch);
             draining.reset();
         }
+        Drain::NoteDeviceDrain(unlockedWaitNs);
     }
     return drains;
 }

@@ -79,11 +79,12 @@ __attribute__((format(gnu_printf, 2, 3))) void append(std::string& text, const c
 
 constexpr std::array<const char*, static_cast<std::size_t>(Window::Count)> WindowNames{"menu", "entry", "hold"};
 constexpr std::array<const char*, DmaKinds> DmaKindNames{"imm->mem", "mem->mem", "imm->gds", "mem->gds", "gds->mem", "gds->gds", "prefetch"};
-constexpr std::array<const char*, DmaPaths> DmaPathNames{"item", "nothing", "gpu-store", "gpu-copy", "gpu-fill", "cpu-after-wait", "cpu-idle", "fallback"};
+constexpr std::array<const char*, DmaPaths> DmaPathNames{"item", "nothing", "gpu-store", "gpu-store-after-cpu-read", "gpu-copy", "gpu-fill", "cpu-after-wait", "cpu-idle", "device-drain", "fallback"};
+constexpr std::size_t GdsTargets = static_cast<std::size_t>(GdsTarget::Count);
 constexpr std::size_t Touches = static_cast<std::size_t>(Touch::Count);
 constexpr std::array<const char*, Touches> TouchNames{"wait", "dispatch-args", "cond-exec", "predication", "dma-source", "hook-read", "overwritten", "aged-out"};
 constexpr std::size_t WaitHows = static_cast<std::size_t>(WaitHow::Count);
-constexpr std::array<const char*, WaitHows> WaitHowNames{"entry", "held", "stored", "table", "polled"};
+constexpr std::array<const char*, WaitHows> WaitHowNames{"entry", "held", "stored", "table", "polled", "queued"};
 constexpr std::size_t GateRefusals = static_cast<std::size_t>(GateRefusal::Count);
 constexpr std::array<const char*, GateRefusals> GateRefusalNames{"would-skip", "deferred-labels", "label-batch-submit", "A1", "group-capture", "unordered-fills", "hidden-write"};
 constexpr std::size_t GateExits = static_cast<std::size_t>(GateExit::Count);
@@ -111,16 +112,17 @@ std::array<PacketRow, 2> zpassRows{};
 Counter zpassOtherQueues{};
 
 // C1: DMA_DATA touching the GDS by queue, kind and path: count, CPU wait, the GDS's unfinished
-// writers when it started (idle / in flight / in the open batch).
+// writers when it started (GdsTarget: idle / in flight / in the open batch, split under a targeted
+// store's own hold / pending, the lock-free snapshot).
 struct GdsRow {
     Counter n{};
     Counter waitNs{};
-    std::array<Counter, 3> target{};
+    std::array<Counter, GdsTargets> target{};
 };
 std::array<std::array<std::array<GdsRow, DmaPaths>, DmaKinds>, QueueSlots> gdsRows{};
 std::array<std::array<Counter, FallbackReasons>, QueueSlots> gdsFallbacks{};
-// GDS DMA_DATAs running per queue, and their GPU wait so far (the 0x93 blame's "inside a GDS wait").
-std::array<Counter, QueueSlots> gdsPacketsRunning{};
+// Per queue, the GPU waits of its GDS DMA_DATAs so far, added as each wait ends (Stream::GpuWaitScope
+// through Stream::NoteGdsGpuWait, and noteDeviceDrain): the 0x93 blame's clock.
 std::array<Counter, QueueSlots> gdsPacketWaitNs{};
 
 // C1's readback destinations, per producer queue, under ringMutex (a leaf lock); [ringLow, ringHigh)
@@ -169,15 +171,21 @@ Counter indirectHits{};
 std::array<Counter, IndirectMisses> indirectMisses{};
 
 // The thread's open PacketRecord path note: Armed with the kind (bits 24-31), then Noted with the
-// path (bits 8-15) and the fallback reason (bits 16-23); and the queue-0 drain episode the packet
+// path (bits 8-15) and the fallback reason (bits 16-23), and a GDS target sampled under a lock
+// (noteGdsTarget: bits 2-4, the GdsTarget + 1; 0 none); and the queue-0 drain episode the packet
 // opened (0: none), tagged with the path as soon as it is known, since a fill's own push closes it
-// before the packet ends.
+// before the packet ends. The device drains' unlocked waits on this thread (noteDeviceDrain), a
+// clock the records read as they read Stream::ThreadGpuWait.
 struct DmaPathTag {};
 using DmaPathSlot = HostThreadSlot<std::uint32_t, DmaPathTag>;
 struct DmaEpisodeTag {};
 using DmaEpisodeSlot = HostThreadSlot<std::uint64_t, DmaEpisodeTag>;
+struct DeviceDrainTag {};
+using DeviceDrainSlot = HostThreadSlot<std::uint64_t, DeviceDrainTag>;
 constexpr std::uint32_t PathArmed = 1u;
 constexpr std::uint32_t PathNoted = 2u;
+constexpr std::uint32_t PathTargetShift = 2u;
+constexpr std::uint32_t PathTargetMask = 7u << PathTargetShift;
 
 // C5's device-call note (RecipeNote): Armed, then Noted, FromCache, the outcome (bits 8-15) and the
 // unreusable reason (bits 16-23).
@@ -275,7 +283,8 @@ void appendPacketRow(std::string& line, const char* name, PacketRow& row, bool& 
 
 void reportGds(const char* window, bool print = true) {
     std::string line;
-    append(line, "[gds] window=%s DMA_DATA touching the GDS (queue kind/path n, CPU wait ms, target idle/in-flight/open):", window);
+    // Pending: in flight or open, from the lock-free snapshot (split only under a targeted store's hold).
+    append(line, "[gds] window=%s DMA_DATA touching the GDS (queue kind/path n, CPU wait ms, target idle/in-flight/open/pending):", window);
     bool first = true;
     for (std::size_t slot = 0; slot < QueueSlots; ++slot) {
         for (std::size_t kind = 0; kind < DmaKinds; ++kind) {
@@ -283,12 +292,12 @@ void reportGds(const char* window, bool print = true) {
                 auto& row = gdsRows[slot][kind][path];
                 const auto n = Take(row.n);
                 const auto waitNs = Take(row.waitNs);
-                std::array<std::uint64_t, 3> target{};
-                for (std::size_t state = 0; state < 3; ++state) target[state] = Take(row.target[state]);
+                std::array<std::uint64_t, GdsTargets> target{};
+                for (std::size_t state = 0; state < GdsTargets; ++state) target[state] = Take(row.target[state]);
                 if (n == 0) continue;
                 if (!first) line += ',';
                 first = false;
-                append(line, " %s %s/%s %llu %.1f %llu/%llu/%llu", queueName(slot).c_str(), DmaKindNames[kind], DmaPathNames[path], count(n), ms(waitNs), count(target[0]), count(target[1]), count(target[2]));
+                append(line, " %s %s/%s %llu %.1f %llu/%llu/%llu/%llu", queueName(slot).c_str(), DmaKindNames[kind], DmaPathNames[path], count(n), ms(waitNs), count(target[0]), count(target[1]), count(target[2]), count(target[3]));
             }
         }
     }
@@ -304,8 +313,10 @@ void reportGds(const char* window, bool print = true) {
         }
     }
     // Readback destinations: pushed, still live, and every first touch (waits by waiter and how).
+    // Gate (c)'s share: CPU uses (every wait but a queued-label answer, and every read) of the first
+    // touches whose outcome was seen (aged-out entries apart).
     append(line, "; GDS readbacks by producer queue (pushed, live: first touches n):");
-    std::uint64_t firstAll = 0, cpuFirst = 0;
+    std::uint64_t firstAll = 0, cpuFirst = 0, agedOut = 0;
     first = true;
     for (std::size_t slot = 0; slot < QueueSlots; ++slot) {
         const auto pushed = Take(readbacksPushed[slot]);
@@ -326,8 +337,9 @@ void reportGds(const char* window, bool print = true) {
             for (std::size_t how = 0; how < WaitHows; ++how) {
                 if (waits[waiter][how] == 0) continue;
                 append(line, " wait/%s/%s %llu", queueName(waiter).c_str(), WaitHowNames[how], count(waits[waiter][how]));
-                // A wait answered by the recorder's label table did not read the memory.
-                if (how != static_cast<std::size_t>(WaitHow::Table)) cpuFirst += waits[waiter][how];
+                // A wait answered from the recorder's label table still used the readback's value
+                // (filed there by its store); one answered from a label queued after it did not.
+                if (how != static_cast<std::size_t>(WaitHow::Queued)) cpuFirst += waits[waiter][how];
             }
         }
         for (std::size_t touch = 1; touch < Touches; ++touch) {
@@ -335,13 +347,15 @@ void reportGds(const char* window, bool print = true) {
             append(line, " %s %llu", TouchNames[touch], count(touches[touch]));
             if (touch != static_cast<std::size_t>(Touch::Overwritten) && touch != static_cast<std::size_t>(Touch::AgedOut)) cpuFirst += touches[touch];
         }
+        agedOut += touches[static_cast<std::size_t>(Touch::AgedOut)];
         firstAll += touchSum;
     }
-    append(line, "; CPU reads first %llu of %llu first touches (%.1f%%)", count(cpuFirst), count(firstAll), firstAll == 0 ? 0.0 : 100.0 * static_cast<double>(cpuFirst) / static_cast<double>(firstAll));
+    const auto seen = firstAll - agedOut;
+    append(line, "; CPU uses first %llu of %llu first touches seen (%.1f%%), aged out %llu (not counted)", count(cpuFirst), count(seen), seen == 0 ? 0.0 : 100.0 * static_cast<double>(cpuFirst) / static_cast<double>(seen), count(agedOut));
     // The 0x93 blame.
     const auto waits = Take(blameWaits);
     const auto waitNs = Take(blameNs);
-    append(line, "; queue-0 waits that polled %llu, %.1f ms; by producer queue (n, ms, inside a GDS DMA_DATA's wait n, ms):", count(waits), ms(waitNs));
+    append(line, "; queue-0 waits that polled %llu, %.1f ms; by producer queue (n, ms; with its GDS DMA_DATA GPU waits ending inside n, their ms capped at each wait):", count(waits), ms(waitNs));
     first = true;
     for (std::size_t slot = 0; slot < QueueSlots; ++slot) {
         const auto n = Take(blameByProducer[slot]);
@@ -427,17 +441,21 @@ int hiddenWriteMode() {
 }
 
 bool GdsOn() {
-    static const bool on = [] {
-        const char* text = std::getenv("APS5_DEBUG_GDS_STATS");
-        return text != nullptr && text[0] != '\0' && text[0] != '0';
-    }();
-    return on;
+    return Stream::GdsStatsOn();
 }
 
-Window ClassifyWindow(std::uint64_t presents, std::uint64_t draws) {
-    if (presents != 0 && draws / presents >= HoldDrawsPerPresent) return Window::Hold;
-    if (presents >= MenuPresents) return Window::Menu;
-    return Window::Entry;
+Window ClassifyWindow(std::uint64_t presents, std::uint64_t draws, std::uint64_t leaseQueue0Ns, Window previous) {
+    if (presents == 0 || draws / presents < LightDrawsPerPresent) return Window::Menu;
+    if (previous == Window::Menu || leaseQueue0Ns >= EntryLeaseWaitNs) return Window::Entry;
+    return Window::Hold;
+}
+
+Window TagWindow(std::uint64_t presents, std::uint64_t draws, std::uint64_t leaseQueue0Ns) {
+    // One report per window (DrawPipeline::reportStream), possibly from different threads.
+    static std::atomic<std::uint8_t> previous{static_cast<std::uint8_t>(Window::Menu)};
+    const auto window = ClassifyWindow(presents, draws, leaseQueue0Ns, static_cast<Window>(previous.load(std::memory_order_relaxed)));
+    previous.store(static_cast<std::uint8_t>(window), std::memory_order_relaxed);
+    return window;
 }
 
 const char* WindowName(Window window) {
@@ -459,15 +477,30 @@ void noteDmaPath(DmaPath path, int reason) {
     const auto slot = DmaPathSlot::Get();
     if ((slot & PathArmed) == 0) return;
     const auto kind = (slot >> 24u) & 0xffu;
-    DmaPathSlot::Set(PathArmed | PathNoted | (static_cast<std::uint32_t>(path) << 8u) | (static_cast<std::uint32_t>(std::clamp(reason, 0, static_cast<int>(FallbackReasons) - 1)) << 16u) | (kind << 24u));
+    DmaPathSlot::Set(PathArmed | PathNoted | (slot & PathTargetMask) | (static_cast<std::uint32_t>(path) << 8u) | (static_cast<std::uint32_t>(std::clamp(reason, 0, static_cast<int>(FallbackReasons) - 1)) << 16u) | (kind << 24u));
     if (const auto episode = DmaEpisodeSlot::Get(); episode != 0) DriverDetail::DrawPipeline::Queue0().TagStreamEpisode(episode, static_cast<std::uint16_t>(TagDma0 | (kind * DmaPaths + static_cast<std::uint32_t>(path))));
+}
+
+void noteGdsTarget(GdsTarget target) {
+    const auto slot = DmaPathSlot::Get();
+    if ((slot & PathArmed) == 0) return;
+    DmaPathSlot::Set((slot & ~PathTargetMask) | ((static_cast<std::uint32_t>(target) + 1u) << PathTargetShift));
+}
+
+void noteDeviceDrain(std::uint64_t unlockedWaitNs) {
+    if (unlockedWaitNs != 0) {
+        DeviceDrainSlot::Set(DeviceDrainSlot::Get() + unlockedWaitNs);
+        if (const auto gds = Stream::ThreadGdsSlot::Get(); gds != 0 && gds <= QueueSlots) Add(gdsPacketWaitNs[gds - 1u], unlockedWaitNs);
+    }
+    const auto slot = DmaPathSlot::Get();
+    if ((slot & PathArmed) != 0 && (slot & PathNoted) == 0) noteDmaPath(DmaPath::DeviceDrain, 0);
 }
 
 // A record armed but not finished (the packet threw).
 void PacketRecord::release() {
     DmaPathSlot::Set(0);
     DmaEpisodeSlot::Set(0);
-    if (gds) gdsPacketsRunning[queueSlot(queue)].fetch_sub(1, std::memory_order_relaxed);
+    if (gds) Stream::ThreadGdsSlot::Set(0);
     armed = false;
 }
 
@@ -511,21 +544,23 @@ void PacketRecord::Arm() {
         DmaEpisodeSlot::Set(stream ? episode : 0);
     }
     if (gds) {
-        // The GDS's unfinished writers as the packet starts: any (in flight), in the open batch.
-        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
-        if (const auto* recorder = Graphics::Recorder::Active()) target = recorder->OpenWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? 2 : recorder->PendingWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? 1 : 0;
-        gdsPacketsRunning[queueSlot(queue)].fetch_add(1, std::memory_order_relaxed);
+        // The GDS's unfinished writers as the packet starts, from the published pending-write
+        // snapshot (no lock: GpuMutex here would be a hold today's packet does not make). A targeted
+        // GDS store splits it under its own hold later (noteGdsTarget).
+        target = Graphics::Recorder::SnapshotWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? GdsTarget::Pending : GdsTarget::Idle;
+        // This thread's GPU waits from here on run the queue's GDS-wait clock (the 0x93 blame).
+        Stream::ThreadGdsSlot::Set(static_cast<std::uint32_t>(queueSlot(queue)) + 1u);
     }
     startNs = Stream::NowNs();
     gpuWaitNs = Stream::ThreadGpuWait::Get();
+    deviceDrainNs = DeviceDrainSlot::Get();
 }
 
 void PacketRecord::Finish(bool wroteOnGpu) {
     if (!active) return;
     active = false;
     const auto packetNs = Stream::NowNs() - startNs;
-    const auto waitedNs = Stream::ThreadGpuWait::Get() - gpuWaitNs;
+    const auto waitedNs = (Stream::ThreadGpuWait::Get() - gpuWaitNs) + (DeviceDrainSlot::Get() - deviceDrainNs);
     if (zpass) {
         auto& row = zpassRows[wroteOnGpu ? 0 : 1];
         Add(row.n);
@@ -547,6 +582,7 @@ void PacketRecord::Finish(bool wroteOnGpu) {
     } else if (!wroteOnGpu) {
         path = waitedNs != 0 ? DmaPath::CpuAfterWait : DmaPath::CpuIdle;
     }
+    if (const auto sampled = (note & PathTargetMask) >> PathTargetShift; sampled != 0 && sampled <= GdsTargets) target = static_cast<GdsTarget>(sampled - 1u);
     if (armed) {
         armed = false;
         DmaPathSlot::Set(0);
@@ -571,10 +607,9 @@ void PacketRecord::Finish(bool wroteOnGpu) {
         auto& row = gdsRows[slot][kindIndex][pathIndex];
         Add(row.n);
         Add(row.waitNs, waitedNs);
-        Add(row.target[target]);
+        Add(row.target[static_cast<std::size_t>(target)]);
         if (path == DmaPath::Fallback) Add(gdsFallbacks[slot][reason]);
-        Add(gdsPacketWaitNs[slot], waitedNs);
-        gdsPacketsRunning[slot].fetch_sub(1, std::memory_order_relaxed);
+        Stream::ThreadGdsSlot::Set(0);
         gds = false;
         // The destination of a GDS readback, from now on until its first touch.
         if (kind == DmaKind::GdsToMem && path != DmaPath::Nothing) pushReadback(slot, destination, bytes);
@@ -609,6 +644,14 @@ void noteGuestAccess(std::uint64_t address, std::size_t bytes, bool store) {
     noteTouch(store ? Touch::Overwritten : Touch::HookRead, address, bytes);
 }
 
+void noteWaitTouch(std::uint32_t queue, std::uint64_t address, std::size_t bytes, WaitHow how) {
+    const auto waiter = queueSlot(queue);
+    takeOverlapping(address, bytes, [&](std::size_t slot) {
+        Add(waitTouches[slot][waiter][static_cast<std::size_t>(how)]);
+        Add(firstTouches[slot][static_cast<std::size_t>(Touch::Wait)]);
+    });
+}
+
 void WaitRecord::start(std::uint64_t awaited, std::size_t awaitedBytes) {
     startNs = Stream::NowNs();
     takeOverlapping(awaited, awaitedBytes, [this](std::size_t slot) {
@@ -616,10 +659,7 @@ void WaitRecord::start(std::uint64_t awaited, std::size_t awaitedBytes) {
         ++taken;
     });
     if (queue != 0) return;
-    for (std::size_t slot = 0; slot < QueueSlots; ++slot) {
-        gdsWaitNs[slot] = gdsPacketWaitNs[slot].load(std::memory_order_relaxed);
-        inGds[slot] = gdsPacketsRunning[slot].load(std::memory_order_relaxed) != 0;
-    }
+    for (std::size_t slot = 0; slot < QueueSlots; ++slot) gdsWaitNs[slot] = gdsPacketWaitNs[slot].load(std::memory_order_relaxed);
 }
 
 void WaitRecord::finish() {
@@ -642,9 +682,11 @@ void WaitRecord::finish() {
     const auto slot = queueSlot(producer);
     Add(blameByProducer[slot]);
     Add(blameByProducerNs[slot], ns);
-    if (inGds[slot] || gdsPacketsRunning[slot].load(std::memory_order_relaxed) != 0 || gdsPacketWaitNs[slot].load(std::memory_order_relaxed) != gdsWaitNs[slot]) {
+    // The producer's GDS DMA_DATA GPU waits that ended during this wait, capped at the wait.
+    const auto gdsNs = gdsPacketWaitNs[slot].load(std::memory_order_relaxed) - gdsWaitNs[slot];
+    if (gdsNs != 0) {
         Add(blameInGds[slot]);
-        Add(blameInGdsNs[slot], ns);
+        Add(blameInGdsNs[slot], std::min(ns, gdsNs));
     }
 }
 
@@ -893,6 +935,15 @@ void ReportWindow(Window window, bool print) {
     }
     // C1.
     if (GdsCounting()) reportGds(name);
+}
+
+}
+
+namespace AgcDriver::Stream {
+
+// LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): see StreamStats.hpp (ThreadGdsSlot).
+void NoteGdsGpuWait(std::uint32_t slot, std::uint64_t ns) {
+    if (slot < Drain::QueueSlots) Add(Drain::gdsPacketWaitNs[slot], ns);
 }
 
 }
