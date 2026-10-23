@@ -16,6 +16,7 @@ namespace AgcDriver::Graphics {
 
 struct HostImport;
 struct DrawTicket;
+class InputLeaseShadow;
 
 struct PreparedDraw {
     std::shared_ptr<const VertexInputLayout> vertexInput;
@@ -69,8 +70,10 @@ struct DrawInputCopy {
     std::uint64_t registryGeneration = 0;
 };
 // `bufferBytes` (when larger than `bytes`) sizes the buffer for whole-stride vertex bindings: the bytes
-// past `bytes` are zero, not read from guest memory.
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t bufferBytes = 0);
+// past `bytes` are zero, not read from guest memory. `shadow` (LOCAL DEBUG, APS5_PROFILE_DRAW,
+// REVALIDATE-PLAN 7 I0): the input's lease counters, made by the caller before InPlaceDrawInput;
+// without one, a profiling run's call makes its own.
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t bufferBytes = 0, InputLeaseShadow* shadow = nullptr);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr);

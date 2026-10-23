@@ -3014,6 +3014,53 @@ RevalidateProfile& Revalidations() {
     return profile;
 }
 
+// LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7, V0): the template collect lease counts (see
+// ShaderResources::CollectLeaseCounts), printed with the revalidate line.
+struct CollectLeaseProfile {
+    std::atomic<std::uint64_t> proofs{0}, collected{0}, wouldSkip{0}, rekeys{0};
+    std::atomic<std::uint64_t> noKey{0}, noLease{0}, owner{0}, epoch{0}, unwatch{0}, mapping{0};
+    std::atomic<std::uint64_t> wrong{0}, voided{0}, movedMidProof{0};
+    std::atomic<std::uint32_t> printed{0};
+};
+
+CollectLeaseProfile& CollectLeases() {
+    static auto* profile = new CollectLeaseProfile();
+    return *profile;
+}
+
+template<typename Read>
+ShaderResources::CollectLeaseCounts readCollectLeases(CollectLeaseProfile& profile, Read read) {
+    ShaderResources::CollectLeaseCounts counts;
+    counts.proofs = read(profile.proofs);
+    counts.collected = read(profile.collected);
+    counts.wouldSkip = read(profile.wouldSkip);
+    counts.rekeys = read(profile.rekeys);
+    counts.noKey = read(profile.noKey);
+    counts.noLease = read(profile.noLease);
+    counts.owner = read(profile.owner);
+    counts.epoch = read(profile.epoch);
+    counts.unwatch = read(profile.unwatch);
+    counts.mapping = read(profile.mapping);
+    counts.wrong = read(profile.wrong);
+    counts.voided = read(profile.voided);
+    counts.movedMidProof = read(profile.movedMidProof);
+    return counts;
+}
+
+// Why a proof rekeyed its lease, and so why its records miss (CollectLeaseProof::rekeyed; 0: it did
+// not).
+constexpr std::uint8_t RekeyNoLease = 1;
+constexpr std::uint8_t RekeyOwner = 2;
+constexpr std::uint8_t RekeyEpoch = 3;
+constexpr std::uint8_t RekeyUnwatch = 4;
+constexpr std::uint8_t RekeyMapping = 5;
+
+void reportCollectLeases() {
+    const auto n = readCollectLeases(CollectLeases(), [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); });
+    using U = unsigned long long;
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] collect lease (10 s): fast proofs %llu, records collected %llu, would skip %llu (%.1f%%), lease rekeys %llu; misses: no key %llu, no lease %llu, owner %llu, epoch %llu, unwatch %llu, mapping %llu; W %llu (void %llu); moved mid-proof %llu\n", static_cast<U>(n.proofs), static_cast<U>(n.collected), static_cast<U>(n.wouldSkip), n.collected == 0 ? 0.0 : 100.0 * static_cast<double>(n.wouldSkip) / static_cast<double>(n.collected), static_cast<U>(n.rekeys), static_cast<U>(n.noKey), static_cast<U>(n.noLease), static_cast<U>(n.owner), static_cast<U>(n.epoch), static_cast<U>(n.unwatch), static_cast<U>(n.mapping), static_cast<U>(n.wrong), static_cast<U>(n.voided), static_cast<U>(n.movedMidProof));
+}
+
 void countFastFail(FastFail reason) {
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -3095,6 +3142,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)));
+    reportCollectLeases();
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -3134,6 +3182,62 @@ void ShaderResources::captureValidation() {
         if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true};
     }
     lookupLog().clear();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 6, V0): new records clear the collect lease (its
+    // generation stays, so no older leasedAt matches the next one).
+    if (BuildProfiled()) {
+        collectLease.key = {};
+        collectLease.owner = 0;
+    }
+}
+
+ShaderResources::CollectLeaseCounts ShaderResources::CollectLeaseCountsNow() {
+    return readCollectLeases(CollectLeases(), [](std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); });
+}
+
+ShaderResources::CollectLeaseProof ShaderResources::beginCollectLease() {
+    CollectLeaseProof proof;
+    if (!BuildProfiled()) return proof;
+    proof.on = true;
+    auto& profile = CollectLeases();
+    profile.proofs.fetch_add(1, std::memory_order_relaxed);
+    proof.key = GuestMemory::CurrentCollectMemoKey();
+    const auto owner = GuestMemory::CollectCoverageOwner();
+    if (proof.key != collectLease.key || owner != collectLease.owner) {
+        proof.rekeyed = !collectLease.key.Valid() ? RekeyNoLease : owner != collectLease.owner ? RekeyOwner : proof.key.epoch != collectLease.key.epoch ? RekeyEpoch : proof.key.unwatched != collectLease.key.unwatched ? RekeyUnwatch : RekeyMapping;
+        collectLease = {proof.key, owner, collectLease.gen + 1};
+        profile.rekeys.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (storageLeasedAt.size() != storageTextures.size()) storageLeasedAt.assign(storageTextures.size(), 0);
+    return proof;
+}
+
+std::uint64_t ShaderResources::leaseCollect(CollectLeaseProof& proof, std::uint32_t& leasedAt, std::uint64_t address, std::size_t bytes) {
+    auto& profile = CollectLeases();
+    profile.collected.fetch_add(1, std::memory_order_relaxed);
+    if (!proof.key.Valid()) {
+        profile.noKey.fetch_add(1, std::memory_order_relaxed);
+    } else if (leasedAt == collectLease.gen) {
+        profile.wouldSkip.fetch_add(1, std::memory_order_relaxed);
+        proof.leased = true;
+        // The =2 check, as a counter: under the proof's key the range must still be covered.
+        if (GuestMemory::CurrentCollectMemoKey() != proof.key) {
+            profile.voided.fetch_add(1, std::memory_order_relaxed);
+        } else if (!GuestMemory::CollectCovered(address, bytes)) {
+            profile.wrong.fetch_add(1, std::memory_order_relaxed);
+            if (profile.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[collect-lease] W: object %p would skip the collect of 0x%llx+0x%llx under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which does not cover it\n", static_cast<const void*>(this), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(proof.key.epoch), static_cast<unsigned long long>(proof.key.unwatched), static_cast<unsigned long long>(proof.key.mapping));
+        }
+    } else {
+        const auto reason = proof.rekeyed;
+        (reason == RekeyOwner ? profile.owner : reason == RekeyEpoch ? profile.epoch : reason == RekeyUnwatch ? profile.unwatch : reason == RekeyMapping ? profile.mapping : profile.noLease).fetch_add(1, std::memory_order_relaxed);
+    }
+    bool covered = false;
+    const auto generation = GuestMemory::CollectWritesCovering(address, bytes, covered);
+    if (covered) leasedAt = collectLease.gen;
+    return generation;
+}
+
+void ShaderResources::endCollectLease(const CollectLeaseProof& proof) {
+    if (proof.leased && GuestMemory::CurrentCollectMemoKey() != proof.key) CollectLeases().movedMidProof.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::size_t ShaderResources::LookupLogCapacity() {
@@ -3166,6 +3270,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7, V0): L2's lease, recorded only.
+    auto leaseProof = beginCollectLease();
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
     struct QueriesTag {};
@@ -3199,7 +3305,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        surface.collected = leaseProof.on ? leaseCollect(leaseProof, surface.leasedAt, address, bytes) : GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
         if (!keyProofs) {
@@ -3256,7 +3362,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        if ((leaseProof.on ? leaseCollect(leaseProof, storageLeasedAt[i], address, bytes) : GuestMemory::CollectWrites(address, bytes)) == 0) return fail(FastFail::Collect);
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -3303,6 +3409,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
+    if (leaseProof.on) endCollectLease(leaseProof);
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();

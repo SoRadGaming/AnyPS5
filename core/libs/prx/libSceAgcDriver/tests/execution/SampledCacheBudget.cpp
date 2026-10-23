@@ -583,6 +583,90 @@ void replacedEntryTests(Context context) {
     std::puts("template over a replaced sampled cache entry passed");
 }
 
+// LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 V0): the template collect lease over real fast
+// proofs of one sampled template, as the environment sets it up (counting with a collect memo key,
+// counting without one, off; the rows turn the template audit off, so a proof stays fast). Once a fast
+// proof keyed the lease and covered the record, a repeat would skip that collect; an epoch bump rekeys
+// (epoch) and the next proof would skip again; an allocation change rekeys (mapping); a new object's
+// first fast proof rekeys (no lease yet) and misses its record (no key without the epoch coverage).
+// W, void and moved mid-proof stay 0. Off, nothing is counted.
+void collectLeaseCounterTests(Context context) {
+    using L = ShaderResources::CollectLeaseCounts;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    ClearCachedTextures(context.device);
+    const bool counting = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool keyed = counting && std::getenv("APS5_DEBUG_COVERAGE") != nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    const std::uint64_t one = keyed ? 1 : 0;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    Require(resources->Reusable() && resources->SampledTextures().size() == 1, "the collect lease template is not reusable");
+    // The first proof (fast in practice: the build kept its records) also prints the first [rescache]
+    // lines, which take the counts; every check below counts from after it, inside the next 10 s.
+    ShaderResources::ProofReport report{};
+    Require(resources->Revalidate(shader, &report), "the collect lease template did not prove current");
+    auto before = ShaderResources::CollectLeaseCountsNow();
+    // One proof of `object`: fast, then the count changes it must show (checked when `checked`), and
+    // no W, void or move mid-proof.
+    const auto prove = [&](ShaderResources& object, std::initializer_list<std::pair<std::uint64_t L::*, std::uint64_t>> counts, const char* what, bool checked = true) {
+        report = {};
+        Require(object.Revalidate(shader, &report), what);
+        Require(report.path == ShaderResources::ProofPath::Fast, what);
+        const auto now = ShaderResources::CollectLeaseCountsNow();
+        if (counting) {
+            Require(now.proofs == before.proofs + 1 && now.collected == before.collected + 1, what);
+            if (checked) {
+                for (const auto& [field, count] : counts) Require(now.*field - before.*field == count, what);
+            }
+        } else {
+            Require(now.proofs == 0 && now.collected == 0 && now.rekeys == 0, "the collect lease counted without APS5_PROFILE_DRAW");
+        }
+        Require(now.wrong == before.wrong && now.voided == before.voided && now.movedMidProof == before.movedMidProof, what);
+        before = now;
+    };
+    // After a full first proof (new records, the lease cleared) this one keys the lease: not checked.
+    prove(*resources, {}, "the template's second proof was not fast", false);
+    prove(*resources, {{&L::rekeys, 0}, {&L::wouldSkip, one}, {&L::noKey, 1 - one}}, "a repeat proof would not skip its covered record");
+    prove(*resources, {{&L::rekeys, 0}, {&L::wouldSkip, one}}, "a third proof would not skip its covered record");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    prove(*resources, {{&L::rekeys, one}, {&L::wouldSkip, 0}, {&L::epoch, one}}, "an epoch bump did not rekey the lease");
+    prove(*resources, {{&L::rekeys, 0}, {&L::wouldSkip, one}}, "the record was not leased again after an epoch bump");
+    // A new object over the same texture: its first proof finds no lease (when it is fast).
+    auto rebuilt = std::make_shared<ShaderResources>(context, shader);
+    Require(rebuilt->Reusable(), "the rebuilt collect lease template is not reusable");
+    report = {};
+    Require(rebuilt->Revalidate(shader, &report), "the rebuilt template did not prove current");
+    const auto now = ShaderResources::CollectLeaseCountsNow();
+    if (counting && report.path == ShaderResources::ProofPath::Fast) Require(now.rekeys - before.rekeys == 1 && now.wouldSkip == before.wouldSkip && now.noLease - before.noLease == one && now.noKey - before.noKey == 1 - one, "a new object's first fast proof did not rekey its lease or miss its record");
+    Require(now.wrong == before.wrong && now.voided == before.voided, "a new object's first proof counted W");
+    before = now;
+    rebuilt.reset();
+    alignas(64) static std::byte other[64];
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(other, sizeof(other), true, true, true);
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(other);
+    }
+    // Only the fast proof's counts: the import checks after it are not this test's.
+    report = {};
+    static_cast<void>(resources->Revalidate(shader, &report));
+    const auto moved = ShaderResources::CollectLeaseCountsNow();
+    Require(report.path == ShaderResources::ProofPath::Fast, "the proof after an allocation change was not fast");
+    if (counting) Require(moved.rekeys - before.rekeys == one && moved.wouldSkip == before.wouldSkip && moved.mapping - before.mapping == one, "an allocation change did not rekey the lease");
+    Require(moved.wrong == before.wrong && moved.voided == before.voided && moved.movedMidProof == before.movedMidProof, "the proof after an allocation change counted W");
+    resources.reset();
+    ClearCachedTextures(context.device);
+    std::puts("template collect lease counter passed");
+}
+
 bool lookupChangedTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1072,6 +1156,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!lookupChangedTests(context)) return VulkanTestSkipped;
             std::puts("resource cache lookup-changed tests passed");
+            return 0;
+        }
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 V0): the template collect lease counter.
+        if (mode == "collect-lease-counter") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            collectLeaseCounterTests(context);
             return 0;
         }
         if (memory) {

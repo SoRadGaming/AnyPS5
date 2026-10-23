@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthLease.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InputLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LocalCuts.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1230,18 +1231,24 @@ void NoteBufferHeapSpill(const Context& context, VkMemoryPropertyFlags propertie
     if (count <= 5 || (count & (count - 1)) == 0) AgcDriver::ProfilePrint_nid_no_patch("[draw-inputs] budget spill: a buffer asking for properties 0x%x (%llu bytes) got memory type %u on heap %u%s, its first heap being over its VK_EXT_memory_budget budget; %llu such buffers, %.1f MiB\n", static_cast<unsigned>(properties), static_cast<unsigned long long>(bytes), type, typeHeap(context, type), deviceLocalType(context, type) ? " (device-local)" : "", static_cast<unsigned long long>(count), static_cast<double>(total) / 1048576.0);
 }
 
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t bufferBytes) {
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t bufferBytes, InputLeaseShadow* shadow) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     const auto allocated = std::max(bytes, bufferBytes);
     DrawInputCopy copy;
     copy.bytes = bytes;
     if (recorder != nullptr && bytes != 0) {
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): the lease counters of a direct
+        // caller's input. They only observe: the collect is today's, the lookup's lease only records.
+        std::optional<InputLeaseShadow> ownShadow;
+        if (shadow == nullptr && InputLeaseCounting()) shadow = &ownShadow.emplace(recorder, address, bytes, use);
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        copy.generation = shadow != nullptr ? shadow->Collect(address, bytes) : GuestMemory::CollectWrites(address, bytes);
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, shadow != nullptr ? shadow->Lease() : nullptr);
         // A kept copy made for narrower bindings lacks the padding this draw needs.
-        if (copy.buffer != nullptr && copy.buffer->Bytes().size() < allocated) copy.buffer.reset();
+        const bool padding = copy.buffer != nullptr && copy.buffer->Bytes().size() < allocated;
+        if (padding) copy.buffer.reset();
+        if (shadow != nullptr) shadow->Result(copy.buffer != nullptr, padding);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
@@ -1723,13 +1730,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): the input's lease counters, probed
+        // before InPlaceDrawInput.
+        std::optional<InputLeaseShadow> leaseShadow;
+        if (InputLeaseCounting()) leaseShadow.emplace(context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), use);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
         if (import == nullptr) {
             // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the copy's collect is an input walk.
             const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Inputs);
-            copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+            copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use, 0, leaseShadow ? &*leaseShadow : nullptr);
         } else {
+            if (leaseShadow) leaseShadow->InPlace();
             GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         }
         std::optional<std::uint32_t> highest;
@@ -1903,7 +1915,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto bytes = static_cast<std::size_t>(end - begin);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
         RequireNoMultisampleTarget(begin, bytes, "a vertex buffer read");
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): the input's lease counters, probed
+        // before InPlaceDrawInput (row P's first skip point would be its FlushPending).
+        std::optional<InputLeaseShadow> leaseShadow;
+        if (InputLeaseCounting()) leaseShadow.emplace(context.recorder, begin, bytes, Recorder::SnapshotUse::Vertex);
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
+            if (leaseShadow) leaseShadow->InPlace();
             if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::VertexInPlace, bytes);
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
@@ -1913,7 +1930,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // LOCAL DEBUG (APS5_DEBUG_Q0_PREP_STATS): the copy's collect is an input walk (nothing below
         // in this iteration collects).
         const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Inputs);
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, static_cast<std::size_t>(plan.paddedEnds[range] - begin));
+        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, static_cast<std::size_t>(plan.paddedEnds[range] - begin), leaseShadow ? &*leaseShadow : nullptr);
         if (DebugDrawInputBytes()) CountDrawInputBytes(copy.reused ? DrawInputBytes::VertexReused : DrawInputBytes::VertexCopied, bytes);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());

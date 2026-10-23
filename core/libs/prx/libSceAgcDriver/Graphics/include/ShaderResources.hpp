@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
@@ -436,6 +437,21 @@ public:
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     static std::size_t LookupLogCapacity();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 6 and 7, V0; stage S1): the template collect
+    // lease L2 would hold, recorded from today's collects in every fast proof and never applied
+    // (APS5_EXPERIMENT_COLLECT_LEASE is not read yet). At a proof's start the object's lease is rekeyed
+    // to the thread's collect memo key and coverage owner when either moved; a record (a sampled
+    // surface or a storage image) whose collect was reported covered under the lease would skip its
+    // collect at the next proof under it (CollectCovered must still hold then: W counts a record it
+    // does not, which must stay 0; a key moved since the proof's start voids the check). Counted on
+    // the [rescache] collect lease line every 10 s; CollectLeaseCountsNow reads the counts without
+    // taking them, for tests.
+    struct CollectLeaseCounts {
+        std::uint64_t proofs = 0, collected = 0, wouldSkip = 0, rekeys = 0;
+        std::uint64_t noKey = 0, noLease = 0, owner = 0, epoch = 0, unwatch = 0, mapping = 0;
+        std::uint64_t wrong = 0, voided = 0, movedMidProof = 0;
+    };
+    static CollectLeaseCounts CollectLeaseCountsNow();
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
@@ -670,6 +686,9 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 6, V0): the collect lease generation under
+        // which this record's collect was last reported covered (0: none).
+        std::uint32_t leasedAt = 0;
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
@@ -705,6 +724,31 @@ private:
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 6, V0): the object's template collect lease (a key,
+    // its coverage owner and a generation that moves at every rekey; captureValidation clears the key
+    // and owner), the storage images' leasedAt (parallel to storageTextures), and one fast proof's
+    // view of it: the key read at its start, why it rekeyed (0: it did not), and whether a record of
+    // it would have skipped its collect.
+    struct CollectLease {
+        GuestMemory::CollectMemoKey key{};
+        std::uint64_t owner = 0;
+        std::uint32_t gen = 0;
+    };
+    CollectLease collectLease;
+    std::vector<std::uint32_t> storageLeasedAt;
+    struct CollectLeaseProof {
+        bool on = false;
+        bool leased = false;
+        std::uint8_t rekeyed = 0;
+        GuestMemory::CollectMemoKey key{};
+    };
+    CollectLeaseProof beginCollectLease();
+    // Today's collect of one record (CollectWritesCovering is CollectWrites), with the lease's
+    // prediction for it before and its fill after.
+    std::uint64_t leaseCollect(CollectLeaseProof& proof, std::uint32_t& leasedAt, std::uint64_t address, std::size_t bytes);
+    // Before UnchangedSinceAll: a proof that would have skipped a collect while the key moved after
+    // its start would fail (FastFail::Collect) at =1; counted only.
+    void endCollectLease(const CollectLeaseProof& proof);
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;

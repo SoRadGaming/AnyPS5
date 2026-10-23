@@ -465,8 +465,9 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::snprintf(item, sizeof(item), "; %llu labels appended to queued commits", static_cast<unsigned long long>(labelsAppended));
         drainText += item;
     }
-    char reads[64];
-    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)));
+    // LOCAL DEBUG (REVALIDATE-PLAN 7, I0): the HeldReads queries beside their hits ("stores held").
+    char reads[128];
+    std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held of %llu queries", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadQueries.exchange(0, std::memory_order_relaxed)));
     drainText += reads;
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = runs = runCommits = labelsAppended = 0;

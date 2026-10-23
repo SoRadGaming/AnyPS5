@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthLease.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InputLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/General.hpp"
@@ -4391,12 +4392,18 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     ++version;
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent) BumpPendingSerial();
+        if (wasLent) {
+            BumpPendingSerial();
+            // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition (the lent re-mark).
+            if (InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Lent);
+        }
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition to the registry.
+    if (InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Mark);
 }
 
 void StorageTexture::reconcilePending() {
@@ -4408,6 +4415,8 @@ void StorageTexture::reconcilePending() {
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
     BumpPendingSerial();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition to the registry.
+    if (any && InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Reconcile);
 }
 
 bool StorageTexture::Dirty() const {
@@ -5099,6 +5108,39 @@ bool StorageTexture::AnyLiveOverlaps(std::span<const std::pair<std::uint64_t, st
 
 std::uint64_t StorageTexture::PendingSerial() {
     return pendingSerial.load(std::memory_order_acquire);
+}
+
+std::uint64_t StorageTexture::NothingPendingOver(std::uint64_t address, std::size_t bytes, PendingOver* over) {
+    const auto answer = [over](PendingOver kind) {
+        if (over != nullptr) *over = kind;
+    };
+    const auto serial = PendingSerial();
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        if (pending.textures.MayOverlap(address, bytes)) {
+            for (const auto* texture : pending.textures) {
+                if (!texture->overlaps(address, bytes)) continue;
+                answer(PendingOver::Pending);
+                return 0;
+            }
+        }
+        for (const auto* texture : pending.flushing) {
+            if (!texture->overlaps(address, bytes)) continue;
+            answer(PendingOver::Flushing);
+            return 0;
+        }
+    }
+    if (AnyShadowedOverlaps(address, bytes)) {
+        answer(PendingOver::Shadow);
+        return 0;
+    }
+    if (PendingSerial() != serial) {
+        answer(PendingOver::Moved);
+        return 0;
+    }
+    answer(PendingOver::Nothing);
+    return serial;
 }
 
 void StorageTexture::NoteProved() const {
