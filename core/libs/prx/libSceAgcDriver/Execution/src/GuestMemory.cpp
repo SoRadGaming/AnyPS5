@@ -2487,6 +2487,10 @@ void SetCollectWalkHook(void (*hook)()) {
     collectWalkHook.store(hook, std::memory_order_release);
 }
 
+void DropCollectCoverageForTest() {
+    epochCoverage().ranges.clear();
+}
+
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);

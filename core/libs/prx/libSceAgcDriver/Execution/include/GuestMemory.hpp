@@ -265,6 +265,10 @@ std::uint64_t CoveredCollectGeneration();
 // Test hook: called by a memoized collect that walks, after it read its key and before it takes the
 // tracker lock (an unwatch there moves UnwatchSerial during the walk); null, the default, outside tests.
 void SetCollectWalkHook(void (*hook)());
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 9, the =2 death rows of L1 row C and L2): test only. Empties the
+// calling thread's epoch coverage while its key stays, which nothing else does (coverage is cleared
+// only at a key change), so a lease that holds under the key no longer matches the coverage.
+void DropCollectCoverageForTest();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it; under
 // APS5_EXPERIMENT_LAZY_GENERATION a collect bumps it only when it stamps): a stamp taken after

@@ -3031,6 +3031,29 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_resource_cache_collect_lease_counter agc_driver_resource_cache_collect_lease_counter_no_key agc_driver_resource_cache_collect_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6 and 9, L2): the template collect
+    # lease over real fast proofs at each switch value (unset, on, verify; on and verify again with
+    # APS5_PROFILE_DRAW, whose V0 misses tell captureValidation's clear from a key move), every row with
+    # the epoch coverage that gives the thread a collect memo key and the template audit off; then =2's
+    # death case (the coverage dropped under the same key must abort with the [collect-lease] line,
+    # matched; the test turns abort() into exit code 3).
+    set(collectLeaseTests agc_driver_resource_cache_collect_lease agc_driver_resource_cache_collect_lease_1 agc_driver_resource_cache_collect_lease_2 agc_driver_resource_cache_collect_lease_1_profile agc_driver_resource_cache_collect_lease_2_profile)
+    foreach(collectLeaseTest IN LISTS collectLeaseTests)
+        add_test(NAME ${collectLeaseTest} COMMAND agc_driver_sampled_cache_budget_tests collect-lease)
+    endforeach()
+    set_tests_properties(agc_driver_resource_cache_collect_lease PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_1 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_2 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=2" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_1_profile PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=1;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_2_profile PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=2;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME agc_driver_resource_cache_collect_lease_2_death COMMAND agc_driver_sampled_cache_budget_tests collect-lease-death)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_2_death PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=2" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\\[collect-lease\\] APS5_EXPERIMENT_COLLECT_LEASE=2: object [^\r\n]*but the thread's coverage does not hold its range")
+    list(APPEND collectLeaseTests agc_driver_resource_cache_collect_lease_2_death)
+    if(WIN32)
+        set_tests_properties(${collectLeaseTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     # The driver draw test again with the draw key off: the draw cache then keys on the decoded vertex
     # stage, which must include PA_CL_VS_OUT_CNTL.
     add_test(NAME agc_driver_vertex_clip_cull_draw_no_key COMMAND agc_driver_vertex_clip_cull_draw_tests no-key)
@@ -3324,6 +3347,12 @@ if(BUILD_TESTING)
             # collect lease counter counting, with the epoch coverage and the draw inputs in VRAM as the
             # play build runs them; they change no draw.
             "input_lease_counter|APS5_PROFILE_DRAW=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
+            # LOCAL EXPERIMENT (REVALIDATE-PLAN 6, L2): the template collect lease verified (=2: every
+            # record it holds checked against the coverage before today's collect, which is used) and
+            # on, with the epoch coverage that gives the proofs a collect memo key (without it no record
+            # is held); its own cases are in agc_driver_resource_cache_collect_lease*.
+            "collect_lease|APS5_EXPERIMENT_COLLECT_LEASE=2,APS5_DEBUG_COVERAGE=1"
+            "collect_lease_on|APS5_EXPERIMENT_COLLECT_LEASE=1,APS5_DEBUG_COVERAGE=1"
             # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's surface size and key memos
             # verified (=2: every hit computed too, a difference fatal) and on; their own cases are in
             # agc_storage_target_memos*.

@@ -23,8 +23,10 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -667,6 +669,235 @@ void collectLeaseCounterTests(Context context) {
     std::puts("template collect lease counter passed");
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6 and 9, L2): a sampled template of
+// two records (two watched surfaces).
+ShaderRecompiler::RecompileResult SampledPrograms(std::initializer_list<std::uint64_t> addresses) {
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + PlaceholderDimensionsPerClass + 2u;
+    binding.count = static_cast<std::uint32_t>(addresses.size());
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten.assign(addresses.size(), false);
+    binding.imageSamplers.assign(addresses.size(), 0u);
+    for (const auto address : addresses) {
+        const auto words = Descriptor(address);
+        binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+    }
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(std::move(binding));
+    return program;
+}
+
+// The collect walk hook's action at the next memoized walk (GuestMemory::SetCollectWalkHook): throw
+// (the walk, and so its record's collect, never happens), or unwatch a spare block (the key moves
+// during the walk).
+struct CollectWalkThrown {};
+std::atomic<int> collectWalkAction{0};
+std::atomic<std::uint64_t> collectWalkUnwatch{0};
+constexpr int WalkThrows = 1;
+constexpr int WalkUnwatches = 2;
+
+void collectLeaseWalkHook() {
+    const auto action = collectWalkAction.exchange(0);
+    if (action == WalkThrows) throw CollectWalkThrown{};
+    if (action == WalkUnwatches) AgcDriver::GuestMemory::Unwatch(collectWalkUnwatch.load(), 65536);
+}
+
+[[maybe_unused]] void collectLeaseExitOnAbort(int) {
+    std::_Exit(3);
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6 and 9, L2): the template collect
+// lease over real fast proofs of a two-record sampled template, the mode as the environment sets it
+// (every row has the epoch coverage that gives the thread a collect memo key and turns the template
+// audit off). Every proof returns true in every mode; per proof the switch's counts show how many
+// records the lease held: =1 skips them (CoveredCollectGeneration) and collects the rest; =2 predicts
+// and verifies them and collects all; unset counts nothing. Cases: (a) a repeat under the same key
+// holds both records; (b) an epoch bump, (c) an unwatch and (i) an allocation change rekey (none held),
+// and the next proof holds both again; (d) a second thread that adopted the epoch (same key, other
+// owner) holds none, then both on its own; a third thread that adopts it holds none (a thread's owner
+// is never reused); back on this thread none, then both; (e) a record whose collect did not happen
+// in the proof that set the lease (its walk threw) is not held while the other is; (f) a walk that
+// moves the key after a held record: =1 fails the proof (FastFail::Collect, the full walk proves),
+// =2 counts the move, unset is today's; (g) the full walk's captureValidation (=1 after (f)) clears the
+// lease: the next proof finds no lease (with APS5_PROFILE_DRAW: V0 misses `no lease`, not `unwatch`).
+// `death` (=2): the coverage dropped under the same key; the next proof must abort.
+bool collectLeaseTests(Context context, bool death) {
+    using E = ShaderResources::CollectLeaseExperimentCounts;
+    using Path = ShaderResources::ProofPath;
+    namespace Memory = AgcDriver::GuestMemory;
+    const bool keyed = std::getenv("APS5_DEBUG_COVERAGE") != nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    if (!keyed) {
+        std::puts("skipped, the collect lease needs the epoch coverage's collect memo key (APS5_DEBUG_COVERAGE=1)");
+        return false;
+    }
+    const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_COLLECT_LEASE");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface first(context);
+    WatchedSurface second(context);
+    ClearCachedTextures(context.device);
+    // A spare watched surface: its four 64 KiB blocks are each unwatched once to move UnwatchSerial.
+    WatchedSurface spare(context);
+    struct Unhook {
+        ~Unhook() { Memory::SetCollectWalkHook(nullptr); }
+    } unhook;
+    std::size_t spareUsed = 0;
+    const auto spareBlock = [&] {
+        Require(spareUsed < SurfaceBytes / 65536, "the collect lease test ran out of spare blocks");
+        return spare.Address() + 65536 * spareUsed++;
+    };
+    Memory::SetCollectWalkHook(&collectLeaseWalkHook);
+    std::unique_lock gpu(Memory::GpuMutex());
+    Memory::BumpCollectEpoch();
+    const auto program = SampledPrograms({first.Address(), second.Address()});
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    Require(resources->Reusable() && resources->SampledTextures().size() == 2, "the collect lease template is not reusable");
+    auto before = ShaderResources::CollectLeaseExperimentNow();
+    auto profileBefore = ShaderResources::CollectLeaseCountsNow();
+    // One Revalidate of the template (it must prove current) and the switch's counts it moved.
+    struct Proof {
+        Path path;
+        E counts;
+    };
+    const auto revalidate = [&]() {
+        ShaderResources::ProofReport report{};
+        Require(resources->Revalidate(shader, &report), "the collect lease template did not prove current");
+        const auto now = ShaderResources::CollectLeaseExperimentNow();
+        const Proof proof{report.path, {now.skipped - before.skipped, now.collects - before.collects, now.predicted - before.predicted, now.verified - before.verified, now.voided - before.voided, now.moved - before.moved}};
+        before = now;
+        return proof;
+    };
+    // A fast proof's counts for `held` of its two records held by the lease, no key move.
+    const auto expectHeld = [&](const Proof& proof, std::uint64_t held, const char* what) {
+        Require(proof.path == Path::Fast, what);
+        const auto& d = proof.counts;
+        if (mode == 0) Require(d.skipped == 0 && d.collects == 0 && d.predicted == 0 && d.verified == 0 && d.voided == 0 && d.moved == 0, what);
+        else if (mode == 1) Require(d.skipped == held && d.collects == 2 - held && d.predicted == 0 && d.voided == 0 && d.moved == 0, what);
+        else Require(d.skipped == 0 && d.collects == 2 && d.predicted == held && d.verified == held && d.voided == 0 && d.moved == 0, what);
+    };
+    // The build's records, then a proof that keys the lease (the first may be a full walk): unchecked.
+    static_cast<void>(revalidate());
+    Require(revalidate().path == Path::Fast, "the collect lease template's second proof was not fast");
+    // (a)
+    expectHeld(revalidate(), 2, "a repeat proof under the same key did not hold both records");
+    expectHeld(revalidate(), 2, "a third proof under the same key did not hold both records");
+    if (death) {
+#ifdef _WIN32
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#else
+        std::signal(SIGABRT, collectLeaseExitOnAbort);
+#endif
+        Require(mode == 2, "the collect lease death case runs at APS5_EXPERIMENT_COLLECT_LEASE=2");
+        std::cout << "APS5_EXPERIMENT_COLLECT_LEASE=2: the coverage is dropped under the same key; the next proof must abort" << std::endl;
+        Memory::DropCollectCoverageForTest();
+        static_cast<void>(revalidate());
+        Require(false, "=2 did not abort on a leased record its thread's coverage does not hold");
+    }
+    // (b)
+    Memory::BumpCollectEpoch();
+    expectHeld(revalidate(), 0, "an epoch bump did not rekey the collect lease");
+    expectHeld(revalidate(), 2, "the records were not held again after an epoch bump");
+    // (c)
+    Memory::Unwatch(spareBlock(), 65536);
+    expectHeld(revalidate(), 0, "an unwatch did not rekey the collect lease");
+    expectHeld(revalidate(), 2, "the records were not held again after an unwatch");
+    // (d) Other threads, each holding the GpuMutex while this one waits.
+    gpu.unlock();
+    std::string failure;
+    const auto onThread = [&](const char* adoptedWhat, const char* againWhat) {
+        std::thread([&] {
+            try {
+                std::lock_guard lock(Memory::GpuMutex());
+                Memory::AdoptLatestCollectEpoch();
+                expectHeld(revalidate(), 0, adoptedWhat);
+                if (againWhat != nullptr) expectHeld(revalidate(), 2, againWhat);
+            } catch (const std::exception& error) {
+                failure = error.what();
+            }
+        }).join();
+        Require(failure.empty(), failure);
+    };
+    onThread("a thread that adopted the epoch (same key, other owner) held the collect lease", "the adopting thread's own covered records were not held");
+    onThread("a new thread took the coverage owner of one that ended", nullptr);
+    gpu.lock();
+    expectHeld(revalidate(), 0, "the collect lease held for its earlier owner after another thread's proofs");
+    expectHeld(revalidate(), 2, "the records were not held again on this thread");
+    // (e) Record 0 walked under the new key first, so its collect in the next proof is the coverage
+    // hit; record 1's walk throws there, so its collect never happens in the proof that sets the lease.
+    const auto unsetRecord = [&] {
+        Memory::BumpCollectEpoch();
+        static_cast<void>(Memory::CollectWrites(first.Address(), SurfaceBytes));
+        collectWalkAction.store(WalkThrows);
+        bool thrown = false;
+        try {
+            ShaderResources::ProofReport report{};
+            static_cast<void>(resources->Revalidate(shader, &report));
+        } catch (const CollectWalkThrown&) {
+            thrown = true;
+        }
+        collectWalkAction.store(0);
+        Require(thrown, "the second record's collect did not walk in the proof after an epoch bump");
+        before = ShaderResources::CollectLeaseExperimentNow();
+    };
+    unsetRecord();
+    expectHeld(revalidate(), 1, "a record whose collect did not happen when the lease was set was held, or the other was not");
+    expectHeld(revalidate(), 2, "both records were not held once both were covered");
+    // (f)
+    unsetRecord();
+    collectWalkUnwatch.store(spareBlock());
+    collectWalkAction.store(WalkUnwatches);
+    const auto moved = revalidate();
+    collectWalkAction.store(0);
+    Require(moved.path == (mode == 1 ? Path::Full : Path::Fast), mode == 1 ? "=1 did not fail a proof whose key moved after a skipped collect" : "a proof whose key moved after a held record was not fast");
+    if (mode == 1) Require(moved.counts.skipped == 1 && moved.counts.collects == 1 && moved.counts.moved == 1, "=1 did not count the skip and the move of a proof whose key moved after it");
+    else if (mode == 2) Require(moved.counts.predicted == 1 && moved.counts.verified == 1 && moved.counts.voided == 0 && moved.counts.collects == 2 && moved.counts.moved == 1, "=2 did not count the move after a held record");
+    else Require(moved.counts.moved == 0 && moved.counts.collects == 0, "the collect lease counted with its switch unset");
+    // (g) The key moved in (f) as well: every mode rekeys; =1's full walk cleared the lease before.
+    profileBefore = ShaderResources::CollectLeaseCountsNow();
+    expectHeld(revalidate(), 0, "the proof after a moved key held the collect lease");
+    if (profiled) {
+        const auto now = ShaderResources::CollectLeaseCountsNow();
+        if (mode == 1) Require(now.noLease - profileBefore.noLease == 2 && now.unwatch == profileBefore.unwatch, "the full walk's captureValidation did not clear the collect lease");
+        else Require(now.unwatch - profileBefore.unwatch == 2 && now.noLease == profileBefore.noLease, "the proof after an unwatch did not miss for the unwatch");
+    }
+    expectHeld(revalidate(), 2, "the records were not held again after the lease was cleared");
+    // (i) Only the fast proof's counts: the import checks after it are not this test's (as in the
+    // counter's test).
+    alignas(64) static std::byte other[64];
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(other, sizeof(other), true, true, true);
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(other);
+    }
+    {
+        ShaderResources::ProofReport report{};
+        static_cast<void>(resources->Revalidate(shader, &report));
+        const auto now = ShaderResources::CollectLeaseExperimentNow();
+        expectHeld({report.path, {now.skipped - before.skipped, now.collects - before.collects, now.predicted - before.predicted, now.verified - before.verified, now.voided - before.voided, now.moved - before.moved}}, 0, "an allocation change did not rekey the collect lease");
+        before = now;
+    }
+    resources.reset();
+    ClearCachedTextures(context.device);
+    std::puts("template collect lease tests passed");
+    return true;
+}
+
 bool lookupChangedTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1162,6 +1393,12 @@ int main(int argc, char** argv) {
         if (mode == "collect-lease-counter") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             collectLeaseCounterTests(context);
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6 and 9, L2): the template
+        // collect lease in the switch's mode (it takes the GpuMutex itself), and =2's death case.
+        if (mode == "collect-lease" || mode == "collect-lease-death") {
+            if (!collectLeaseTests(context, mode == "collect-lease-death")) return VulkanTestSkipped;
             return 0;
         }
         if (memory) {

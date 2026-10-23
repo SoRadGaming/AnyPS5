@@ -3061,6 +3061,79 @@ void reportCollectLeases() {
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] collect lease (10 s): fast proofs %llu, records collected %llu, would skip %llu (%.1f%%), lease rekeys %llu; misses: no key %llu, no lease %llu, owner %llu, epoch %llu, unwatch %llu, mapping %llu; W %llu (void %llu); moved mid-proof %llu\n", static_cast<U>(n.proofs), static_cast<U>(n.collected), static_cast<U>(n.wouldSkip), n.collected == 0 ? 0.0 : 100.0 * static_cast<double>(n.wouldSkip) / static_cast<double>(n.collected), static_cast<U>(n.rekeys), static_cast<U>(n.noKey), static_cast<U>(n.noLease), static_cast<U>(n.owner), static_cast<U>(n.epoch), static_cast<U>(n.unwatch), static_cast<U>(n.mapping), static_cast<U>(n.wrong), static_cast<U>(n.voided), static_cast<U>(n.movedMidProof));
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6, L2): the template collect lease
+// applied (see ShaderResources::CollectLeaseExperimentCounts). Unset or 0: off (today's collects); 2:
+// verify; anything else: on. Read once.
+int CollectLeaseMode() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_COLLECT_LEASE");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+// Cumulative relaxed counts while the switch is set, and what the last =2 report printed of them.
+struct CollectLeaseExperiment {
+    std::atomic<std::uint64_t> skipped{0}, collects{0}, predicted{0}, verified{0}, voided{0}, moved{0};
+    std::array<std::uint64_t, 6> reported{};
+    std::atomic<std::int64_t> lastReportMs{0};
+    // The first few void predictions are printed with their record.
+    std::atomic<std::uint32_t> printed{0};
+};
+
+CollectLeaseExperiment& CollectLeaseExperiments() {
+    static auto* experiment = new CollectLeaseExperiment();
+    return *experiment;
+}
+
+ShaderResources::CollectLeaseExperimentCounts collectLeaseExperimentTotals() {
+    auto& e = CollectLeaseExperiments();
+    const auto load = [](std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    return {load(e.skipped), load(e.collects), load(e.predicted), load(e.verified), load(e.voided), load(e.moved)};
+}
+
+// The =2 line every 10 s (from the first fast proof on), without APS5_PROFILE_DRAW: the gate G2 judges
+// the void share of the predictions from it.
+void reportCollectLeaseExperiment() {
+    auto& e = CollectLeaseExperiments();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = e.lastReportMs.load(std::memory_order_relaxed);
+    if (last == 0) {
+        e.lastReportMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed);
+        return;
+    }
+    if (nowMs - last < 10000 || !e.lastReportMs.compare_exchange_strong(last, nowMs, std::memory_order_relaxed)) return;
+    const auto totals = collectLeaseExperimentTotals();
+    const std::array<std::uint64_t, 6> now{totals.skipped, totals.collects, totals.predicted, totals.verified, totals.voided, totals.moved};
+    std::array<unsigned long long, 6> delta{};
+    for (std::size_t i = 0; i < now.size(); ++i) delta[i] = static_cast<unsigned long long>(now[i] - e.reported[i]);
+    e.reported = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[collect-lease] APS5_EXPERIMENT_COLLECT_LEASE=2 (10 s): records collected %llu, predicted held %llu, verified %llu, void %llu (%.3f%%), proofs whose key moved after a leased record %llu\n", delta[1], delta[2], delta[3], delta[4], delta[2] == 0 ? 0.0 : 100.0 * static_cast<double>(delta[4]) / static_cast<double>(delta[2]), delta[5]);
+}
+
+// =2's check of one record the lease predicts held, just before today's collect of it: under the
+// proof's key the record's range must be covered (the coverage is this thread's and only grows under
+// a key, so nothing races it); a key moved since the proof's start voids the prediction (=1 would fail
+// that proof at its end).
+void verifyCollectLease(const void* object, const GuestMemory::CollectMemoKey& key, std::uint32_t gen, std::uint64_t address, std::size_t bytes, bool storage, std::size_t record) {
+    auto& e = CollectLeaseExperiments();
+    e.predicted.fetch_add(1, std::memory_order_relaxed);
+    const auto now = GuestMemory::CurrentCollectMemoKey();
+    if (now != key) {
+        e.voided.fetch_add(1, std::memory_order_relaxed);
+        if (e.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[collect-lease] APS5_EXPERIMENT_COLLECT_LEASE=2: void: object %p %s record %zu (0x%llx+0x%zx) was predicted held under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which moved to {epoch %llu, unwatch %llu, mapping %llu} before its collect\n", object, storage ? "storage" : "sampled", record, static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(key.epoch), static_cast<unsigned long long>(key.unwatched), static_cast<unsigned long long>(key.mapping), static_cast<unsigned long long>(now.epoch), static_cast<unsigned long long>(now.unwatched), static_cast<unsigned long long>(now.mapping));
+        return;
+    }
+    if (!GuestMemory::CollectCovered(address, bytes)) {
+        std::fprintf(stderr, "[collect-lease] APS5_EXPERIMENT_COLLECT_LEASE=2: object %p %s record %zu (0x%llx+0x%zx) is leased at generation %u under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which still holds, but the thread's coverage does not hold its range: today's collect would not be the coverage hit =1 replaces it with\n", object, storage ? "storage" : "sampled", record, static_cast<unsigned long long>(address), bytes, static_cast<unsigned>(gen), static_cast<unsigned long long>(key.epoch), static_cast<unsigned long long>(key.unwatched), static_cast<unsigned long long>(key.mapping));
+        std::fflush(stderr);
+        std::abort();
+    }
+    e.verified.fetch_add(1, std::memory_order_relaxed);
+}
+
 void countFastFail(FastFail reason) {
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -3183,8 +3256,9 @@ void ShaderResources::captureValidation() {
     }
     lookupLog().clear();
     // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 6, V0): new records clear the collect lease (its
-    // generation stays, so no older leasedAt matches the next one).
-    if (BuildProfiled()) {
+    // generation stays, so no older leasedAt matches the next one). LOCAL EXPERIMENT
+    // (APS5_EXPERIMENT_COLLECT_LEASE, L2): also while the lease is applied or verified.
+    if (BuildProfiled() || CollectLeaseMode() != 0) {
         collectLease.key = {};
         collectLease.owner = 0;
     }
@@ -3194,50 +3268,88 @@ ShaderResources::CollectLeaseCounts ShaderResources::CollectLeaseCountsNow() {
     return readCollectLeases(CollectLeases(), [](std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); });
 }
 
+ShaderResources::CollectLeaseExperimentCounts ShaderResources::CollectLeaseExperimentNow() {
+    return collectLeaseExperimentTotals();
+}
+
 ShaderResources::CollectLeaseProof ShaderResources::beginCollectLease() {
     CollectLeaseProof proof;
-    if (!BuildProfiled()) return proof;
+    const int mode = CollectLeaseMode();
+    const bool profiled = BuildProfiled();
+    if (!profiled && mode == 0) return proof;
     proof.on = true;
+    proof.profiled = profiled;
+    proof.mode = static_cast<std::uint8_t>(mode);
     auto& profile = CollectLeases();
-    profile.proofs.fetch_add(1, std::memory_order_relaxed);
+    if (profiled) profile.proofs.fetch_add(1, std::memory_order_relaxed);
     proof.key = GuestMemory::CurrentCollectMemoKey();
     const auto owner = GuestMemory::CollectCoverageOwner();
     if (proof.key != collectLease.key || owner != collectLease.owner) {
         proof.rekeyed = !collectLease.key.Valid() ? RekeyNoLease : owner != collectLease.owner ? RekeyOwner : proof.key.epoch != collectLease.key.epoch ? RekeyEpoch : proof.key.unwatched != collectLease.key.unwatched ? RekeyUnwatch : RekeyMapping;
-        collectLease = {proof.key, owner, collectLease.gen + 1};
-        profile.rekeys.fetch_add(1, std::memory_order_relaxed);
+        auto gen = collectLease.gen + 1;
+        // LOCAL EXPERIMENT (L2): a generation never repeats; at the wrap no record keeps an older one
+        // (0 is no lease).
+        if (gen == 0) {
+            for (auto& surface : validatedTextures) surface.leasedAt = 0;
+            std::fill(storageLeasedAt.begin(), storageLeasedAt.end(), 0u);
+            gen = 1;
+        }
+        collectLease = {proof.key, owner, gen};
+        if (profiled) profile.rekeys.fetch_add(1, std::memory_order_relaxed);
     }
     if (storageLeasedAt.size() != storageTextures.size()) storageLeasedAt.assign(storageTextures.size(), 0);
+    if (mode == 2) reportCollectLeaseExperiment();
     return proof;
 }
 
-std::uint64_t ShaderResources::leaseCollect(CollectLeaseProof& proof, std::uint32_t& leasedAt, std::uint64_t address, std::size_t bytes) {
-    auto& profile = CollectLeases();
-    profile.collected.fetch_add(1, std::memory_order_relaxed);
-    if (!proof.key.Valid()) {
-        profile.noKey.fetch_add(1, std::memory_order_relaxed);
-    } else if (leasedAt == collectLease.gen) {
-        profile.wouldSkip.fetch_add(1, std::memory_order_relaxed);
-        proof.leased = true;
-        // The =2 check, as a counter: under the proof's key the range must still be covered.
-        if (GuestMemory::CurrentCollectMemoKey() != proof.key) {
-            profile.voided.fetch_add(1, std::memory_order_relaxed);
-        } else if (!GuestMemory::CollectCovered(address, bytes)) {
-            profile.wrong.fetch_add(1, std::memory_order_relaxed);
-            if (profile.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[collect-lease] W: object %p would skip the collect of 0x%llx+0x%llx under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which does not cover it\n", static_cast<const void*>(this), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(proof.key.epoch), static_cast<unsigned long long>(proof.key.unwatched), static_cast<unsigned long long>(proof.key.mapping));
+std::uint64_t ShaderResources::leaseCollect(CollectLeaseProof& proof, std::uint32_t& leasedAt, std::uint64_t address, std::size_t bytes, bool storage, std::size_t record) {
+    // The lease rule (GuestMemory.hpp), per record: the key is Valid, and the proof's start found the
+    // lease under this key and this thread's owner (else it rekeyed, and no leasedAt has the new
+    // generation yet); the record's own collect was reported covered under that generation.
+    const bool held = proof.key.Valid() && leasedAt == collectLease.gen;
+    if (proof.profiled) {
+        auto& profile = CollectLeases();
+        profile.collected.fetch_add(1, std::memory_order_relaxed);
+        if (!proof.key.Valid()) {
+            profile.noKey.fetch_add(1, std::memory_order_relaxed);
+        } else if (held) {
+            profile.wouldSkip.fetch_add(1, std::memory_order_relaxed);
+            // The =2 check, as a counter (V0, switch unset; =2 checks it itself, =1 skips the collect):
+            // under the proof's key the range must still be covered.
+            if (proof.mode == 0) {
+                if (GuestMemory::CurrentCollectMemoKey() != proof.key) {
+                    profile.voided.fetch_add(1, std::memory_order_relaxed);
+                } else if (!GuestMemory::CollectCovered(address, bytes)) {
+                    profile.wrong.fetch_add(1, std::memory_order_relaxed);
+                    if (profile.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[collect-lease] W: object %p would skip the collect of 0x%llx+0x%llx under collect memo key {epoch %llu, unwatch %llu, mapping %llu}, which does not cover it\n", static_cast<const void*>(this), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(proof.key.epoch), static_cast<unsigned long long>(proof.key.unwatched), static_cast<unsigned long long>(proof.key.mapping));
+                }
+            }
+        } else {
+            const auto reason = proof.rekeyed;
+            (reason == RekeyOwner ? profile.owner : reason == RekeyEpoch ? profile.epoch : reason == RekeyUnwatch ? profile.unwatch : reason == RekeyMapping ? profile.mapping : profile.noLease).fetch_add(1, std::memory_order_relaxed);
         }
-    } else {
-        const auto reason = proof.rekeyed;
-        (reason == RekeyOwner ? profile.owner : reason == RekeyEpoch ? profile.epoch : reason == RekeyUnwatch ? profile.unwatch : reason == RekeyMapping ? profile.mapping : profile.noLease).fetch_add(1, std::memory_order_relaxed);
     }
+    if (held) {
+        proof.leased = true;
+        // LOCAL EXPERIMENT (L2): =1 takes the coverage hit's answer at the collect's own point.
+        if (proof.mode == 1) {
+            CollectLeaseExperiments().skipped.fetch_add(1, std::memory_order_relaxed);
+            return GuestMemory::CoveredCollectGeneration();
+        }
+        if (proof.mode == 2) verifyCollectLease(this, proof.key, collectLease.gen, address, bytes, storage, record);
+    }
+    if (proof.mode != 0) CollectLeaseExperiments().collects.fetch_add(1, std::memory_order_relaxed);
     bool covered = false;
     const auto generation = GuestMemory::CollectWritesCovering(address, bytes, covered);
     if (covered) leasedAt = collectLease.gen;
     return generation;
 }
 
-void ShaderResources::endCollectLease(const CollectLeaseProof& proof) {
-    if (proof.leased && GuestMemory::CurrentCollectMemoKey() != proof.key) CollectLeases().movedMidProof.fetch_add(1, std::memory_order_relaxed);
+bool ShaderResources::endCollectLease(const CollectLeaseProof& proof) {
+    if (!proof.leased || GuestMemory::CurrentCollectMemoKey() == proof.key) return false;
+    if (proof.profiled) CollectLeases().movedMidProof.fetch_add(1, std::memory_order_relaxed);
+    if (proof.mode != 0) CollectLeaseExperiments().moved.fetch_add(1, std::memory_order_relaxed);
+    return proof.mode == 1;
 }
 
 std::size_t ShaderResources::LookupLogCapacity() {
@@ -3270,7 +3382,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
-    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7, V0): L2's lease, recorded only.
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7, V0): L2's lease, recorded. LOCAL EXPERIMENT
+    // (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6, L2): applied (=1) or verified (=2).
     auto leaseProof = beginCollectLease();
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
@@ -3305,7 +3418,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
-        surface.collected = leaseProof.on ? leaseCollect(leaseProof, surface.leasedAt, address, bytes) : GuestMemory::CollectWrites(address, bytes);
+        surface.collected = leaseProof.on ? leaseCollect(leaseProof, surface.leasedAt, address, bytes, false, i) : GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
         if (!keyProofs) {
@@ -3362,7 +3475,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
-        if ((leaseProof.on ? leaseCollect(leaseProof, storageLeasedAt[i], address, bytes) : GuestMemory::CollectWrites(address, bytes)) == 0) return fail(FastFail::Collect);
+        if ((leaseProof.on ? leaseCollect(leaseProof, storageLeasedAt[i], address, bytes, true, i) : GuestMemory::CollectWrites(address, bytes)) == 0) return fail(FastFail::Collect);
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -3409,7 +3522,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
-    if (leaseProof.on) endCollectLease(leaseProof);
+    // LOCAL EXPERIMENT (L2): at =1 a key that moved after a leased record fails the proof here, for
+    // the full walk to collect for real (the move landed before a collect =1 skipped).
+    if (leaseProof.on && endCollectLease(leaseProof)) return fail(FastFail::Collect);
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
