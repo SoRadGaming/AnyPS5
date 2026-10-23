@@ -1338,6 +1338,40 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
 
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the two halves of
+// cachedStorageTexture a target lease stands in for. Its prelude up to the key (:1250-1277, which the
+// lease's creation runs here once and its hits skip: TargetLease.cpp keeps what makes them hold) and
+// its hit path under the cache mutex (the refresh, the splice, the hit count). Keep both in step with
+// cachedStorageTexture (GPU-OWNED-PLAN 9.6, mirror tripwire).
+bool StorageLeaseKey(const Context& context, const GuestTextureResource& requested, const StorageTexture* expected, std::array<std::uint32_t, 8>& words) {
+    const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+    const auto resource = StorageSurface(context, viewed);
+    if (resource.mipCount > AllocatedLevels(resource)) return false;
+    const StorageKey key{context.device, MemoSurfaceKey(context, resource)};
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const CacheHold held(storageCacheHeld);
+    const auto it = findStorage(cache, key);
+    if (it == cache.entries.end() || it->texture.get() != expected || MetadataMoved(*it->texture, resource)) return false;
+    words = key.words;
+    return true;
+}
+
+std::shared_ptr<StorageTexture> RefreshLeasedStorage(const Context& context, const std::array<std::uint32_t, 8>& words, LeaseRefresh refresh, void* user, bool apply) {
+    const bool profile = LookupOutcomes::Profiled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const CacheHold held(storageCacheHeld);
+    const auto it = findStorage(cache, {context.device, words});
+    auto* image = it != cache.entries.end() ? it->texture.get() : nullptr;
+    if (!refresh(image, user) || image == nullptr || !apply) return nullptr;
+    cache.entries.splice(cache.entries.begin(), cache.entries, it);
+    TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
+    if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+    return it->texture;
+}
+
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory) {
     const auto heap = largestDeviceLocalHeap(memory);
     return std::max<std::uint64_t>(2048ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u : 0u);
@@ -3424,14 +3458,14 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || Recorder::InCompletion()) return false;
+CpuWriteSync CpuWritesWouldSync(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || Recorder::InCompletion()) return CpuWriteSync::None;
     auto* recorder = Recorder::Active();
-    if (recorder == nullptr) return false;
+    if (recorder == nullptr) return CpuWriteSync::None;
     const auto drawWriters = DrawCopiedWriters();
     const bool labels = Recorder::PendingCompletionLabels() != 0;
-    if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return false;
-    if (!recorder->PendingWriteOverlaps(address, bytes)) return false;
+    if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return CpuWriteSync::None;
+    if (!recorder->PendingWriteOverlaps(address, bytes)) return CpuWriteSync::None;
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
@@ -3442,7 +3476,15 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     // range wait, not every tracked label while some completion label is pending elsewhere.
     static const bool preciseLabels = std::getenv("APS5_EXPERIMENT_PRECISE_LABEL_SYNC") != nullptr;
     const bool labelPending = !deviceWriter && !drawWriter && labels && (preciseLabels ? recorder->CompletionLabelIn(address, bytes) : recorder->PendingLabelIn(address, bytes));
-    if (deviceWriter || drawWriter || labelPending) {
+    return deviceWriter ? CpuWriteSync::DeviceWriter : drawWriter ? CpuWriteSync::DrawWriter : labelPending ? CpuWriteSync::Label : CpuWriteSync::None;
+}
+
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, D4-B): the checks are CpuWritesWouldSync's,
+    // split out unchanged for the target lease's refresh, which must not sync.
+    const auto writer = CpuWritesWouldSync(context, address, bytes);
+    if (writer != CpuWriteSync::None) {
+        auto* recorder = Recorder::Active();
         Recorder::CountSync(4);
         // LOCAL DEBUG (APS5_DEBUG_SYNC_STATS=1): why dispatch and draw resources wait for the GPU here.
         static const bool syncStats = std::getenv("APS5_DEBUG_SYNC_STATS") != nullptr;
@@ -3451,7 +3493,7 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
         if (syncStats) {
             static std::atomic<std::uint64_t> counts[3]{}, waitedNs[3]{};
             static std::atomic<std::int64_t> lastMs{0};
-            const int reason = deviceWriter ? 0 : drawWriter ? 1 : 2;
+            const int reason = writer == CpuWriteSync::DeviceWriter ? 0 : writer == CpuWriteSync::DrawWriter ? 1 : 2;
             counts[reason].fetch_add(1, std::memory_order_relaxed);
             waitedNs[reason].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - syncStart).count()), std::memory_order_relaxed);
             const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();

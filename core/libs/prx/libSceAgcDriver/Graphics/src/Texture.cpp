@@ -286,7 +286,8 @@ void reportProofs() {
     }
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter's would-hits
     // and misses (TargetLease.cpp); counted outside the [draws] lookup wall, which stays comparable
-    // with r70's.
+    // with r70's. LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, 9.4.3 D4-B): then the leases' hits,
+    // creations and misses while their switch is set.
     line += TargetLeaseReport();
     AgcDriver::ProfilePrint_nid_no_patch("[proofs] storage refresh proofs per 10 s (target lookups/other callers): %s\n", line.c_str());
 }
@@ -2666,11 +2667,17 @@ StorageTexture::TargetMiss StorageTexture::TakeTargetMiss() {
     return std::exchange(targetMiss, TargetMiss::None);
 }
 
-bool StorageTexture::refreshProved(bool profile, bool scoped) {
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, D4-B): a lease's verdict for each refusal of
+// refreshProved is the failure's own, one place up.
+static_assert(static_cast<std::size_t>(StorageTexture::LeaseVerdict::NoProof) == FailNoProof + 1 && static_cast<std::size_t>(StorageTexture::LeaseVerdict::Stamped) == FailStamped + 1 && static_cast<std::size_t>(StorageTexture::LeaseVerdict::KeyPin) == FailKeyPin + 1 && FailKeyPin + 1 == ProofFailureCount, "LeaseVerdict must follow ProofFailure one place up");
+
+bool StorageTexture::refreshProved(bool profile, bool scoped, LeaseRows* lease) {
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN L2-0): each refusal names its reason on the
-    // [proofs] line.
+    // [proofs] line. LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, D4-B): a lease's refusal names
+    // it in the lease's verdict instead, uncounted (the full path it falls back to counts its own).
     const auto fail = [&](ProofFailure failure) {
-        if (profile) countProofFailure(failure);
+        if (lease != nullptr) lease->verdict = static_cast<LeaseVerdict>(static_cast<std::size_t>(failure) + 1);
+        else if (profile) countProofFailure(failure);
         return false;
     };
     if (refreshProof.generation == 0) return fail(FailNoProof);
@@ -2679,19 +2686,36 @@ bool StorageTexture::refreshProved(bool profile, bool scoped) {
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1): the surface's collect is kept for a pinned
-    // hit's generation advance below.
-    const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, bytes);
-    if (current == 0) return fail(FailCollect);
+    // hit's generation advance below. LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, D4-B): a lease
+    // skips both collects (memo hits under the collect memo key it re-checked, its ranges covered at
+    // its creation) and reads that generation in its stamp check's lock instead.
+    std::uint64_t current = 0;
+    if (lease == nullptr) {
+        current = GuestMemory::CollectWrites(descriptor.baseAddress, bytes);
+        if (current == 0) return fail(FailCollect);
+    }
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, K1): a proof taken over a pin also needs the key
         // proof still a pin (RefreshProof::keyPinned).
         if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || (refreshProof.keyPinned && keyProof.pinNote == 0)) return fail(FailKeyProof);
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return fail(FailCollect);
+        if (lease == nullptr && GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return fail(FailCollect);
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return fail(FailStamped);
+    if (lease == nullptr) {
+        if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return fail(FailStamped);
+    } else {
+        // LOCAL EXPERIMENT (D4-B): the image's rows and the lease's target-key row unchanged, and its
+        // CMASK row not stored over, in one tracker lock (three locks on the full path).
+        lease->surface = {queries[0].address, queries[0].bytes, queries[0].generation};
+        if (used > 1) lease->keys = {queries[1].address, queries[1].bytes, queries[1].generation};
+        std::array<GuestMemory::UnchangedQuery, 3> unchanged{queries[0], queries[1], GuestMemory::UnchangedQuery{}};
+        auto rows = used;
+        if (lease->targetKeys.generation != 0) unchanged[rows++] = {lease->targetKeys.address, static_cast<std::size_t>(lease->targetKeys.bytes), lease->targetKeys.generation};
+        const GuestMemory::UnchangedQuery cmask{lease->cmask.address, static_cast<std::size_t>(lease->cmask.bytes), lease->cmask.generation};
+        if (!GuestMemory::StampsHold(std::span(unchanged.data(), rows), std::span(&cmask, lease->cmask.generation != 0 ? 1 : 0), lease->drain, &current)) return fail(FailStamped);
+    }
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_KEY_PIN, GPU-OWNED-PLAN 9.3, K1): the key proof is a pin (the
     // keys read Uncompressed from the pending-store memo, not from bytes), which answers a refresh
     // only where today's path would end at its unchanged exit having done nothing else: an unscoped
@@ -2709,11 +2733,14 @@ bool StorageTexture::refreshProved(bool profile, bool scoped) {
         else if (IsDccClear(filledKeys) && !anyLayerPending()) refusal = KeyPin::FilledKeys;
         else refusal = DccKeyPinRefusal(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256), keyProof.pinNote);
         if (refusal != KeyPin::Holds) {
-            CountKeyPin(refusal, inTargetLookup, true);
+            // LOCAL EXPERIMENT (D4-B): a lease names the refusal, uncounted.
+            if (lease != nullptr) lease->pin = refusal;
+            else CountKeyPin(refusal, inTargetLookup, true);
             return fail(FailKeyPin);
         }
     }
     const auto serial = PendingSerial();
+    if (lease != nullptr) lease->serial = serial;
     // Both answering exits. LOCAL EXPERIMENT (APS5_EXPERIMENT_PROOF_UNITS=2, P1; APS5_EXPERIMENT_KEY_PIN=2,
     // K1): a unit-checked or pinned hit under its verify mode is handed to today's path, which
     // refresh() checks against it. LOCAL EXPERIMENT (K1): a pinned hit does what today's path does
@@ -2746,9 +2773,37 @@ bool StorageTexture::refreshProved(bool profile, bool scoped) {
         refreshProof.pendingSerial = serial;
         return answer(true);
     };
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): a lease's answer at
+    // the same three points. Under P1's or K1's verify mode today's path would take the refresh over:
+    // a miss, with nothing written. Otherwise a hit: the lease's rows receive what it leaves, and only
+    // when it applies are the writes made, in today's order (a conversion, the pending serial, then
+    // answer's hit count and K1's advance).
+    const auto leaseAnswer = [&](bool unitChecked, bool converted, bool newSerial) {
+        const bool unitPredicted = unitChecked && ProofUnits() == 2;
+        if (unitPredicted || (pinned && KeyPins() == 2)) {
+            lease->verdict = unitPredicted ? LeaseVerdict::P1Verifying : LeaseVerdict::K1Verifying;
+            return false;
+        }
+        lease->verdict = LeaseVerdict::Hit;
+        lease->unitChecked = unitChecked;
+        lease->pinned = pinned;
+        lease->pendingSerial = newSerial ? serial : refreshProof.pendingSerial;
+        lease->current = current;
+        if (!lease->apply) return true;
+        if (converted) {
+            refreshProof.unitChecked = true;
+            countProofUnits(UnitConverted);
+        }
+        if (newSerial) refreshProof.pendingSerial = serial;
+        return answer(unitChecked);
+    };
     if (refreshProof.unitChecked) {
         const auto reason = otherPendingReason();
-        if (reason == OtherPending::Outside) return unitHit();
+        if (reason == OtherPending::Outside) return lease != nullptr ? leaseAnswer(true, false, true) : unitHit();
+        if (lease != nullptr) {
+            lease->other = reason;
+            return fail(FailOtherPending);
+        }
         countUnitRefusal(reason);
         if (profile) countOtherPending(proofCounts.failedOther, reason);
         return fail(FailOtherPending);
@@ -2761,16 +2816,43 @@ bool StorageTexture::refreshProved(bool profile, bool scoped) {
             const int units = ProofUnits();
             const auto reason = profile || units != 0 ? otherPendingReason() : OtherPending::Outside;
             if (units != 0 && reason == OtherPending::Outside) {
+                if (lease != nullptr) return leaseAnswer(true, true, true);
                 refreshProof.unitChecked = true;
                 countProofUnits(UnitConverted);
                 return unitHit();
             }
+            if (lease != nullptr) {
+                lease->other = reason;
+                return fail(FailOtherPending);
+            }
             if (profile) countOtherPending(proofCounts.failedOther, reason);
             return fail(FailOtherPending);
         }
+        if (lease != nullptr) return leaseAnswer(false, false, true);
         refreshProof.pendingSerial = serial;
     }
-    return answer(false);
+    return lease != nullptr ? leaseAnswer(false, false, false) : answer(false);
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): refresh()'s proved route
+// for a target lease (Texture.hpp), unscoped as Refresh() is.
+StorageTexture::LeaseVerdict StorageTexture::RefreshForLease(LeaseRows& rows) {
+    const bool profile = LookupOutcomes::Profiled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // refresh()'s two CompletePendingCpuWrites would return false without a sync, or the lease misses.
+    if (CpuWritesWouldSync(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != CpuWriteSync::None || (descriptor.dccAddress != 0 && CpuWritesWouldSync(context, descriptor.dccAddress, DccKeyBytes(guestBytes)) != CpuWriteSync::None)) return rows.verdict = LeaseVerdict::CopiedWriter;
+    if (!refreshProved(profile, false, &rows) || !rows.apply) return rows.verdict;
+    // The proved exit of refresh().
+    layerBehind.clear();
+    NoteProved();
+    refreshesProved.fetch_add(1, std::memory_order_relaxed);
+    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
+    return rows.verdict;
+}
+
+StorageTexture::LeaseProofState StorageTexture::LeaseState() const {
+    const bool layersAt = std::all_of(layerGeneration.begin(), layerGeneration.end(), [&](std::uint64_t layer) { return layer == generation; });
+    return {refreshProof.generation, refreshProof.pendingSerial, generation, refreshProof.unitChecked, refreshProof.keyPinned, layersAt};
 }
 
 bool StorageTexture::otherPendingInside() const {

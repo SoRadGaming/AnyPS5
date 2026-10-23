@@ -201,11 +201,43 @@ bool cmaskProved(std::uint64_t address, std::size_t bytes) {
     return found != cmaskProofs().end() && found->second.bytes == bytes && !GuestMemory::StoredOver(address, bytes, found->second.generation);
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): moves with every proof of
+// any address while the switch is set, under the proof mutex: a target lease holding a copy of its
+// CMASK's entry reads the entry again only once some proof changed (fix 6 of 9.2: the hit tests the
+// entry of its own address, never this serial alone).
+std::atomic<std::uint64_t> cmaskProofSerial{0};
+
 void proveCmask(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     std::lock_guard lock(cmaskProofMutex());
     if (generation == 0) cmaskProofs().erase(address);
     else cmaskProofs()[address] = {bytes, generation};
+    if (TargetLeases() != 0) cmaskProofSerial.fetch_add(1, std::memory_order_release);
 }
+
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, D4-B; TargetLease.hpp).
+CmaskProofEntry CmaskProofFor(std::uint64_t address) {
+    std::lock_guard lock(cmaskProofMutex());
+    CmaskProofEntry entry;
+    entry.serial = cmaskProofSerial.load(std::memory_order_acquire);
+    if (const auto found = cmaskProofs().find(address); found != cmaskProofs().end()) {
+        entry.found = true;
+        entry.bytes = found->second.bytes;
+        entry.generation = found->second.generation;
+    }
+    return entry;
+}
+
+std::uint64_t CmaskProofSerial() {
+    return cmaskProofSerial.load(std::memory_order_acquire);
+}
+
+void NoteCmaskProof(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    proveCmask(address, bytes, generation);
+}
+
+namespace {
 
 void requireCmaskCodes(std::uint32_t codes) {
     Require((codes & 1u) == 0, "a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
@@ -281,14 +313,17 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
 }
 
 // LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): `worked`, when given, is set once the CMASK is not proved
-// expanded (the lease counter's "clear work").
-bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident, bool* worked = nullptr) {
+// expanded (the lease counter's "clear work"). LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, 9.4.3
+// D4-B): `leaseProved`, a target lease's hit whose lock held this CMASK's row (not stored over since
+// its proof, an entry of these bytes), skips cmaskProved, which would answer true (its collect a memo
+// hit under the lease's key); the code and size checks still run.
+bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident, bool* worked = nullptr, bool leaseProved = false) {
     if (color.cmaskAddress == 0) return false;
     if (context.detiler != nullptr) requireCmaskCodes(context.detiler->CmaskErrors());
     const CmaskLayout layout(color.extent.width, color.extent.height);
     const auto bytes = layout.Bytes();
     Require(color.cmaskBytes == bytes, "CMASK size differs from the color target's CMASK layout");
-    if (cmaskProved(color.cmaskAddress, bytes)) return false;
+    if (leaseProved || cmaskProved(color.cmaskAddress, bytes)) return false;
     if (worked != nullptr) *worked = true;
     auto* recorder = Recorder::Active();
     if (resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
@@ -1933,7 +1968,12 @@ void noteTargetRefreshes(DrawOutcome& outcome, bool after) {
 // stats run stays comparable with r70's, which had no counter: TargetLeaseBefore before the clock
 // starts and TargetLeaseAfter once the lookup is accounted. The order changes no value: the [draws]
 // lines they now step over write only the draw's outcome and read the clock and ThreadCollectedBytes,
-// and the counter writes only its own table and counters and TakeTargetMiss's byte.
+// and the counter writes only its own table and counters and TakeTargetMiss's byte. LOCAL EXPERIMENT
+// (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the slot loop's lookups also carry the
+// lease while the switch is set: its hit stands in for the lookup inside the lookup wall and the
+// target lookup scope (=1; =2 predicts there and the lookup runs), and skips the materializations its
+// lock proved no-ops; TargetLeaseAfter makes the lease after a quiet full path and checks =2's
+// prediction, outside the wall as the counter is.
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup, TargetLeaseUse* lease = nullptr) {
     if (lease != nullptr) TargetLeaseBefore(*lease);
     const auto lookupStart = std::chrono::steady_clock::now();
@@ -1946,21 +1986,24 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         {
             const StorageTexture::TargetLookupScope targetLookup(profile);
             try {
-                resident = lookup();
+                if (lease != nullptr) resident = TargetLeaseHit(*lease);
+                if (resident == nullptr) resident = lookup();
             } catch (...) {
                 if (profile) noteTargetRefreshes(outcome, true);
                 throw;
             }
         }
         if (profile) noteTargetRefreshes(outcome, true);
-        if (resident != nullptr) materializeRegisterClear(context, color, *resident, lease != nullptr ? &lease->registerClearWorked : nullptr);
+        // LOCAL EXPERIMENT (D4-B): skipped after a hit whose lock held the target keys' row (the range
+        // proof answers, so this would return at ProvedCurrentDccKeys), or of a target without DCC.
+        if (resident != nullptr && (lease == nullptr || !lease->skipRegisterClear)) materializeRegisterClear(context, color, *resident, lease != nullptr ? &lease->registerClearWorked : nullptr);
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
-    if (resident != nullptr) materializeCmaskClear(context, color, resident, lease != nullptr ? &lease->cmaskClearWorked : nullptr);
+    if (resident != nullptr) materializeCmaskClear(context, color, resident, lease != nullptr ? &lease->cmaskClearWorked : nullptr, lease != nullptr && lease->skipCmaskProof);
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -1973,7 +2016,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }
-    if (lease != nullptr) TargetLeaseAfter(*lease, resident != nullptr);
+    if (lease != nullptr) TargetLeaseAfter(*lease, resident.get());
     return resident;
 }
 
@@ -2952,6 +2995,29 @@ void verifyRecipeHit(const Context& context, const State& state, const Pm4::Draw
 
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B; tests): prepareDraw's slot
+// loop for one resident tiled single-level 2D target (its depth plane flush and retire, then the
+// lookup with the lease as the loop builds it; the closure's non-array branch).
+std::shared_ptr<StorageTexture> TargetLeaseLookup(const Context& context, const ColorTarget& color) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    Require(color.arrayLastSlice == 0 && color.samples == 1, "the test lookup takes a single-sample target that is not an array slice");
+    const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+    static_cast<void>(FlushDepthPlanes(color.address, colorLayout.Bytes(), DepthPlaneScope::Whole));
+    RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
+    const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Target);
+    std::optional<TargetLeaseUse> lease;
+    if (profile || TargetLeases() != 0) lease.emplace(TargetLeaseUse{&color, context.device, colorLayout.Bytes(), color.tileMode != ColorTileMode::Linear && context.detiler != nullptr, false, &context, profile});
+    const auto lookup = [&] {
+        auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
+        Require(resident->Attachable(), "storage format cannot be a color attachment");
+        Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
+        return resident;
+    };
+    const State state{};
+    DrawOutcome outcome;
+    return refreshResidentTarget(context, state, color, outcome, profile, lookup, lease ? &*lease : nullptr);
+}
+
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
     auto& key = validationKeyScratch();
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
@@ -3512,9 +3578,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             const GuestMemory::WalkCallerScope walkCaller(GuestMemory::WalkCaller::Target);
-            // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter.
+            // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.4.1 D4-0): the target lease counter; LOCAL
+            // EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, 9.4.3 D4-B): the target leases.
             std::optional<TargetLeaseUse> lease;
-            if (profile) lease.emplace(TargetLeaseUse{&color, context.device, colorLayout.Bytes(), color.tileMode != ColorTileMode::Linear && context.detiler != nullptr, dumpLimit != 0});
+            if (profile || TargetLeases() != 0) lease.emplace(TargetLeaseUse{&color, context.device, colorLayout.Bytes(), color.tileMode != ColorTileMode::Linear && context.detiler != nullptr, dumpLimit != 0, &context, profile});
             // LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A, item 4; behaviour-identical, so not switched):
             // the lookup reaches its inputs through one reference, so its closure (8 bytes, where four
             // captured references took 32) fits libstdc++'s 16-byte std::function buffer and the lookup
