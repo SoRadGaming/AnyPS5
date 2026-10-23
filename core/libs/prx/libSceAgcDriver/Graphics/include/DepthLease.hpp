@@ -27,9 +27,10 @@
 //   not accessible, misses as unproven, not as stamped);
 // - nothing stamped the depth or stencil plane since the generations NoteMemory took, nor the HTILE
 //   since the generation its read proof held (GuestMemory::StampsHold without the drain);
-// - no host write had ended unstamped (APS5_EXPERIMENT_HOST_WRITE_STAMPS=1 queues them for the next
-//   tracker lock holder to stamp: the stamp test does not drain them, and one queued could stamp a
-//   range when drained, so with every range unstamped it misses as "host writes pending");
+// - no host write had ended unstamped over the pages of a range (APS5_EXPERIMENT_HOST_WRITE_STAMPS=1
+//   queues them for the next tracker lock holder to stamp: the stamp test does not drain them, and one
+//   queued over a range stamps it when drained, so with every range unstamped it misses as "host
+//   writes pending"; one elsewhere stamps no range when drained, so it is no miss);
 // - no write over the HTILE was noted after the newest note at that end (with no batch finished, so
 //   Recorder::NewestWriteNote over the HTILE is unchanged: Recorder::WrittenAfterNote).
 // Otherwise it misses, by the first of those that moved (a memo key move by its cause: the epoch,
@@ -37,12 +38,13 @@
 // condition: its moves are counted apart, for the would-hits and for the misses. A would-hit whose
 // call still did work a lease would skip (an HTILE clear stored back, a cleared HTILE taken, the depth
 // mirror synced) is counted too. The checks before the call's own work read state only: one tracker
-// lock without the drain (the host writes queued meanwhile stay queued for the call's own first
-// collect, so the counter changes neither the tracker's drain order nor its lock count beyond that
-// one lock; its per-range answers name the range) and the recorder under the GPU lock; at the end
-// one htileReads lookup and a walk of clearedHtiles (normally empty). Counted on the [proofs] line,
-// with the counter's own time, summed apart by the [draws] phase that carries it: "prepare" for
-// Draw's call, "readTarget" for DrawWithRecipe's (DepthLeaseRecipeScope).
+// lock without the drain, not counted on [guestmem]'s tracker waits line, and under it the host-write
+// queue's mutex while a write is pending (the host writes queued meanwhile stay queued for the call's
+// own first collect, so the counter changes neither the tracker's drain order nor its counted locks,
+// though its hold may make another lock wait; its per-range answers name the range) and the recorder
+// under the GPU lock; at the end one htileReads lookup and a walk of clearedHtiles (normally empty).
+// Counted on the [proofs] line, with the counter's own time, summed apart by the [draws] phase that
+// carries it: "prepare" for Draw's call, "readTarget" for DrawWithRecipe's (DepthLeaseRecipeScope).
 namespace AgcDriver::Graphics {
 
 // The state an eligible call leaves (its end) and the next call of the target reads at its start.

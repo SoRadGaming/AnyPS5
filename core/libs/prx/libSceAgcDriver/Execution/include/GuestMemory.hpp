@@ -100,12 +100,14 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 // answer from the same lock (every row is then tested, none skipped after a failure): in `rows`, which
 // holds at least one entry per row, the unchanged rows first, then the not-stored-over ones: Held;
 // Unproven (generation 0, empty, not covered, an unwatched tracker, or a not-stored-over row over a
-// host region: no stamp moved it); Stamped. And whether host writes had ended unstamped when a lock
-// without the drain was taken (what the drain would stamp first; false when it drains).
+// host region: no stamp moved it); Stamped. And whether a host write had ended unstamped over one
+// of the rows' pages when a lock without the drain was taken (what the drain would stamp first over
+// a row; one elsewhere stamps none of them; false when it drains). A report's lock without the drain
+// is not counted on [guestmem]'s tracker waits line.
 enum class StampRow : std::uint8_t { Held, Unproven, Stamped };
 struct StampsHoldReport {
     std::span<StampRow> rows;
-    bool hostWritesPending = false;
+    bool hostWritesOver = false;
 };
 bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain = true, std::uint64_t* current = nullptr, StampsHoldReport* report = nullptr);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);

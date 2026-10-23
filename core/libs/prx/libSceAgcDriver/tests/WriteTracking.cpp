@@ -1935,7 +1935,7 @@ void CheckStampsHold() {
         Require(StampsHold(unchanged, stored) == (unchangedAll && notStoredOver), "StampsHold's rows together disagree with UnchangedSinceAll and StoredOver");
         std::array<StampRow, 4> answers{};
         StampsHoldReport report{answers};
-        Require(StampsHold(unchanged, stored, round % 2 == 0, nullptr, &report) == (unchangedAll && notStoredOver) && !report.hostWritesPending, "StampsHold with a report answers otherwise than without, or reports host writes pending");
+        Require(StampsHold(unchanged, stored, round % 2 == 0, nullptr, &report) == (unchangedAll && notStoredOver) && !report.hostWritesOver, "StampsHold with a report answers otherwise than without, or reports host writes pending");
         for (std::size_t i = 0; i < unchanged.size(); ++i) {
             const auto& query = unchanged[i];
             const auto expected = query.generation == 0 || query.bytes == 0 || !Watched(query.address, query.bytes) ? StampRow::Unproven : UnchangedSince(query.address, query.bytes, query.generation) ? StampRow::Held : StampRow::Stamped;
@@ -1975,9 +1975,27 @@ void CheckStampsHold() {
         Require(StampsHold(rows, {}, false, &seen) && seen == before, "a StampsHold without the drain stamped a queued host write");
         std::array<StampRow, 1> answer{};
         StampsHoldReport report{answer};
-        Require(StampsHold(rows, {}, false, nullptr, &report) && report.hostWritesPending && answer[0] == StampRow::Held, "a StampsHold without the drain did not report the queued host write pending (its row held)");
+        Require(StampsHold(rows, {}, false, nullptr, &report) && report.hostWritesOver && answer[0] == StampRow::Held, "a StampsHold without the drain did not report the queued host write over its row (its row held)");
         Require(!StampsHold(rows, {}), "the draining StampsHold missed a queued host write");
-        Require(!StampsHold(rows, {}, false, nullptr, &report) && !report.hostWritesPending && answer[0] == StampRow::Stamped, "the stamped host write was still reported pending, or its row not stamped");
+        Require(!StampsHold(rows, {}, false, nullptr, &report) && !report.hostWritesOver && answer[0] == StampRow::Stamped, "the stamped host write was still reported pending, or its row not stamped");
+    }
+    {
+        // Host writes queued over none of a row's pages (another block, the row's block past its
+        // pages, the page before it) are not reported over it, and their drain leaves the row held in
+        // both forms: the drain stamps a write's own pages, page exact. One sharing a row's page is.
+        const HostWriteHookScope hook(&NoteHostWriteHook);
+        CollectWritesUncached(base, bytes);
+        const std::array rows{UnchangedQuery{base + Block + 4096, 2 * 4096, TrackerGeneration()}};
+        HostWriteBytes(memory + 3 * Block + 100, 16, 0x66);
+        HostWriteBytes(memory + Block + 4 * 4096, 16, 0x66);
+        HostWriteBytes(memory + Block + 4096 - 16, 16, 0x66);
+        std::array<StampRow, 2> answers{};
+        StampsHoldReport report{answers};
+        Require(StampsHold(rows, rows, false, nullptr, &report) && !report.hostWritesOver, "host writes queued over none of a row's pages were reported over it");
+        Require(StampsHold(rows, rows), "the drain of host writes over none of a row's pages stamped the row");
+        HostWriteBytes(memory + Block + 3 * 4096 - 1, 2, 0x66);
+        Require(StampsHold(rows, rows, false, nullptr, &report) && report.hostWritesOver, "a host write queued over a row's last page was not reported over it");
+        Require(!StampsHold(rows, {}) && !StampsHold({}, rows), "the drain of a host write over a row's page left the row unchanged");
     }
 }
 

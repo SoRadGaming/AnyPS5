@@ -7763,6 +7763,11 @@ bool targetLeaseDrawTests(const Device& device, Recorder& recorder) {
     const auto keyCount = DccKeyBytes(color.bytes);
     Require(color.bytes <= keyOffset && color.bytes <= bytes - otherOffset && keyCount <= cmaskOffset - keyOffset && color.cmaskBytes <= 65536 && DescribeSurface(SurfaceForTarget(color)).guestBytes == color.bytes, "lease draw fixture: unexpected target sizes");
     std::memset(memory, 0x55, bytes);
+    // The target's bytes hold depths in [0, 1], which the depth plane case reads as its plane.
+    for (std::size_t offset = 0; offset + sizeof(float) <= color.bytes; offset += sizeof(float)) {
+        const float depth = 0.5f;
+        std::memcpy(memory + offset, &depth, sizeof(depth));
+    }
     std::memset(memory + keyOffset, 0xff, keyCount);
     std::memset(memory + cmaskOffset, 0xff, color.cmaskBytes);
     {
@@ -7860,20 +7865,38 @@ bool targetLeaseDrawTests(const Device& device, Recorder& recorder) {
     expectMiss("lease draws: a key store was answered from the lease");
     settle("lease draws: no lease after a key store");
 
-    // A depth plane drawn over the target (stale until the slot loop's flush stores it over the
-    // target, which retires the surface). The harness may not store planes: then not tested.
+    // A depth plane drawn over the target: a mirrorable one (D32, swizzle mode Z64KBX, one sample),
+    // which DepthSurfaceView marks stale over the target's bytes (not its keys). The slot loop's flush
+    // then stores it over the target (a store the lease's stamp test sees) and retires the surface, so
+    // the lookup misses. Not tested only where the harness cannot make the depth surface; once it is
+    // made, a plane left fresh, a lookup answered from the lease or a plane not stored fails the test.
     {
-        bool tested = false;
+        DepthTarget depth{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        depth.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+        GuestTextureResource plane{};
+        plane.baseAddress = address;
+        plane.width = side;
+        plane.height = side;
+        plane.mipCount = 1;
+        plane.allocatedMipCount = 1;
+        plane.tileMode = TextureTileMode::kZ64KBX;
+        plane.dimension = TextureDimension::k2D;
+        plane.format = 22;
+        Require(DescribeSurface(plane).guestBytes <= keyOffset, "lease draws fixture: the depth plane reaches the target's keys");
+        const auto stores = DepthPlaneStoreCounts().stores;
+        bool drawn = false;
         try {
-            const DepthTarget depth{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
-            if (DepthSurfaceView(context, depth) != VK_NULL_HANDLE && DepthPlanesStaleOver(address, color.bytes)) {
-                expectMiss("lease draws: a depth plane over the target was answered from the lease");
-                tested = true;
-            }
+            drawn = DepthSurfaceView(context, depth) != VK_NULL_HANDLE;
         } catch (const std::exception& error) {
-            std::cout << "lease draws: a depth plane over the target could not be drawn or stored here (" << error.what() << ")\n";
+            std::cout << "lease draws: a depth surface over the target could not be made here (" << error.what() << ")\n";
         }
-        if (!tested) std::cout << "lease draws: the depth plane case not tested\n";
+        if (drawn) {
+            Require(DepthPlanesStaleOver(address, color.bytes), "lease draws: a written depth plane over the target is not stale");
+            expectMiss("lease draws: a depth plane over the target was answered from the lease");
+            Require(DepthPlaneStoreCounts().stores > stores && !DepthPlanesStaleOver(address, color.bytes), "lease draws: the slot loop's flush did not store the depth plane over the target");
+        } else {
+            std::cout << "lease draws: the depth plane case not tested\n";
+        }
         // ClearDepthSurfaces destroys the surfaces' images at once (it is the device teardown's, run
         // with nothing in flight): the work recorded over the surface (its creation, the slot loop's
         // plane store) must finish first, or the batch goes to the queue over a destroyed image and
@@ -12859,10 +12882,19 @@ bool depthLeaseCounterTests(const Device& device, Recorder& recorder) {
         ~Release() { ReleaseWatched(memory, bytes); }
     } release{memory};
     const auto& context = device.GetContext();
+    // ClearDepthSurfaces destroys the surfaces' images at once (the device teardown's): the batch
+    // that recorded work over them must finish first, on a failed expectation too.
     struct Clear {
+        Recorder& recorder;
         VkDevice device;
-        ~Clear() { ClearDepthSurfaces(device); }
-    } clear{context.device};
+        ~Clear() {
+            try {
+                recorder.Sync();
+            } catch (...) {
+            }
+            ClearDepthSurfaces(device);
+        }
+    } clear{recorder, context.device};
     const auto base = reinterpret_cast<std::uint64_t>(memory);
     constexpr VkExtent2D extent{64, 64};
     const auto htileBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
@@ -12967,9 +12999,11 @@ bool depthLeaseCounterTests(const Device& device, Recorder& recorder) {
     {
         // Host writes that ended unstamped (queued for the next tracker lock holder, as under
         // APS5_EXPERIMENT_HOST_WRITE_STAMPS=1; the hook installed by hand): the stamp test takes its
-        // lock without the drain, so with every range unstamped the call misses as pending host
-        // writes, over the depth plane too (not stamped first to name the plane); the call's own
-        // collects then stamp the queue, and the next call would hit.
+        // lock without the drain, so with every range unstamped a call misses as pending host writes
+        // when one lies over a range's pages, the depth plane's too (not stamped first to name the
+        // plane), and would hit when none does: elsewhere, or in the HTILE's block past its pages (the
+        // drain stamps a write's own pages only). The call's own collects then stamp the queue, and
+        // the next call would hit.
         struct HostWriteHook {
             HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&note); }
             ~HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr); }
@@ -12983,8 +13017,12 @@ bool depthLeaseCounterTests(const Device& device, Recorder& recorder) {
             Require(write.Open(), "D5-0: the host write did not open");
             std::memset(bytes, 0x66, 16);
         };
-        expect(a, [&] { hostWrite(unrelated + 4096); }, DepthLease::HostWrites, "a host write elsewhere ended unstamped");
+        expect(a, [&] { hostWrite(unrelated + 4096); }, DepthLease::WouldHit, "a host write elsewhere ended unstamped");
         expect(a, none, DepthLease::WouldHit, "the call after the host write elsewhere was stamped");
+        Require(htileBytes + 2 * 4096 <= block, "D5-0 fixture: the HTILE leaves no page of its block free");
+        const auto pastHtile = (a.htileAddress + htileBytes + 4095) / 4096 * 4096;
+        expect(a, [&] { hostWrite(pastHtile); }, DepthLease::WouldHit, "a host write in the HTILE's block past its pages ended unstamped");
+        expect(a, none, DepthLease::WouldHit, "the call after the host write past the HTILE was stamped");
         expect(a, [&] { hostWrite(a.address + 4096); }, DepthLease::HostWrites, "a host write over the depth plane ended unstamped");
         expect(a, none, DepthLease::WouldHit, "the call after the host write over the depth plane was stamped");
     }

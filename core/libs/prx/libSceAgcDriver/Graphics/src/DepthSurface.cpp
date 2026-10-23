@@ -1922,11 +1922,12 @@ std::uint64_t depthLeaseNs(std::chrono::steady_clock::time_point start) {
 
 // Reads only: the memo key, the recorder under the GPU lock (eligibility requires it held) and, while
 // the memo key and the finished serial held, one tracker lock for the stamps, taken without the drain
-// (none when a range has no generation), whose per-range answers name a failed range (unproven before
-// stamped, depth before stencil before HTILE), and with every range unstamped, the host writes that
-// ended unstamped (a miss of their own: a drain could stamp a range) and else the HTILE's newer
-// writes. The host writes queued meanwhile stay queued for the call's own first collect, so profiling
-// moves neither the tracker's drain order nor its lock count beyond that one lock.
+// (none when a range has no generation; not counted on [guestmem]'s tracker line), whose per-range
+// answers name a failed range (unproven before stamped, depth before stencil before HTILE), and with
+// every range unstamped, a host write that ended unstamped over a range's pages (a miss of its own:
+// the drain would stamp that range) and else the HTILE's newer writes. The host writes queued
+// meanwhile stay queued for the call's own first collect, so profiling moves neither the tracker's
+// drain order nor its counted locks.
 void depthLeaseStart(DepthLeaseUse& use, const Context& context, const DepthTarget& target, bool native) {
     const auto start = std::chrono::steady_clock::now();
     use.recorder = RecorderFor(context);
@@ -1981,7 +1982,7 @@ void depthLeaseStart(DepthLeaseUse& use, const Context& context, const DepthTarg
                     break;
                 }
             }
-        } else if (report.hostWritesPending) {
+        } else if (report.hostWritesOver) {
             use.stamped = DepthLease::HostWrites;
         } else if (use.recorder != nullptr && use.ranges[2].bytes != 0) {
             use.htileWritten = use.recorder->WrittenAfterNote(use.ranges[2].address, use.ranges[2].bytes, use.previous.writeNotes);

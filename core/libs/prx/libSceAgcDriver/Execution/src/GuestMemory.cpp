@@ -2649,12 +2649,36 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
+namespace {
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0), under the tracker lock: whether a host write
+// that ended unstamped lies over one of the rows' pages. No drain runs under that lock (only its
+// holder stamps the queue; a writer's own drain only tries it), so the queue holds every such write.
+// The drain stamps a write's own pages, page exact (its walk covers only those pages), so a write
+// over none of the rows' pages leaves every row's answer as this lock reads it. The queue's mutex
+// is taken under the tracker lock, as drainHostWrites takes it.
+bool hostWritesOverRows(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver) {
+    if (!hostWritesPending()) return false;
+    auto& queue = hostWriteQueue();
+    const std::lock_guard lock(queue.mutex);
+    const auto over = [&](const UnchangedQuery& row) {
+        if (row.bytes == 0) return false;
+        const auto first = row.address / WritePageBytes;
+        const auto last = (row.address + row.bytes - 1) / WritePageBytes;
+        return std::any_of(queue.ranges.begin(), queue.ranges.end(), [&](const auto& range) { return range.first / WritePageBytes <= last && first <= (range.second - 1) / WritePageBytes; });
+    };
+    return std::any_of(unchanged.begin(), unchanged.end(), over) || std::any_of(notStoredOver.begin(), notStoredOver.end(), over);
+}
+}
+
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the unchanged rows as
 // UnchangedSinceAll tests them, the not-stored-over rows as StoredOver's answer negated, in one lock.
-// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): with a report, every row is answered.
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): with a report, every row is answered, and
+// a report's lock without the drain (the DepthSurfaceView counter's, which only profiling runs) is
+// taken plainly: it adds nothing to [guestmem]'s tracker waits and acquisitions, which stay the
+// count of the driver's own locks (its hold may still make one of them wait).
 bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain, std::uint64_t* current, StampsHoldReport* report) {
     auto& tracker = Tracker();
-    const auto lock = drain ? lockTracker(tracker) : acquireTracker(tracker);
+    const auto lock = drain ? lockTracker(tracker) : report != nullptr ? std::unique_lock(tracker.mutex) : acquireTracker(tracker);
     tracker.initialize();
     if (current != nullptr) *current = tracker.generation.load(std::memory_order_relaxed);
     const auto unchangedRow = [&](const UnchangedQuery& row) {
@@ -2679,9 +2703,8 @@ bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const Uncha
         return true;
     }
     require(report->rows.size() >= unchanged.size() + notStoredOver.size(), "StampsHold's report has fewer entries than rows");
-    // Under the lock no drain runs (only a tracker lock holder stamps the queue), so this is what the
-    // draining form would have stamped first.
-    report->hostWritesPending = !drain && hostWritesPending();
+    // What the draining form would have stamped first over a row (none when it drains).
+    report->hostWritesOver = !drain && hostWritesOverRows(unchanged, notStoredOver);
     bool held = tracker.watched;
     std::size_t at = 0;
     for (const auto& row : unchanged) {

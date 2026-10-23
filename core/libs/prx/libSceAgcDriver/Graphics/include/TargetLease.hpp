@@ -112,13 +112,12 @@ struct TargetLeasePrediction {
     // the hit skips (RegisterClear, Cmask: TargetLeaseBeforeMaterialize). Per point, whether it was
     // reached, what had landed since the prediction by then (null: nothing) and the walked count
     // there. A failure is classified at the point before its own check, so a materialization's own
-    // stamps, pending marks and reaps never excuse its own disagreement. The CMASK's landed is read
-    // before today's register clear (`cmaskLandedEarly`), which runs between the hit's lock and the
-    // CMASK at =2 only: its stores over the CMASK abort instead of counting as raced.
+    // stamps, pending marks and reaps never excuse its own disagreement. The CMASK's point follows
+    // today's register clear (=2 runs it live), whose part must pass before the CMASK's is checked:
+    // that call then only stamped other threads' writes, so what lands there is a race.
     std::array<bool, 3> reached{};
     std::array<const char*, 3> landed{};
     std::array<std::uint64_t, 3> walkedAt{};
-    bool cmaskLandedEarly = false;
 };
 enum class TargetLeasePoint : std::uint8_t { Lookup, RegisterClear, Cmask };
 

@@ -2001,8 +2001,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         if (profile) noteTargetRefreshes(outcome, true);
         // LOCAL EXPERIMENT (D4-B): skipped after a hit whose lock held the target keys' row (the range
         // proof answers, so this would return at ProvedCurrentDccKeys), or of a target without DCC. =2
-        // reads its race test right before each materialization a prediction skips (the CMASK's here
-        // too, before this live call: TargetLeaseBeforeMaterialize).
+        // reads its race test right before each materialization a prediction skips.
         if (lease != nullptr && lease->prediction.hit && resident != nullptr) TargetLeaseBeforeMaterialize(*lease, false);
         if (resident != nullptr && (lease == nullptr || !lease->skipRegisterClear)) materializeRegisterClear(context, color, *resident, lease != nullptr ? &lease->registerClearWorked : nullptr);
     } catch (const std::exception& error) {
