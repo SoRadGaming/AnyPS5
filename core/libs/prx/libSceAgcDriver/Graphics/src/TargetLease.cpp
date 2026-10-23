@@ -345,11 +345,11 @@ const char* landedSincePrediction(const TargetLeaseUse& use) {
 }
 
 // =2: the race test at one point of today's path, with the walked count there (TargetLeasePrediction).
-void notePoint(TargetLeaseUse& use, TargetLeasePoint point) {
+void notePoint(TargetLeaseUse& use, TargetLeasePoint point, const char* landed) {
     auto& prediction = use.prediction;
     const auto at = static_cast<std::size_t>(point);
     prediction.reached[at] = true;
-    prediction.landed[at] = landedSincePrediction(use);
+    prediction.landed[at] = landed;
     prediction.walkedAt[at] = GuestMemory::ThreadCollectedBytes();
 }
 
@@ -359,10 +359,11 @@ void notePoint(TargetLeaseUse& use, TargetLeasePoint point) {
 // returned (TargetLeaseLookedUp): a materialization the hit does not skip runs live in both and may
 // refresh or rescan. Each materialization the hit skips has its own part: no work (d), no walk (c)
 // and its proof unchanged (f). A failure after which something landed (landedSincePrediction), read
-// at the point before the failing part ran, or K1's advance at a later reading of the tracker clock,
-// is raced (the first 8 printed): a part's own stamps, pending marks and reaps come after its point,
-// so they never excuse its own failure (today's lookup is read after it returned, so its own may).
-// Any other aborts.
+// at the point before the failing part ran (the CMASK part's before today's register clear, which
+// runs between the hit's lock and the CMASK at =2 only), or K1's advance at a later reading of the
+// tracker clock, is raced (the first 8 printed): a part's own stamps, pending marks and reaps come
+// after its point, so they never excuse its own failure (today's lookup is read after it returned, so
+// its own may). Any other aborts.
 void verifyPrediction(TargetLeaseUse& use, StorageTexture* resident) {
     const auto& prediction = use.prediction;
     const auto& color = *use.color;
@@ -573,10 +574,14 @@ std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use) {
         Require(texture->Attachable(), "storage format cannot be a color attachment");
         Require(color.mipCount > 1 || color.depth > 1 || texture->GuestBytes() == use.colorBytes, "resident image layout differs from the color layout");
         // 7. The materializations the lock proved no-ops (fix 18 of 9.2: a target without its keys'
-        // row, a K1 target, clears its keys live at today's place).
+        // row, a K1 target, clears its keys live at today's place). The CMASK's row held in the lock,
+        // before that place: a live register clear may sync (completion actions), store or flush images
+        // over the CMASK, after which today's cmaskProved answers otherwise, so the CMASK proof is
+        // skipped only when the register clear is skipped too (then nothing of today's path runs
+        // between the lock and materializeCmaskClear); after a live one it runs as today.
         use.hit = true;
         use.skipRegisterClear = color.dccAddress == 0 || probe.rows.targetKeys.generation != 0;
-        use.skipCmaskProof = color.cmaskAddress != 0;
+        use.skipCmaskProof = color.cmaskAddress != 0 && use.skipRegisterClear;
         // The way's tick, so a set conflict replaces the least recently used lease, with or without
         // APS5_PROFILE_DRAW (only creations and hits write the table while the switch is set).
         entry->used = ++table.tick;
@@ -593,7 +598,7 @@ std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use) {
         prediction.hit = true;
         prediction.texture = probe.image;
         prediction.skipRegisterClear = color.dccAddress == 0 || rows.targetKeys.generation != 0;
-        prediction.skipCmaskProof = color.cmaskAddress != 0;
+        prediction.skipCmaskProof = color.cmaskAddress != 0 && prediction.skipRegisterClear;
         prediction.unitChecked = rows.unitChecked;
         prediction.pinned = rows.pinned;
         prediction.pinNote = probe.pinNote;
@@ -630,14 +635,30 @@ void TargetLeaseLookedUp(TargetLeaseUse& use, StorageTexture* resident) {
         prediction.proofUnitChecked = state.unitChecked;
         prediction.layersAt = state.layersAt;
     }
-    notePoint(use, TargetLeasePoint::Lookup);
+    notePoint(use, TargetLeasePoint::Lookup, landedSincePrediction(use));
 }
 
+// The CMASK part's race test is read here, before today's register clear, which =2 always runs live
+// (=1's hit skips it with the CMASK proof): a store over the CMASK by that call is today's own path,
+// so it aborts instead of counting as raced. Its walked count is still split right before
+// materializeCmaskClear, which ends the register clear's part.
 void TargetLeaseBeforeMaterialize(TargetLeaseUse& use, bool cmask) {
-    const auto& prediction = use.prediction;
+    auto& prediction = use.prediction;
     if (!prediction.hit) return;
-    if (cmask ? !prediction.skipCmaskProof : (!prediction.skipRegisterClear || use.color->dccAddress == 0)) return;
-    notePoint(use, cmask ? TargetLeasePoint::Cmask : TargetLeasePoint::RegisterClear);
+    constexpr auto cmaskAt = static_cast<std::size_t>(TargetLeasePoint::Cmask);
+    if (!cmask) {
+        const bool registerClear = prediction.skipRegisterClear && use.color->dccAddress != 0;
+        if (!registerClear && !prediction.skipCmaskProof) return;
+        const auto landed = landedSincePrediction(use);
+        if (registerClear) notePoint(use, TargetLeasePoint::RegisterClear, landed);
+        if (prediction.skipCmaskProof) {
+            prediction.landed[cmaskAt] = landed;
+            prediction.cmaskLandedEarly = true;
+        }
+        return;
+    }
+    if (!prediction.skipCmaskProof) return;
+    notePoint(use, TargetLeasePoint::Cmask, prediction.cmaskLandedEarly ? prediction.landed[cmaskAt] : landedSincePrediction(use));
 }
 
 void TargetLeaseAfter(TargetLeaseUse& use, StorageTexture* resident) {

@@ -316,8 +316,9 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
 // LOCAL DEBUG (GPU-OWNED-PLAN 9.4.1 D4-0): `worked`, when given, is set once the CMASK is not proved
 // expanded (the lease counter's "clear work"). LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, 9.4.3
 // D4-B): `leaseProved`, a target lease's hit whose lock held this CMASK's row (not stored over since
-// its proof, an entry of these bytes), skips cmaskProved, which would answer true (its collect a memo
-// hit under the lease's key); the code and size checks still run.
+// its proof, an entry of these bytes) and that skipped the register clear too (nothing ran since the
+// lock), skips cmaskProved, which would answer true (its collect a memo hit under the lease's key);
+// the code and size checks still run.
 bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident, bool* worked = nullptr, bool leaseProved = false) {
     if (color.cmaskAddress == 0) return false;
     if (context.detiler != nullptr) requireCmaskCodes(context.detiler->CmaskErrors());
@@ -2000,7 +2001,8 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         if (profile) noteTargetRefreshes(outcome, true);
         // LOCAL EXPERIMENT (D4-B): skipped after a hit whose lock held the target keys' row (the range
         // proof answers, so this would return at ProvedCurrentDccKeys), or of a target without DCC. =2
-        // reads its race test right before each materialization a prediction skips.
+        // reads its race test right before each materialization a prediction skips (the CMASK's here
+        // too, before this live call: TargetLeaseBeforeMaterialize).
         if (lease != nullptr && lease->prediction.hit && resident != nullptr) TargetLeaseBeforeMaterialize(*lease, false);
         if (resident != nullptr && (lease == nullptr || !lease->skipRegisterClear)) materializeRegisterClear(context, color, *resident, lease != nullptr ? &lease->registerClearWorked : nullptr);
     } catch (const std::exception& error) {
@@ -2010,7 +2012,10 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
     if (lease != nullptr && lease->prediction.hit && resident != nullptr) TargetLeaseBeforeMaterialize(*lease, true);
-    if (resident != nullptr) materializeCmaskClear(context, color, resident, lease != nullptr ? &lease->cmaskClearWorked : nullptr, lease != nullptr && lease->skipCmaskProof);
+    // LOCAL EXPERIMENT (D4-B): the hit's CMASK row stands for cmaskProved only when the register clear
+    // was skipped too: a live one (no target keys' row) may sync, store or flush over the CMASK after
+    // the hit's lock, and cmaskProved then runs as today.
+    if (resident != nullptr) materializeCmaskClear(context, color, resident, lease != nullptr ? &lease->cmaskClearWorked : nullptr, lease != nullptr && lease->skipCmaskProof && lease->skipRegisterClear);
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -3004,8 +3009,9 @@ void verifyRecipeHit(const Context& context, const State& state, const Pm4::Draw
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B; tests): prepareDraw's slot
 // loop for one resident tiled single-level 2D target (its depth plane flush and retire, then the
-// lookup with the lease as the loop builds it; the closure's non-array branch).
-std::shared_ptr<StorageTexture> TargetLeaseLookup(const Context& context, const ColorTarget& color) {
+// lookup with the lease as the loop builds it; the closure's non-array branch). `used`: the lease use
+// as the lookup left it.
+std::shared_ptr<StorageTexture> TargetLeaseLookup(const Context& context, const ColorTarget& color, TargetLeaseUse* used) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     Require(color.arrayLastSlice == 0 && color.samples == 1, "the test lookup takes a single-sample target that is not an array slice");
     const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
@@ -3022,7 +3028,9 @@ std::shared_ptr<StorageTexture> TargetLeaseLookup(const Context& context, const 
     };
     const State state{};
     DrawOutcome outcome;
-    return refreshResidentTarget(context, state, color, outcome, profile, lookup, lease ? &*lease : nullptr);
+    auto resident = refreshResidentTarget(context, state, color, outcome, profile, lookup, lease ? &*lease : nullptr);
+    if (used != nullptr) *used = lease ? *lease : TargetLeaseUse{};
+    return resident;
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {

@@ -61,7 +61,9 @@
 // one), then the splice and hit count; then the lookup's two Requires on the image, and the
 // materializations: materializeRegisterClear only when the target keys' row was not in the lock (K1
 // targets, whose range proof is never stable), materializeCmaskClear with its proof test skipped
-// (its code and size checks still run). Every revocation is live: identity, eviction and replacement
+// only when the register clear was skipped too (its code and size checks still run; after a live
+// register clear, which may sync, store or flush over the CMASK past the lock, the proof runs as
+// today). Every revocation is live: identity, eviction and replacement
 // (the cache), levels, the epoch, UnwatchSerial and allocations (the memo key), stamps of every kind
 // and host writes (StampsHold drains them under the tracker lock), the pending registry and P1's unit
 // check, K1's pin (refreshProved), depth planes, copied writers and completion labels (the head of
@@ -76,7 +78,7 @@ class StorageTexture;
 struct TargetLeasePrediction {
     bool hit = false;
     const StorageTexture* texture = nullptr;
-    // The materializations the hit would skip.
+    // The materializations the hit would skip (the CMASK proof only with the register clear).
     bool skipRegisterClear = false;
     bool skipCmaskProof = false;
     bool unitChecked = false;
@@ -110,10 +112,13 @@ struct TargetLeasePrediction {
     // the hit skips (RegisterClear, Cmask: TargetLeaseBeforeMaterialize). Per point, whether it was
     // reached, what had landed since the prediction by then (null: nothing) and the walked count
     // there. A failure is classified at the point before its own check, so a materialization's own
-    // stamps, pending marks and reaps never excuse its own disagreement.
+    // stamps, pending marks and reaps never excuse its own disagreement. The CMASK's landed is read
+    // before today's register clear (`cmaskLandedEarly`), which runs between the hit's lock and the
+    // CMASK at =2 only: its stores over the CMASK abort instead of counting as raced.
     std::array<bool, 3> reached{};
     std::array<const char*, 3> landed{};
     std::array<std::uint64_t, 3> walkedAt{};
+    bool cmaskLandedEarly = false;
 };
 enum class TargetLeasePoint : std::uint8_t { Lookup, RegisterClear, Cmask };
 
@@ -195,9 +200,10 @@ std::uint64_t CmaskProofSerial();
 // Tests: proveCmask (a CMASK proof of `address`, as a materialization or a recorded CMASK clear takes
 // it), and one draw's resident lookup of a tiled single-level 2D color target as prepareDraw's slot
 // loop makes it (FlushDepthPlanes and RetireDepthSurfaces over the target, then refreshResidentTarget
-// with the lease, through the lookup closure's CachedStorageSurface and Requires).
+// with the lease, through the lookup closure's CachedStorageSurface and Requires); `used`, when given,
+// receives the lookup's lease use as it ended (default when the slot loop would build none).
 void NoteCmaskProof(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
-std::shared_ptr<StorageTexture> TargetLeaseLookup(const Context& context, const ColorTarget& color);
+std::shared_ptr<StorageTexture> TargetLeaseLookup(const Context& context, const ColorTarget& color, TargetLeaseUse* used = nullptr);
 
 }
 

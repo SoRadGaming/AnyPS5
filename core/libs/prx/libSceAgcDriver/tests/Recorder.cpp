@@ -7912,6 +7912,52 @@ bool targetLeaseDrawTests(const Device& device, Recorder& recorder) {
     expectMiss("lease draws: a replaced cache entry was answered from the lease");
     Require(resident == fresh, "lease draws: the lookup after the replacement did not return the cache's new image");
     settle("lease draws: no lease after a replaced entry");
+
+    // Which materializations an answered lookup skips. With the target keys' row in the hit's lock,
+    // both: the register clear and, as nothing runs between the lock and it, the CMASK proof. K1
+    // (APS5_EXPERIMENT_KEY_PIN=1): the driver's uncompressed key store pending (as
+    // StoreUncompressedOnGpu makes it, without the command), so the key read answers from its memo and
+    // the target keys' proof is never stable: the pinned hit has no target-key row and runs the
+    // register clear live, and then the CMASK proof too, since the live call may sync, store or flush
+    // over the CMASK after the lock. =2's prediction skips the same. Not tested with K1 off or
+    // verifying (no pin), nor with the switch unset (no lease).
+    const auto answeredUsing = [&](TargetLeaseUse& used, const char* what) {
+        const auto before = TargetLeaseTotals();
+        static_cast<void>(recorder.Commands());
+        resident = TargetLeaseLookup(context, color, &used);
+        const auto after = TargetLeaseTotals();
+        Require(answered(before, after), what);
+        return after.targetKeysLive - before.targetKeysLive;
+    };
+    const char* pinText = std::getenv("APS5_EXPERIMENT_KEY_PIN");
+    const auto pins = pinText != nullptr ? std::strtol(pinText, nullptr, 10) : 0;
+    if (mode != 0) {
+        TargetLeaseUse used;
+        const auto live = answeredUsing(used, "lease draws: a lookup with nothing between was not answered by the lease");
+        const bool skipsRegisterClear = mode == 1 ? used.skipRegisterClear : used.prediction.skipRegisterClear;
+        const bool skipsCmaskProof = mode == 1 ? used.skipCmaskProof : used.prediction.skipCmaskProof;
+        Require(skipsRegisterClear && skipsCmaskProof && live == 0, "lease draws: a hit holding the target keys' row did not skip both materializations");
+    }
+    if (mode != 0 && pins == 1) {
+        static_cast<void>(recorder.Commands());
+        recorder.NotePendingFill(color.dccAddress, keyCount, 0xff);
+        AgcDriver::GuestMemory::MarkWritten(color.dccAddress, keyCount);
+        NoteKeysFillOnGpu(color.dccAddress, keyCount, DccKeys::Uncompressed);
+        expectMiss("lease draws (K1): a key store pending on the GPU was answered from the lease");
+        settle("lease draws (K1): the pinned target's lookups were never answered by a lease");
+        const auto pinnedBefore = TargetLeaseTotals();
+        TargetLeaseUse used;
+        const auto live = answeredUsing(used, "lease draws (K1): the pinned target's second lookup was not answered by the lease");
+        const auto pinnedAfter = TargetLeaseTotals();
+        if (mode == 1) {
+            Require(used.hit && pinnedAfter.pinned == pinnedBefore.pinned + 1 && live == 1, "lease draws (K1) 1: the pinned target's hit was not pinned, or held the target keys' row");
+            Require(!used.skipRegisterClear && !used.skipCmaskProof && !used.registerClearWorked && !used.cmaskClearWorked, "lease draws (K1) 1: a hit that ran the register clear live skipped the CMASK proof, or a clear did work");
+        } else {
+            Require(used.prediction.hit && used.prediction.pinned && !used.prediction.skipRegisterClear && !used.prediction.skipCmaskProof, "lease draws (K1) 2: the pinned prediction held the target keys' row, or skipped the CMASK proof after a live register clear");
+        }
+        recorder.Sync();
+        settle("lease draws (K1): no lease after the pending key store finished");
+    }
     recorder.Sync();
 
     const auto end = TargetLeaseTotals();
