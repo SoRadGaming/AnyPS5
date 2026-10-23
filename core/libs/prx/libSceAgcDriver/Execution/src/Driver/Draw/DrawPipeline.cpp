@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PrepHelpers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -299,13 +300,30 @@ unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
 
+bool DrawPipeline::hiddenWriteTracking() {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN, DRAIN-PLAN D1) or the counters reading it.
+    return Stream::On() || Drain::HiddenWriteDrain() != 0;
+}
+
+std::size_t DrawPipeline::CopyWrites(std::vector<Range>& writes) {
+    std::lock_guard lock(mutex);
+    for (const auto& item : items) {
+        writes.insert(writes.end(), item.writes.begin(), item.writes.end());
+        for (const auto& label : item.labels) {
+            const auto range = labelRange(label);
+            if (range.second > range.first) writes.push_back(range);
+        }
+    }
+    return items.size();
+}
+
 void DrawPipeline::rethrowFailure() {
     if (failure == nullptr) return;
     auto error = std::exchange(failure, nullptr);
     std::rethrow_exception(error);
 }
 
-std::uint64_t DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, ItemKind kind, const Prepare* prepare) {
+std::uint64_t DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, ItemKind kind, const Prepare* prepare, bool hiddenWrites) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_REPORT") != nullptr;
     const bool streamOn = Stream::On();
     std::unique_lock lock(mutex);
@@ -390,12 +408,17 @@ std::uint64_t DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, st
     const auto pushDepth = streamOn ? static_cast<std::uint32_t>(items.size()) : 0;
     const auto seq = ++lastSeq;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full, pushedAtNs, pushDepth, seq});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), kind, {}, static_cast<std::uint32_t>(enqueueDepth), full, pushedAtNs, pushDepth, seq, hiddenWrites});
     if (streamOn) {
+        // LOCAL DEBUG (DRAIN-PLAN C4): a push that closes no episode is the next push of the refill
+        // after the last one that did (closeStreamEpisode restarts the count).
+        const bool closes = streamEpisode.serial != 0;
         closeStreamEpisode(pushedAtNs);
+        if (!closes && streamRefillPushes <= RefillPushes) ++streamRefillPushes;
         streamGateEpisode.store(0, std::memory_order_relaxed);
         streamGateSerial = 0;
     }
+    if (hiddenWrites) hiddenOutstanding.fetch_add(1, std::memory_order_release);
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] { run(); });
@@ -486,6 +509,8 @@ void DrawPipeline::run() {
                 streamCounts.busyNs[busyKind] += std::exchange(busyNs, 0);
                 // The wake after the push that ended a drain episode belongs to that drain.
                 if (streamWake.pending) fileStreamWake(foundNs, idleStartNs);
+                // LOCAL DEBUG (DRAIN-PLAN C4): the rest of the span is producer slow.
+                fileProducerSlow(foundNs - idleStartNs);
             }
             if (items.empty()) break;
             front = stopped ? nullptr : &items.front();
@@ -585,6 +610,8 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
             ++streamCounts.commits;
             streamCounts.commitNs += spent;
             const auto& item = items.front();
+            // LOCAL DEBUG (DRAIN-PLAN C0): draws per present tag the window.
+            if (front != nullptr && item.kind == ItemKind::Draw) ++streamCounts.draws;
             const auto startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count());
             if (front != nullptr && item.kind == ItemKind::Draw && item.enqueuedAtNs != 0 && startNs >= item.enqueuedAtNs) {
                 const auto leadNs = startNs - item.enqueuedAtNs;
@@ -601,6 +628,8 @@ DrawPipeline::Item* DrawPipeline::commitFront(Item* front, CommitRun* run) {
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_PREP_HELPERS): a stopped pipeline pops without committing;
         // the pop still moves CommittingSeq past the item, so its helper job is dropped as stale.
         committingSeq.store(items.front().seq, std::memory_order_release);
+        // DRAIN-PLAN D1: a hidden-write item stops counting once it is popped after its commit.
+        if (items.front().hidden) hiddenOutstanding.fetch_sub(1, std::memory_order_release);
         done = std::move(items.front());
         items.pop_front();
         ++commits;
@@ -835,19 +864,8 @@ void DrawPipeline::closeStreamEpisode(std::uint64_t nowNs) {
         ownGpuWaitNs = std::min(cutWaitNs - episode.returnGpuWaitNs, ownIdleNs);
         cutGpuWaitNs = std::min(nowWaitNs - cutWaitNs, cutIdleNs);
     }
-    // The site's slot: by call site, reason and opcode; the last slot takes the sites that find
-    // every other slot taken.
-    auto& sites = streamCounts.sites;
-    const auto matches = [&](const StreamSite& site) { return site.line == episode.line && site.opcode == episode.opcode && site.reason == episode.reason && (site.file == episode.file || std::strcmp(site.file, episode.file) == 0); };
-    std::size_t slot = 0;
-    while (slot + 1 < sites.size() && sites[slot].file != nullptr && !matches(sites[slot])) ++slot;
-    if (sites[slot].file == nullptr && slot + 1 < sites.size()) {
-        sites[slot].file = episode.file;
-        sites[slot].line = episode.line;
-        sites[slot].opcode = episode.opcode;
-        sites[slot].reason = episode.reason;
-    }
-    auto& site = sites[slot];
+    const auto slot = streamSiteSlot(episode.file, episode.line, episode.opcode, episode.reason);
+    auto& site = streamCounts.sites[slot];
     ++site.episodes;
     site.waitNs += episode.waitNs;
     site.idleNs += idleNs;
@@ -867,7 +885,17 @@ void DrawPipeline::closeStreamEpisode(std::uint64_t nowNs) {
         streamCounts.cutIdleNs += cutIdleNs;
     }
     // The committer, idle at this push, takes the item after its wake (fileStreamWake).
-    streamWake = idleNs != 0 ? StreamWake{true, slot, cut ? episode.cutSlot : ownSlot, cut, nowNs} : StreamWake{};
+    streamWake = idleNs != 0 ? StreamWake{true, slot, cut ? episode.cutSlot : ownSlot, cut, nowNs, episode.tag} : StreamWake{};
+    // LOCAL DEBUG (DRAIN-PLAN C2, C7): a tagged episode's idle and serial phase, filed again by tag.
+    if (episode.tag != 0) Drain::FileTaggedEpisode(episode.tag, idleNs, serialNs, true);
+    // LOCAL DEBUG (DRAIN-PLAN C4): the committer's current idle span took this idle; the refill of
+    // this site starts (the closing push is push 0).
+    streamSpanDrainNs += idleNs;
+    streamRefillPushes = 0;
+    streamRefillFile = episode.file;
+    streamRefillLine = episode.line;
+    streamRefillOpcode = episode.opcode;
+    streamRefillReason = episode.reason;
     episode = StreamEpisode{};
     streamEpisodeSerial.store(0, std::memory_order_relaxed);
     streamCuttable.store(false, std::memory_order_relaxed);
@@ -897,6 +925,48 @@ void DrawPipeline::fileStreamWake(std::uint64_t foundNs, std::uint64_t idleStart
     if (wake.cut) streamCounts.cutIdleNs += ns;
     streamCounts.drainIdleNs += ns;
     streamCounts.wakeNs += ns;
+    streamSpanDrainNs += ns;
+    if (wake.tag != 0) Drain::FileTaggedEpisode(wake.tag, ns, 0, false);
+}
+
+// The site's slot: by call site, reason and opcode; the last slot takes the sites that find every
+// other slot taken. Under the mutex.
+std::size_t DrawPipeline::streamSiteSlot(const char* file, std::uint32_t line, std::uint32_t opcode, DrainReason reason) {
+    auto& sites = streamCounts.sites;
+    const auto matches = [&](const StreamSite& site) { return site.line == line && site.opcode == opcode && site.reason == reason && (site.file == file || std::strcmp(site.file, file) == 0); };
+    std::size_t slot = 0;
+    while (slot + 1 < sites.size() && sites[slot].file != nullptr && !matches(sites[slot])) ++slot;
+    if (sites[slot].file == nullptr && slot + 1 < sites.size()) {
+        sites[slot].file = file;
+        sites[slot].line = line;
+        sites[slot].opcode = opcode;
+        sites[slot].reason = reason;
+    }
+    return slot;
+}
+
+// LOCAL DEBUG (DRAIN-PLAN C4): an idle span of the committer ended (it took an item): what drain
+// episodes and their wakes did not take of it is producer slow, filed under the site of the last
+// episode closed when the push that ended it was one of the RefillPushes after that close, and as
+// elsewhere otherwise. Under the mutex.
+void DrawPipeline::fileProducerSlow(std::uint64_t spanNs) {
+    const auto drainNs = std::exchange(streamSpanDrainNs, 0);
+    if (spanNs <= drainNs) return;
+    const auto slowNs = spanNs - drainNs;
+    if (streamRefillFile != nullptr && streamRefillPushes != 0 && streamRefillPushes <= RefillPushes) {
+        auto& site = streamCounts.sites[streamSiteSlot(streamRefillFile, streamRefillLine, streamRefillOpcode, streamRefillReason)];
+        ++site.refills;
+        site.refillNs += slowNs;
+        return;
+    }
+    ++streamCounts.slowElsewhere;
+    streamCounts.slowElsewhereNs += slowNs;
+}
+
+void DrawPipeline::TagStreamEpisode(std::uint64_t serial, std::uint16_t tag) {
+    if (serial == 0) return;
+    std::lock_guard lock(mutex);
+    if (streamEpisode.serial == serial) streamEpisode.tag = tag;
 }
 
 void DrawPipeline::copyQueuedWriters(std::vector<QueuedWriter>& writers) const {
@@ -980,6 +1050,8 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         streamWake = StreamWake{};
         lock.unlock();
         static_cast<void>(takeStreamTotals());
+        // LOCAL DEBUG (DRAIN-PLAN section 6): the D0 lines' counters start with this window too.
+        Drain::ReportWindow(Drain::Window::Entry, false);
         static_cast<void>(Graphics::TakeFlushGuardCounts());
         static_cast<void>(Graphics::TakeNarrowFlushCounts());
         if (PrepHelpers::On()) static_cast<void>(PrepHelpers::TakeWindow(PrepHelpers::Report::Stream));
@@ -994,6 +1066,15 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
     lock.unlock();
     const auto totals = takeStreamTotals();
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    // LOCAL DEBUG (DRAIN-PLAN C0): the window's tag (menu, entry, hold; Drain::ClassifyWindow) from
+    // the draws committed per present, the window before, and the flush guard's queue-0 GPU wait
+    // for address-based leases (the guard's counts, section 11 below, are taken here for it); every
+    // D0 line of the window carries it.
+    const auto flushGuard = Graphics::TakeFlushGuardCounts();
+    std::uint64_t leaseQueue0Ns = 0;
+    for (std::size_t kind = 0; kind < Graphics::FlushWaitKinds; ++kind) leaseQueue0Ns += flushGuard.queue0GpuNs[kind][static_cast<std::size_t>(Graphics::FlushWaitClass::Lease)];
+    const auto window = Drain::TagWindow(totals.presents, counts.draws, leaseQueue0Ns);
+    const auto* windowName = Drain::WindowName(window);
     std::string line;
     // Cells of one section are separated by commas, sections by semicolons.
     bool first = true;
@@ -1008,7 +1089,8 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
     const auto drainIdleNs = std::min(counts.drainIdleNs, counts.idleNs);
     const double busyDifference = counts.commitNs == 0 ? 0.0 : 100.0 * (static_cast<double>(busyNs) - static_cast<double>(counts.commitNs)) / static_cast<double>(counts.commitNs);
     const bool busyMatches = counts.commitNs != 0 && busyDifference <= 5.0 && busyDifference >= -5.0;
-    appendStream(line, "[stream] (10 s, %.2f s measured) committer: busy %.1f ms (draws %.1f, labels %.1f, other %.1f)", static_cast<double>(wallNs) / 1e9, streamMs(busyNs), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Draw)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Label)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Other)]));
+    appendStream(line, "[stream] window=%s (%llu presents, %.0f draws per present, queue-0 lease waits %.1f ms)", windowName, count(totals.presents), totals.presents == 0 ? 0.0 : static_cast<double>(counts.draws) / static_cast<double>(totals.presents), streamMs(leaseQueue0Ns));
+    appendStream(line, " (10 s, %.2f s measured) committer: busy %.1f ms (draws %.1f, labels %.1f, other %.1f)", static_cast<double>(wallNs) / 1e9, streamMs(busyNs), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Draw)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Label)]), streamMs(counts.busyNs[static_cast<std::size_t>(ItemKind::Other)]));
     appendStream(line, " vs [draw] pipelined commit time %.1f ms in %llu commits: %+.1f%%, %s", streamMs(counts.commitNs), count(counts.commits), busyDifference, busyMatches ? "within 5%" : "OFF BY MORE THAN 5%");
     appendStream(line, "; idle %.1f ms (%llu waits on an empty queue): drains %.1f ms (%.1f ms of it waking after the push)", streamMs(counts.idleNs), count(counts.idleWaits), streamMs(drainIdleNs), streamMs(counts.wakeNs));
     appendStream(line, ", producer slow %.1f ms; busy + idle %.1f ms of %.1f ms", streamMs(counts.idleNs - drainIdleNs), streamMs(busyNs + counts.idleNs), streamMs(wallNs));
@@ -1202,7 +1284,7 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
     // matched; and every condition that held per wait (no-import is looked for only when nothing
     // else held).
     {
-        const auto guard = Graphics::TakeFlushGuardCounts();
+        const auto& guard = flushGuard;
         appendStream(line, "; flush guard waits (wait/class n, wall ms, GPU ms, queue-0 GPU ms):");
         first = true;
         std::uint64_t skipWaits = 0, skipWallNs = 0, skipGpuNs = 0, skipQueue0Ns = 0;
@@ -1250,6 +1332,40 @@ void DrawPipeline::reportStream(std::unique_lock<std::mutex>& lock) {
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+    // LOCAL DEBUG (DRAIN-PLAN C4): producer slow split by where the push that ended each idle span
+    // came: one of the first RefillPushes after a drain episode closed (by that episode's site),
+    // or elsewhere; against the [stream] line's producer slow (idle outside the episodes).
+    {
+        std::string refill;
+        std::uint64_t refillNs = 0, refills = 0;
+        for (const auto& site : counts.sites) {
+            refillNs += site.refillNs;
+            refills += site.refills;
+        }
+        appendStream(refill, "[refill] window=%s producer slow %.1f ms (the [stream] line's %.1f ms): within the first %u pushes after a drain episode closed %.1f ms in %llu spans", windowName, streamMs(refillNs + counts.slowElsewhereNs), streamMs(counts.idleNs - drainIdleNs), RefillPushes, streamMs(refillNs), count(refills));
+        appendStream(refill, ", elsewhere %.1f ms in %llu spans; refills by the closing site (spans, ms):", streamMs(counts.slowElsewhereNs), count(counts.slowElsewhere));
+        std::array<std::size_t, StreamSiteSlots> refillOrder{};
+        for (std::size_t i = 0; i < refillOrder.size(); ++i) refillOrder[i] = i;
+        std::sort(refillOrder.begin(), refillOrder.end(), [&](std::size_t a, std::size_t b) { return counts.sites[a].refillNs > counts.sites[b].refillNs; });
+        bool firstSite = true;
+        for (std::size_t shown = 0; shown < 10; ++shown) {
+            const auto& site = counts.sites[refillOrder[shown]];
+            if (site.refills == 0) continue;
+            if (!firstSite) refill += ',';
+            firstSite = false;
+            if (site.file == nullptr) {
+                appendStream(refill, " other-sites - - %llu %.1f", count(site.refills), streamMs(site.refillNs));
+                continue;
+            }
+            char opcode[8];
+            if (site.opcode >= 0x100) std::snprintf(opcode, sizeof(opcode), "-");
+            else std::snprintf(opcode, sizeof(opcode), "0x%02x", site.opcode);
+            appendStream(refill, " %s:%u %s %s %llu %.1f", streamFileName(site.file), site.line, DrainNames[static_cast<std::size_t>(site.reason)], opcode, count(site.refills), streamMs(site.refillNs));
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", refill.c_str());
+    }
+    // LOCAL DEBUG (DRAIN-PLAN section 6): the window's other D0 lines.
+    Drain::ReportWindow(window);
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

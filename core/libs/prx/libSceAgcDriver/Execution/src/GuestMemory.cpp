@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -3881,6 +3882,9 @@ bool copyThroughKernel(std::uint64_t address, std::span<std::byte> destination) 
 }
 
 void flushBeforeAccess(std::uint64_t address, std::size_t bytes) {
+    // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a CPU access to a GDS readback destination
+    // before its first named touch (a store named by its read site).
+    if (Drain::GdsCounting()) Drain::noteGuestAccess(address, bytes, CurrentReadSite() == ReadSite::Store);
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 

@@ -286,6 +286,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WriteEvidence.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WrittenBuffers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/CommandValidation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/DrainStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketExecution.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketFlush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketHistory.cpp
@@ -2658,6 +2659,25 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(${narrowFlushTests} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (DRAIN-PLAN D1): the queue-0 ordering guards and the hidden-write drain
+    # (tests/execution/DispatchNoteGuards.cpp, whose plain run above leaves both switches unset and
+    # expects nothing counted) draining (=1), counting (=2), and counted by the [stream] counters
+    # alone (APS5_DEBUG_STREAM_STATS=1, with the D0 counters' gate window and guard counts).
+    set_tests_properties(agc_driver_dispatch_note_guards PROPERTIES TIMEOUT 60)
+    set(noteGuardTests)
+    foreach(noteGuardCase IN ITEMS "drain|APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=1,APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=1" "count|APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=2,APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=2" "stream_stats|APS5_DEBUG_STREAM_STATS=1,APS5_DEBUG_GDS_STATS=1")
+        string(REPLACE "|" ";" noteGuardCase "${noteGuardCase}")
+        list(GET noteGuardCase 0 noteGuardCaseName)
+        list(GET noteGuardCase 1 noteGuardCaseEnvironment)
+        string(REPLACE "," ";" noteGuardCaseEnvironment "${noteGuardCaseEnvironment}")
+        set(noteGuardTest agc_driver_dispatch_note_guards_${noteGuardCaseName})
+        add_test(NAME ${noteGuardTest} COMMAND agc_driver_dispatch_note_guards_tests)
+        set_tests_properties(${noteGuardTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${noteGuardCaseEnvironment}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+        list(APPEND noteGuardTests ${noteGuardTest})
+    endforeach()
+    if(WIN32)
+        set_tests_properties(${noteGuardTests} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_shader_disk_cache_large_file COMMAND agc_shader_disk_cache_tests --large-file)
     if(Python3_Interpreter_FOUND)
         set(housekeepingModes plain)
@@ -3201,6 +3221,9 @@ if(BUILD_TESTING)
             # HostImportFor PrepareScope assertions, alone and over queue 0's verified tickets
             # (whose preparation runs inside a PrepareScope).
             "stream_stats|APS5_DEBUG_STREAM_STATS=1"
+            # LOCAL DEBUG (DRAIN-PLAN section 6, D0): the drain counters C0-C7 with the GDS counters
+            # (their per-packet records, readback rings, wait records and GDS-wait clocks) on.
+            "drain_counters|APS5_DEBUG_STREAM_STATS=1,APS5_DEBUG_GDS_STATS=1"
             "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the
             # committed flag against std::uncaught_exceptions, including the failure run's throw;
@@ -3281,7 +3304,14 @@ if(BUILD_TESTING)
             # gives the committer's calls a collect memo key (without it no call is eligible); their own
             # cases are in agc_depth_view_lease*.
             "depth_leases|APS5_EXPERIMENT_DEPTH_LEASES=2,APS5_DEBUG_COVERAGE=1"
-            "depth_leases_on|APS5_EXPERIMENT_DEPTH_LEASES=1,APS5_DEBUG_COVERAGE=1")
+            "depth_leases_on|APS5_EXPERIMENT_DEPTH_LEASES=1,APS5_DEBUG_COVERAGE=1"
+            # LOCAL EXPERIMENT (DRAIN-PLAN D1): the queue-0 ordering guards (G-msaa, G-vfill) counting
+            # (=2) and draining (=1), and the hidden-write drain counting and draining, each alone; their
+            # own cases are in agc_driver_dispatch_note_guards*.
+            "dispatch_note_guards|APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=2"
+            "dispatch_note_guards_on|APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=1"
+            "hidden_write_drain|APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=2"
+            "hidden_write_drain_on|APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

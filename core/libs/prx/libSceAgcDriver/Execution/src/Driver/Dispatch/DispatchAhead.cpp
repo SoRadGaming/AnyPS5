@@ -102,9 +102,13 @@ bool OverlapsLabel(std::span<const ShaderRecompiler::MemoryRegion> regions, cons
 
 }
 
-void Driver::resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from) {
+bool Driver::groupCaptureOnQueue(std::uint32_t queue) {
     static const bool allQueues = std::getenv("APS5_GROUP_CAPTURE_ALL_QUEUES") != nullptr;
-    if (!allQueues && submission.queue == 0) return;
+    return allQueues || queue != 0;
+}
+
+void Driver::resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from) {
+    if (!groupCaptureOnQueue(submission.queue)) return;
     auto& resolved = resolvedAhead();
     if (resolved.contains(from) || device.Load() == nullptr) return;
     auto& stats = groupCaptureStats();

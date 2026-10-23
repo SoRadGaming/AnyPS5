@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
@@ -76,12 +77,32 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     }
 }
 
-std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
+std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address, bool queue0Dispatch) {
     if (GuestMemory::SpeculativeReader()) throw std::runtime_error("AGC driver: a raw shader program is not available to a speculative reader");
-    const auto drain = [](std::uint64_t first, std::size_t bytes) {
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C3, C6): a code read the gate's writes (or a
+    // hidden-write draw queued at the gate) would have to drain for ends the gate window (Capture).
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN, DRAIN-PLAN D1): in a queue-0 dispatch's
+    // prologue only (`queue0Dispatch`; draw decode, draw-cache validation and other queues' dispatches
+    // read without it, as today), a draw queued that may write guest memory it does not declare (the
+    // code could be among it) drains queue 0 before the read (=1) or is counted (=2, and C6), once
+    // per read.
+    bool hiddenNoted = false;
+    const auto drain = [&hiddenNoted, queue0Dispatch](std::uint64_t first, std::size_t bytes) {
+        if (Stream::On()) Drain::GateCapture(first, bytes);
         if (!DrawPipeline::Active()) return;
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(first, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (pipeline.Busy() && pipeline.Overlaps(first, bytes)) {
+            pipeline.Drain(DrawPipeline::DrainReason::Capture);
+            return;
+        }
+        if (!queue0Dispatch) return;
+        const int hiddenMode = Drain::HiddenWriteDrain();
+        if ((hiddenMode != 0 || Stream::On()) && !hiddenNoted && pipeline.HiddenWritesQueued() != 0) {
+            hiddenNoted = true;
+            const bool drainHidden = hiddenMode == 1;
+            Drain::NoteGuard(Drain::Guard::HiddenShader, drainHidden);
+            if (drainHidden) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        }
     };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), 256);
     static std::mutex cacheMutex;

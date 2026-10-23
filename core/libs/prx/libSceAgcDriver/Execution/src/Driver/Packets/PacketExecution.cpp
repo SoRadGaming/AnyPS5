@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -258,6 +259,8 @@ void Driver::execute(const Submission& submission) {
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
+            // LOCAL DEBUG (DRAIN-PLAN C1, C2): a DMA_DATA queued as a committer item.
+            if (opcode == 0x50 && Drain::PacketCounting()) Drain::CountDmaItem(packet, submission.queue);
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;
@@ -269,6 +272,9 @@ void Driver::execute(const Submission& submission) {
             const auto value = DrawPipeline::Queue0().PendingLabel(awaited, awaitedBytes);
             if (value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
                 ++waitOutcomes().fromRecorderSameQueue;
+                // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a GDS readback destination's
+                // touch, answered from a label queued after it (WaitHow::Queued).
+                Drain::NoteWaitTouch(submission.queue, awaited, awaitedBytes, Drain::WaitHow::Queued);
                 gateOpened() = true;
                 recent.Record(cursor);
                 cursor = nextCursor;
@@ -277,13 +283,25 @@ void Driver::execute(const Submission& submission) {
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet)) {
                 bumpEpoch(&EpochBumps::waits);
                 ++waitOutcomes().atEntry;
+                // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): as above, read from memory at entry.
+                Drain::NoteWaitTouch(submission.queue, awaited, awaitedBytes, Drain::WaitHow::Entry);
                 gateOpened() = true;
                 recent.Record(cursor);
                 cursor = nextCursor;
                 continue;
             }
         }
-        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS / APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1, C2, C7): the record
+        // of a DMA_DATA or a ZPASS_DONE dump (Drain::PacketRecord), with the packet drain below: its
+        // wait and the drain episode it opened.
+        Drain::PacketRecord drainRecord;
+        if ((opcode == 0x50 || opcode == 0x46) && Drain::PacketCounting()) drainRecord.Start(packet, opcode, submission.queue);
+        if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) {
+            const auto drainStartNs = drainRecord.Active() ? Stream::NowNs() : 0;
+            const auto episodeBefore = drainRecord.Active() ? DrawPipeline::Queue0().DrainEpisode() : 0;
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+            if (drainRecord.Active()) drainRecord.NoteDrain(Stream::NowNs() - drainStartNs, episodeBefore, DrawPipeline::Queue0().DrainEpisode());
+        }
         // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): with nothing queued, a packet that would drain a
         // queued A1 dispatch item (a wait such as 0x3c, a GPU-path 0x16, a flip) cuts the open
         // eligible drain episode (DrawPipeline::NoteWouldDrain).
@@ -298,6 +316,8 @@ void Driver::execute(const Submission& submission) {
         if (predicated) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
+            // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a GDS readback destination's touch.
+            Drain::NoteTouch(Drain::Touch::Predication, queue.predication.address, queue.predication.operation == 3 ? 8 : 4);
             if (!Pm4::PredicationPasses(queue)) {
                 cursor = opcode == 0x3f ? submission.conditionalEnds.at(cursor) : nextCursor;
                 if (submission.queue == 0 && drawAhead != nullptr) drawAhead->Skip(submission.serial, cursor);
@@ -348,6 +368,7 @@ void Driver::execute(const Submission& submission) {
         if (profilePackets) packetProfile.flushMs += std::chrono::duration<double, std::milli>(packetTimer.start - flushStart).count();
 
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
+        if (drainRecord.Active()) drainRecord.Arm();
         const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
         traceLabel(packet, submission.queue);
         timing.Mark("prepare_memory");
@@ -415,6 +436,15 @@ void Driver::execute(const Submission& submission) {
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
+                // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C3): D4's shadow of this gate drain for a
+                // 0x15 with items queued: whether D4 would skip it, else its first refusal in the plan's
+                // order (A1 then drains nothing here: counted without a window).
+                const bool gateShadow = opcode == 0x15 && pipelined && Stream::On() && DrawPipeline::Queue0().Busy();
+                auto gateRefusal = Drain::GateRefusal::None;
+                if (gateShadow) {
+                    gateRefusal = !deferredLabels().labels.empty() ? Drain::GateRefusal::DeferredLabels : !LabelBatchSubmit() ? Drain::GateRefusal::LabelBatchSubmit : pipelineDispatch() ? Drain::GateRefusal::A1 : groupCaptureOnQueue(0) ? Drain::GateRefusal::GroupCapture : !orderedFills() ? Drain::GateRefusal::UnorderedFills : DrawPipeline::Queue0().HiddenWritesQueued() != 0 ? Drain::GateRefusal::HiddenWrites : Drain::GateRefusal::None;
+                    if (pipelineDispatch()) Drain::GateCounted(gateRefusal);
+                }
                 if (!pipelineDispatch() || submission.queue != 0) {
                     if (pipelined && DrawPipeline::Queue0().Busy()) {
                         // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): A1 skips this drain for queue 0, so the
@@ -422,13 +452,21 @@ void Driver::execute(const Submission& submission) {
                         // are kept for that dispatch's reads test (it would face them). A 0x16 packet
                         // drained at its own packet test above already, which A1 keeps.
                         if (opcode == 0x15 && Stream::On()) DrawPipeline::Queue0().NoteGateDrain();
+                        // LOCAL DEBUG (DRAIN-PLAN C3): the window's writes and hidden-write flag as the
+                        // gate found them, and W, this drain's wait.
+                        const bool gateHidden = gateShadow && DrawPipeline::Queue0().HiddenWritesQueued() != 0;
+                        if (gateShadow) static_cast<void>(DrawPipeline::Queue0().CopyWrites(Drain::GateWrites()));
+                        const auto gateStartNs = gateShadow ? Stream::NowNs() : 0;
                         DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                        if (gateShadow) Drain::GateOpen(gateRefusal, Stream::NowNs() - gateStartNs, gateHidden);
                     }
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
             }
             if (opcode == 0x15) timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
             else timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+            // LOCAL DEBUG (DRAIN-PLAN C3): a window still open closes as the dispatch's return.
+            if (Stream::On()) Drain::GateClose(Drain::GateExit::Return);
             Pm4::NoteDispatchRegisters(packet, queue);
             Graphics::Recorder::CountRecordedWork();
             finishDispatchPacket(opcode == 0x16);
@@ -491,6 +529,8 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x22) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
+            // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a GDS readback destination's touch.
+            Drain::NoteTouch(Drain::Touch::CondExec, packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), 4);
             const auto condition = Pm4::ReadCondition(packet);
             if (condition == 0) {
                 nextCursor = submission.conditionalEnds.at(cursor);
@@ -547,6 +587,8 @@ void Driver::execute(const Submission& submission) {
             }
             if (endOfPipeInterrupt && !interruptDeferred) deliverGuestEopInterrupt(submission.queue);
         }
+        // LOCAL DEBUG (DRAIN-PLAN C1, C2, C7): the packet's own part ends here.
+        if (drainRecord.Active()) drainRecord.Finish(wroteOnGpu);
         if (drawPacket || (sampleDump && wroteOnGpu)) {
             // A draw the committer counts itself (APS5_EXPERIMENT_EXACT_BATCH_CAP) is not counted here.
             if (!(exactBatchCap() && std::exchange(drawCountedAtCommit(), false))) Graphics::Recorder::CountRecordedWork();

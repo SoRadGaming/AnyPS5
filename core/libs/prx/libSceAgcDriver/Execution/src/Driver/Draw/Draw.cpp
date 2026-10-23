@@ -660,6 +660,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (pipelined && pipelinedIndirect && record == lastDrawable && !gpuLock.owns_lock() && deferredLabels().labels.empty()) {
                 phaseTiming.Phase(DrawRowVectors);
                 auto writes = drawWriteRanges(graphics, stages);
+                // DRAIN-PLAN D1: the writes `writes` leaves out, flagged on the item (tracked only
+                // when something reads HiddenWritesQueued).
+                const bool hiddenWrites = DrawPipeline::HiddenWriteTracking() && DrawHiddenWrites(graphics, stages);
                 const auto commitQueue = submission.queue;
                 const auto commitPacket = (packet[0] >> 8u) & 0xffu;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -670,7 +673,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     notePipelinePrograms(programs);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
-                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw);
+                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, DrawPipeline::ItemKind::Draw, nullptr, hiddenWrites);
                 if (exactBatchCap()) drawCountedAtCommit() = true;
                 phaseTiming.Phase(DrawRowLockWait);
                 timing.Mark("draw_enqueued");
@@ -714,6 +717,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
+        // DRAIN-PLAN D1: as for the pipelined indirect draw above.
+        const bool hiddenWrites = DrawPipeline::HiddenWriteTracking() && DrawHiddenWrites(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -752,7 +757,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         held->slots.offered = helpers;
         auto& pipeline = DrawPipeline::Queue0();
-        const auto seq = pipeline.Enqueue([held] { held->commit(held->slots.Take()); }, std::move(writes), 0, {}, std::move(reads), DrawPipeline::ItemKind::Draw, ticketed && !helpers ? &prepare : nullptr);
+        const auto seq = pipeline.Enqueue([held] { held->commit(held->slots.Take()); }, std::move(writes), 0, {}, std::move(reads), DrawPipeline::ItemKind::Draw, ticketed && !helpers ? &prepare : nullptr, hiddenWrites);
         if (helpers && seq != 0) {
             PrepJob job;
             job.seq = seq;

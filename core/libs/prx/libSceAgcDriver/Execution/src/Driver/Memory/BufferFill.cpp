@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -239,12 +240,26 @@ void Driver::fillClearCount(const Graphics::StorageTexture::FillCoverage& covera
 namespace {
 
 void drainPendingInputWrites(std::uint32_t queueId, std::initializer_list<std::pair<std::uint64_t, std::size_t>> inputs) {
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C3): an input read the gate's writes (or a
+    // hidden-write draw queued at the gate) would have to drain for ends the gate window (Capture).
+    if (Stream::On()) {
+        for (const auto& [address, bytes] : inputs) Drain::GateCapture(address, bytes);
+    }
     if (queueId != 0 || !DrawPipeline::Active()) return;
     auto& pipeline = DrawPipeline::Queue0();
     for (const auto& [address, bytes] : inputs) {
         if (!pipeline.Overlaps(address, bytes)) continue;
         pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);
         return;
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN, DRAIN-PLAN D1) and LOCAL DEBUG (C6): no
+    // queued write declares the inputs, but a draw that may write guest memory it does not declare
+    // is queued: drain (=1) or count (=2).
+    const int hiddenMode = Drain::HiddenWriteDrain();
+    if ((hiddenMode != 0 || Stream::On()) && pipeline.HiddenWritesQueued() != 0) {
+        const bool drainHidden = hiddenMode == 1;
+        Drain::NoteGuard(Drain::Guard::HiddenFill, drainHidden);
+        if (drainHidden) pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);
     }
 }
 
@@ -456,6 +471,8 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
             GuestMemory::SetCurrentPacket(0x15, queueId);
             store();
         }, {{base, base + bytes}});
+        // LOCAL DEBUG (DRAIN-PLAN C3): the fill queued as an item ends the gate window.
+        if (Stream::On()) Drain::GateClose(Drain::GateExit::FillItem);
         return;
     }
     store();

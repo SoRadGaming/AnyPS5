@@ -2721,11 +2721,18 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || !multisampleSources.empty() || (bda != nullptr && LoopGuardEnabled())) return;
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
+    // LOCAL DEBUG (DRAIN-PLAN C5): the first condition that refuses, kept for the [recipe] dispatch
+    // line; the conditions and their order are today's.
+    const auto refuse = [this](Unreusable why) { unreusable = why; };
+    if (guestMemory.HasCopiedWrites()) return refuse(Unreusable::CopiedWrites);
+    if (HoldsLease()) return refuse(Unreusable::Lease);
+    if (usesBda) return refuse(Unreusable::Bda);
+    if (!multisampleSources.empty()) return refuse(Unreusable::MultisampleSources);
+    if (bda != nullptr && LoopGuardEnabled()) return refuse(Unreusable::LoopGuard);
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return refuse(Unreusable::RefreshedTexture);
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return refuse(Unreusable::DataRefresh);
     const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (!regions.has_value()) return refuse(Unreusable::NoDirectRegions);
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -2733,7 +2740,7 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) return refuse(Unreusable::UnservedRegion);
         directRegions.push_back({begin, end, serial});
     }
     for (const auto& cut : guestMemory.CutRegions()) {
@@ -2743,6 +2750,7 @@ void ShaderResources::noteReusable() {
             region.committedEnd = cut.committedEnd;
         }
     }
+    unreusable = Unreusable::None;
     reusable = true;
 }
 
