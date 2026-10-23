@@ -522,6 +522,9 @@ unsigned long long CodeOffset(const void* address);
 // every read and store through this interface calls first. Code that reads guest memory directly
 // calls FlushGpuWrites itself.
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
+// LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a counter called before the flush hook with every
+// CPU access (`store` for a store); DrainStats registers it while its switch is set.
+void SetGuestAccessCounter(void (*counter)(std::uint64_t address, std::size_t bytes, bool store));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void GuardRead(std::uint64_t address, std::size_t bytes);
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);

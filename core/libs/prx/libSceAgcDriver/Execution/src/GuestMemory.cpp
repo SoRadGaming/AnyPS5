@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -3844,12 +3843,19 @@ unsigned long long CodeOffset(const void* address) {
 
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
+// LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): DrainStats registers its counter here, so
+// GuestMemory.cpp links without it (the write-tracking and shader-memory tests build it alone).
+std::atomic<void (*)(std::uint64_t, std::size_t, bool)> guestAccessCounter{nullptr};
 std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
 
 void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
     FlushGpuWrites(address, bytes);
 }
+}
+
+void SetGuestAccessCounter(void (*counter)(std::uint64_t, std::size_t, bool)) {
+    guestAccessCounter.store(counter, std::memory_order_release);
 }
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
@@ -3884,7 +3890,7 @@ bool copyThroughKernel(std::uint64_t address, std::span<std::byte> destination) 
 void flushBeforeAccess(std::uint64_t address, std::size_t bytes) {
     // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a CPU access to a GDS readback destination
     // before its first named touch (a store named by its read site).
-    if (Drain::GdsCounting()) Drain::noteGuestAccess(address, bytes, CurrentReadSite() == ReadSite::Store);
+    if (const auto counter = guestAccessCounter.load(std::memory_order_acquire)) counter(address, bytes, CurrentReadSite() == ReadSite::Store);
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 

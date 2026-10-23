@@ -644,6 +644,14 @@ void noteGuestAccess(std::uint64_t address, std::size_t bytes, bool store) {
     noteTouch(store ? Touch::Overwritten : Touch::HookRead, address, bytes);
 }
 
+namespace {
+// GuestMemory's flush path calls the counter through a registered pointer (it links without this file).
+const bool guestAccessCounterRegistered = [] {
+    if (GdsCounting()) GuestMemory::SetGuestAccessCounter(&noteGuestAccess);
+    return true;
+}();
+}
+
 void noteWaitTouch(std::uint32_t queue, std::uint64_t address, std::size_t bytes, WaitHow how) {
     const auto waiter = queueSlot(queue);
     takeOverlapping(address, bytes, [&](std::size_t slot) {
