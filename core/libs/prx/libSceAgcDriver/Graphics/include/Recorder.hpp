@@ -284,7 +284,14 @@ public:
     void NoteUnwrittenDrawSlice(std::uint64_t address, const std::array<std::uint64_t, 3>& stamp, const SnapshotArena::Slice& slice);
     const SnapshotArena::Slice* ReusableDrawSlice(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration);
     void KeepDrawSlice(std::uint64_t address, const SnapshotArena::Slice& slice, std::uint64_t generation, std::uint64_t registryGeneration);
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.1 and 7, I0): a draw input's lease in this
+    // recorder's table (see InputLease.hpp; the table exists from the first probe on, only while
+    // profiling), or null: not profiling, the calling thread does not hold the GpuMutex (counted), an
+    // empty input or one of 4 GiB or more.
+    struct InputLease;
+    InputLease* InputLeaseFor(std::uint64_t address, std::size_t bytes, SnapshotUse use);
+    // `lease` (I0): row M's prediction is checked against this lookup and the entry it finds is kept.
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, InputLease* lease = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
     struct UploadSlice {
@@ -1175,6 +1182,12 @@ private:
     SnapshotArena snapshotArena;
     std::uint64_t batchesOpened = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.1 and 7, I0): the draw-input lease table (see
+    // InputLease.hpp), null until the first probe; eraseDrawSnapshot and KeepDrawSnapshot's emplace,
+    // the only mutations of drawSnapshots, bump the set serial of their (address, use).
+    struct InputLeaseTable;
+    std::unique_ptr<InputLeaseTable> inputLeases;
+    void noteInputLeaseMap(InputLease& lease, std::uint64_t address, SnapshotUse use, std::map<DrawSnapshotKey, DrawSnapshot>::iterator found);
     struct IndexRange {
         std::uint64_t generation;
         std::uint64_t registryGeneration;

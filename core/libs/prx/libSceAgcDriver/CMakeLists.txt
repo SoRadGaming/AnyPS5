@@ -328,6 +328,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawTicket.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TargetLease.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/InputLease.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleTarget.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetLayout.cpp
@@ -731,12 +732,17 @@ if(BUILD_TESTING)
     # collect coverage, with the epoch coverage on and the walks counted.
     add_test(NAME agc_write_tracking_stamps_hold COMMAND agc_write_tracking_tests --stamps-hold)
     set_tests_properties(agc_write_tracking_stamps_hold PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
+    # LOCAL EXPERIMENT (REVALIDATE-PLAN 4): the shared collect-lease API (coverage owner, the `covered`
+    # report, CoveredCollectGeneration), with the epoch coverage on and the walks counted (the full run
+    # checks `covered` stays false without).
+    add_test(NAME agc_write_tracking_collect_covering COMMAND agc_write_tracking_tests --collect-covering)
+    set_tests_properties(agc_write_tracking_collect_covering PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_stamps_hold agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_stamps_hold agc_write_tracking_collect_covering agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1642,6 +1648,19 @@ if(BUILD_TESTING)
     set_tests_properties(agc_depth_lease_counter_no_key PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1")
     if(WIN32)
         set_tests_properties(agc_depth_lease_classify agc_depth_lease_counter agc_depth_lease_counter_no_key agc_depth_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 and 9, I0): the draw-input lease counters over real
+    # CopyDrawInput calls: counting (profiling, with the epoch coverage that gives the thread a collect
+    # memo key), profiling without a memo key (row C misses for want of one) and off (nothing counted).
+    add_test(NAME agc_draw_input_lease_counter COMMAND agc_driver_recorder_tests --input-lease-counter-only)
+    add_test(NAME agc_draw_input_lease_counter_no_key COMMAND agc_driver_recorder_tests --input-lease-counter-only)
+    add_test(NAME agc_draw_input_lease_counter_off COMMAND agc_driver_recorder_tests --input-lease-counter-only)
+    set_tests_properties(agc_draw_input_lease_counter agc_draw_input_lease_counter_no_key agc_draw_input_lease_counter_off PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_draw_input_lease_counter PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_draw_input_lease_counter_no_key PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1")
+    if(WIN32)
+        set_tests_properties(agc_draw_input_lease_counter agc_draw_input_lease_counter_no_key agc_draw_input_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     # LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 D5): DepthSurfaceView leases:
@@ -2999,6 +3018,19 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_sampled_cache_budget_memory agc_driver_sampled_cache_budget_without_storage_image_multisample agc_driver_resource_cache_storage_admission agc_driver_resource_cache_oversized_storage_admission agc_driver_resource_cache_storage_clear agc_driver_resource_cache_replaced_texture agc_driver_resource_cache_lookup_changed PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 V0): the template collect lease counter over real fast
+    # proofs: counting (with the epoch coverage that gives the thread a collect memo key), profiling
+    # without a memo key, and off; the template audit is off, so every proof stays fast.
+    add_test(NAME agc_driver_resource_cache_collect_lease_counter COMMAND agc_driver_sampled_cache_budget_tests collect-lease-counter)
+    add_test(NAME agc_driver_resource_cache_collect_lease_counter_no_key COMMAND agc_driver_sampled_cache_budget_tests collect-lease-counter)
+    add_test(NAME agc_driver_resource_cache_collect_lease_counter_off COMMAND agc_driver_sampled_cache_budget_tests collect-lease-counter)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_counter PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_PROFILE_DRAW=1;APS5_DEBUG_COVERAGE=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_counter_no_key PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_counter_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_resource_cache_collect_lease_counter agc_driver_resource_cache_collect_lease_counter_no_key agc_driver_resource_cache_collect_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     # The driver draw test again with the draw key off: the draw cache then keys on the decoded vertex
     # stage, which must include PA_CL_VS_OUT_CNTL.
     add_test(NAME agc_driver_vertex_clip_cull_draw_no_key COMMAND agc_driver_vertex_clip_cull_draw_tests no-key)
@@ -3288,6 +3320,10 @@ if(BUILD_TESTING)
             # DepthSurfaceView lease counter counting (profiling, with the epoch coverage that gives the
             # committer's lookups a collect memo key); they change no draw.
             "target_lease_counter|APS5_PROFILE_DRAW=1,APS5_DEBUG_COVERAGE=1"
+            # LOCAL DEBUG (REVALIDATE-PLAN 7, I0/V0): the draw-input lease counters and the template
+            # collect lease counter counting, with the epoch coverage and the draw inputs in VRAM as the
+            # play build runs them; they change no draw.
+            "input_lease_counter|APS5_PROFILE_DRAW=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
             # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's surface size and key memos
             # verified (=2: every hit computed too, a difference fatal) and on; their own cases are in
             # agc_storage_target_memos*.

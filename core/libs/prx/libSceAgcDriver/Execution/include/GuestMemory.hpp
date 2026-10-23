@@ -242,6 +242,29 @@ CollectMemoKey CurrentCollectMemoKey();
 // under its current collect memo key (false without one): its next collect of the range is then a
 // memo hit that walks nothing, and stays one while the key holds (coverage only grows under a key).
 bool CollectCovered(std::uint64_t address, std::size_t bytes);
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 4, built in stage S1): the collect-lease API shared by the
+// draw-input leases (L1 row C) and the template collect lease (L2). A lease {key K, owner O} holds
+// for a range while K is Valid, K == CurrentCollectMemoKey(), O == CollectCoverageOwner() and the
+// range was reported `covered` under K on this thread: the coverage is per thread and cleared only
+// at a key change, and every part of the key only grows per thread, so today's collect of the range
+// would take the epoch coverage hit, whose only effects CoveredCollectGeneration repeats. No key is
+// Valid (and no lease holds) without APS5_DEBUG_COVERAGE=1.
+// The calling thread's coverage owner: a serial taken from a global counter at the thread's first
+// call (a TEB slot, zero for every new thread) and never reused, so neither a later thread (which may
+// get the same scratch storage) nor one that adopted the same epoch (AdoptLatestCollectEpoch) passes
+// for this one.
+std::uint64_t CollectCoverageOwner();
+// Exactly CollectWrites (the same memo tests, walk and answer); `covered` receives true only when the
+// call returned through the epoch coverage hit, or its walk recorded coverage under the key the call
+// read before it (UnwatchSerial unchanged across the walk); false for every other return, ring, epoch
+// map and receipt hits included.
+std::uint64_t CollectWritesCovering(std::uint64_t address, std::size_t bytes, bool& covered);
+// The epoch coverage hit's answer without its test: the memo-hit counts and the current generation,
+// the host writes that ended before it stamped first (as the hit stamps them).
+std::uint64_t CoveredCollectGeneration();
+// Test hook: called by a memoized collect that walks, after it read its key and before it takes the
+// tracker lock (an unwatch there moves UnwatchSerial during the walk); null, the default, outside tests.
+void SetCollectWalkHook(void (*hook)());
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it; under
 // APS5_EXPERIMENT_LAZY_GENERATION a collect bumps it only when it stamps): a stamp taken after

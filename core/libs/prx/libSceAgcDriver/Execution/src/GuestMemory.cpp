@@ -1686,6 +1686,9 @@ void coverEpoch(std::uint64_t epoch, std::uint64_t serial, std::uint64_t mapping
     coverage.ranges.emplace(first, stop);
 }
 
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 4): see SetCollectWalkHook. Null outside tests.
+std::atomic<void (*)()> collectWalkHook{nullptr};
+
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS, COMMITTER-SPLIT-PLAN 1.7): walk receipts. A thread's
 // role (none, owner, follower) with the token it holds it for and the epoch it took for that token;
 // the ring's slot of a token holds the merged page ranges walked under it, one UnwatchSerial and one
@@ -1928,7 +1931,11 @@ bool cpuStampedSince(const WriteTracker& tracker, std::uint64_t first, std::uint
     return false;
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+// `covered` (LOCAL EXPERIMENT, REVALIDATE-PLAN 4, CollectWritesCovering): when given, receives true
+// only for a return through the epoch coverage hit, or after a walk that recorded coverage under the
+// key read below (UnwatchSerial unchanged across it); false for every other return.
+std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool* covered = nullptr) {
+    if (covered != nullptr) *covered = false;
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1951,6 +1958,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             // checks pending writers must not have this load moved after those checks (a writer
             // that published and stamped in between would pass both, COMMITTER-MAP 3.2 step 2).
             // Free on x86; it only stops the compiler from reordering.
+            if (covered != nullptr) *covered = true;
             return hitGeneration(tracker);
         }
         if (epochCollectMapEnabled()) {
@@ -2029,6 +2037,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): declared before the tracker lock, so the
     // committer's publication of its completed walk runs after the lock is released.
     ReceiptPublication receiptPublication;
+    // LOCAL EXPERIMENT (REVALIDATE-PLAN 4): a test's unwatch between the key's read and the walk.
+    if (useMemo) {
+        if (const auto hook = collectWalkHook.load(std::memory_order_acquire)) hook();
+    }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
@@ -2112,7 +2124,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_RECEIPTS): a memoized walk of the committer, for
             // queue 0 to skip (published by receiptPublication once the lock is released).
             if (useMemo && Q0Receipts() != 0 && receiptPublishEnabled() && serial == unwatched && !SpeculativeReader() && receiptRole().kind == ReceiptFollower) receiptPublication.Set(epoch, serial, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
-            if (epochCoverageEnabled()) coverEpoch(epoch, serial, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+            if (epochCoverageEnabled()) {
+                coverEpoch(epoch, serial, mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+                // LOCAL EXPERIMENT (REVALIDATE-PLAN 4): covered under the key read before the walk only
+                // when the walk's re-read of UnwatchSerial still finds it.
+                if (covered != nullptr && serial == unwatched) *covered = true;
+            }
             if (epochCollectMapEnabled()) {
                 auto& entry = epochCollectMap(epoch).ranges[first];
                 if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
@@ -2439,6 +2456,35 @@ bool CollectCovered(std::uint64_t address, std::size_t bytes) {
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     return epochCovers(key.epoch, key.unwatched, key.mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+}
+
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 4): the shared collect-lease API (see the header).
+namespace {
+std::atomic<std::uint64_t> nextCoverageOwner{0};
+struct CoverageOwnerSlot {};
+}
+
+std::uint64_t CollectCoverageOwner() {
+    auto owner = HostThreadSlot<std::uint64_t, CoverageOwnerSlot>::Get();
+    if (owner == 0) {
+        owner = nextCoverageOwner.fetch_add(1, std::memory_order_relaxed) + 1;
+        HostThreadSlot<std::uint64_t, CoverageOwnerSlot>::Set(owner);
+    }
+    return owner;
+}
+
+std::uint64_t CollectWritesCovering(std::uint64_t address, std::size_t bytes, bool& covered) {
+    return collectWrites(address, bytes, true, &covered);
+}
+
+std::uint64_t CoveredCollectGeneration() {
+    noteCollectMemoHit();
+    if (missStatsEnabled()) ++threadMissStats().memoHits;
+    return hitGeneration(Tracker());
+}
+
+void SetCollectWalkHook(void (*hook)()) {
+    collectWalkHook.store(hook, std::memory_order_release);
 }
 
 void AdoptLatestCollectEpoch() {

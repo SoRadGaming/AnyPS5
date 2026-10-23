@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawInputMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FlushGuard.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InputLease.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -2972,6 +2973,8 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.1, I0): the entry's set serial.
+    if (inputLeases != nullptr) inputLeases->Bump(std::get<0>(entry->first), std::get<1>(entry->first));
     drawSnapshots.erase(entry);
 }
 
@@ -3016,9 +3019,11 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     unwrittenBytes += bytes;
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, InputLease* lease) {
     GuestMemory::AssertGpuLockHeld("Recorder::ReusableDrawSnapshot");
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.4, I0): row M, predicted and filled only.
+    if (lease != nullptr) noteInputLeaseMap(*lease, address, use, found);
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
@@ -3214,6 +3219,8 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
         pool.recency.pop_back();
         throw;
     }
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.1, I0): the new entry's set serial.
+    if (inputLeases != nullptr) inputLeases->Bump(address, use);
     pool.bytes += bytes;
 }
 

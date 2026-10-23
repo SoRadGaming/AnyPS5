@@ -240,6 +240,17 @@ public:
     // as it was, and one that finds it unchanged since an earlier read knows the registry is what
     // it was then.
     static std::uint64_t PendingSerial();
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.2 row P; the I0 counters ask it): the
+    // PendingSerial S at which nothing pending, being stored or live-shadowed overlaps the range: S
+    // read first, then no image in the registry or flushing overlaps it (stricter than FlushPending:
+    // no pending-unit pretest, no Refreshing or `except` exemption), then no live unit shadow does
+    // (AnyShadowedOverlaps, after the registry mutex is released), then S again. 0 (no proof) when
+    // S is still 0 (NoSerial, nothing scanned), something overlaps (Pending, Flushing, Shadow) or S
+    // moved meanwhile (Moved); `over`, when given, receives which (Nothing with a proof). No state
+    // changes: it takes the registry and shadow mutexes and reads the pending index only while that
+    // is current (a stale one is not rebuilt, so no snapshot is published for SurelyClear).
+    enum class PendingOver : std::uint8_t { Nothing, Pending, Flushing, Shadow, Moved, NoSerial };
+    static std::uint64_t NothingPendingOver(std::uint64_t address, std::size_t bytes, PendingOver* over = nullptr);
     // One registry scan for several ranges (the fast Revalidate): each query's `overlaps` receives
     // whether an image other than `except` has results pending, or is being stored right now, over
     // [begin, end), and `found` the image FindPending would return for the range (null: none);

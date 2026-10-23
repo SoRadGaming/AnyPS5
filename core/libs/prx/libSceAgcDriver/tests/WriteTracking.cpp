@@ -2113,6 +2113,88 @@ void CheckCollectCovered() {
     Require(!CollectCovered(base, 0), "an empty range reads as covered");
 }
 
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 4 and 9): the shared collect-lease API. CollectCoverageOwner is one
+// serial per thread, never reused: a thread that adopted this one's epoch, and one started after
+// another ended, each have their own. CollectWritesCovering answers as CollectWrites and reports
+// `covered` exactly for the epoch coverage hit and for a walk that covered the range under the key
+// read before it: not for a walk during which UnwatchSerial moved (the collect walk hook unwatches
+// another block there), a failed collect, or any return without the epoch coverage
+// (APS5_DEBUG_COVERAGE=1), the epoch map and ring hits included. CoveredCollectGeneration answers as
+// the hit does.
+std::atomic<std::uint64_t> unwatchInWalk{0};
+
+void UnwatchInCollectWalk() {
+    if (const auto address = unwatchInWalk.exchange(0); address != 0) Unwatch(address, Block);
+}
+
+struct CollectWalkHookScope {
+    explicit CollectWalkHookScope(std::uint64_t address) {
+        unwatchInWalk.store(address);
+        SetCollectWalkHook(&UnwatchInCollectWalk);
+    }
+    ~CollectWalkHookScope() {
+        SetCollectWalkHook(nullptr);
+        unwatchInWalk.store(0);
+    }
+};
+
+void CheckCollectCovering() {
+    const bool coverage = std::getenv("APS5_DEBUG_COVERAGE") != nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto owner = CollectCoverageOwner();
+    Require(owner != 0 && CollectCoverageOwner() == owner, "the coverage owner is zero or moved on its own thread");
+    BumpCollectEpoch();
+    std::uint64_t adoptedEpoch = 0, adoptedOwner = 0, laterOwner = 0;
+    std::thread([&] {
+        AdoptLatestCollectEpoch();
+        adoptedEpoch = CollectEpoch();
+        adoptedOwner = CollectCoverageOwner();
+    }).join();
+    std::thread([&] { laterOwner = CollectCoverageOwner(); }).join();
+    Require(adoptedEpoch == CollectEpoch(), "the second thread did not adopt this thread's collect epoch");
+    Require(adoptedOwner != 0 && adoptedOwner != owner, "a thread that adopted this thread's collect epoch shares its coverage owner");
+    Require(laterOwner != 0 && laterOwner != owner && laterOwner != adoptedOwner, "a thread started after another ended took its coverage owner");
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const WatchedRelease release{memory, bytes};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x22, bytes);
+    BumpCollectEpoch();
+    // One collect through the API: its answer, whether it walked (counted runs only) and `covered`.
+    const auto collect = [&](std::uint64_t address, std::size_t size, bool walks, bool expected, const char* what) {
+        const auto walked = ThreadCollectedBytes();
+        bool covered = !expected;
+        Require(CollectWritesCovering(address, size, covered) != 0, what);
+        if (counted) Require((ThreadCollectedBytes() != walked) == walks, what);
+        Require(covered == expected, what);
+    };
+    if (!coverage) {
+        collect(base, 2 * Block, true, false, "a walk without the epoch coverage reported its range covered");
+        collect(base, 2 * Block, false, false, "an epoch map hit reported its range covered");
+        collect(base + Block, Block, false, false, "a ring hit reported its range covered");
+        return;
+    }
+    collect(base, 2 * Block, true, true, "the first walk of an epoch did not report its range covered");
+    collect(base, 2 * Block, false, true, "an epoch coverage hit was not reported covered");
+    collect(base + 100, 50, false, true, "a part of a covered range was not reported covered");
+    Require(CoveredCollectGeneration() == TrackerGeneration(), "CoveredCollectGeneration is not the current generation");
+    const auto before = CurrentCollectMemoKey();
+    {
+        const CollectWalkHookScope hook(base + 3 * Block);
+        collect(base + 2 * Block, Block, true, false, "a walk during which UnwatchSerial moved reported its range covered");
+    }
+    const auto after = CurrentCollectMemoKey();
+    Require(after.unwatched != before.unwatched && after.epoch == before.epoch, "the walk hook did not move UnwatchSerial alone");
+    // That walk covered its range under the new key, which a later call reads.
+    collect(base + 2 * Block, Block, false, true, "a range walked under the new key was not covered by it");
+    collect(base, Block, true, true, "a walk under the new key did not report its range covered");
+    alignas(4096) static std::uint8_t outside[4096];
+    bool covered = true;
+    Require(CollectWritesCovering(reinterpret_cast<std::uint64_t>(outside), sizeof(outside), covered) == 0 && !covered, "a failed collect reported its range covered");
+    covered = true;
+    Require(CollectWritesCovering(base, 0, covered) == 0 && !covered, "an empty collect reported its range covered");
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2140,6 +2222,14 @@ int main(int argc, char** argv) {
             CheckStampsHold();
             CheckCollectCovered();
             std::cout << "StampsHold and collect coverage tests passed\n";
+            return 0;
+        }
+        // LOCAL EXPERIMENT (REVALIDATE-PLAN 4): the shared collect-lease API alone, in the epoch
+        // coverage's environment with the walks counted (the full run checks `covered` stays false
+        // without).
+        if (argc > 1 && std::string_view(argv[1]) == "--collect-covering") {
+            CheckCollectCovering();
+            std::cout << "collect covering tests passed\n";
             return 0;
         }
 #ifdef _WIN32
@@ -2192,6 +2282,7 @@ int main(int argc, char** argv) {
         CheckCollectMemoKey();
         CheckStampsHold();
         CheckCollectCovered();
+        CheckCollectCovering();
         CheckHostWriteStamps();
 #ifdef _WIN32
         CheckHostWriteWatchedMiddle();

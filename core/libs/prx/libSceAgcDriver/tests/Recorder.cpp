@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/FieldCount.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InputLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -4724,6 +4725,168 @@ void drawSnapshotEvictionTests(const Device& device) {
     std::memset(block, 0x5a, 16);
     CollectWrites(address, 16);
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
+}
+
+// LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 and 9, I0): the draw-input lease counters over
+// real CopyDrawInput calls, as the environment sets them up (counting with a collect memo key,
+// counting without one, off). Every row checks the same observable results (reuse, buffers, derived
+// values) and that NothingPendingOver gives no proof at PendingSerial 0 (NoSerial, counted apart from
+// query nothing-over) but one after a bump; the counting rows also check each row's prediction: (a) a
+// repeat holds P (memo), C and M together; (c) an epoch bump makes C miss (epoch), the call walks and refills; (b) a CPU store seen at
+// the next epoch makes UnchangedSince fail, a copy is made and kept, and M misses (set serial moved)
+// next time; (d) an unwatch makes C miss (unwatch), an allocation change makes C miss (mapping) and
+// erases the entry through sameRegistry; (j) a padding refusal; (h) a vertex lower_bound served by a
+// wider entry, then an in-between size kept: M misses and finds the new entry; a PendingSerial bump
+// makes P's memo miss and its query answer; a probe without the GpuMutex gets no lease (counted); an
+// addition to the pending registry counts U only off the GpuMutex. W and M wrong stay 0. Off, nothing
+// is counted and no lease is handed out.
+bool drawInputLeaseCounterTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    using Use = Recorder::SnapshotUse;
+    using C = InputLeaseCounts;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 4 * block;
+    void* memory = AllocateWatched(bytes, block);
+    if (memory == nullptr) {
+        std::cout << "no write watching: the draw input lease counters not tested\n";
+        return false;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    const bool counting = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool keyed = counting && std::getenv("APS5_DEBUG_COVERAGE") != nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    const std::uint64_t one = keyed ? 1 : 0;
+    const auto& context = device.GetContext();
+    auto* words = static_cast<std::uint32_t*>(memory);
+    for (std::uint32_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) words[i] = i * 5 + 1;
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    constexpr std::size_t size = 256;
+    auto before = InputLeaseCountsNow();
+    // Each step's counts since the last step (counting rows only); W and M wrong stay 0 in every row.
+    const auto expect = [&](std::initializer_list<std::pair<std::uint64_t C::*, std::uint64_t>> counts, const char* what) {
+        const auto now = InputLeaseCountsNow();
+        if (counting) {
+            for (const auto& [field, count] : counts) Require(now.*field - before.*field == count, what);
+        }
+        Require(now.cWrong == before.cWrong && now.mWrong == before.mWrong, what);
+        before = now;
+    };
+    // PendingSerial 0, which a fresh test process still has (no storage image went pending yet), is no
+    // proof for row P: the query reports NoSerial and the probe counts it apart from nothing-over.
+    if (StorageTexture::PendingSerial() == 0) {
+        auto over = StorageTexture::PendingOver::Nothing;
+        Require(StorageTexture::NothingPendingOver(address, size, &over) == 0 && over == StorageTexture::PendingOver::NoSerial, "NothingPendingOver gave a proof at PendingSerial 0");
+        {
+            InputLeaseShadow shadow(&recorder, address + 2 * block, size, Use::Index32);
+        }
+        expect({{&C::indexCalls, 1}, {&C::inserted, 1}, {&C::pNoSerial, 1}, {&C::pQuery, 0}, {&C::pMemo, 0}}, "row P counted PendingSerial 0 as a proof");
+    } else {
+        std::cout << "PendingSerial is not 0 at the start: row P's serial-0 case not tested\n";
+    }
+    // Row P's memo needs a PendingSerial other than 0; with nothing over the range, the query proves it.
+    StorageTexture::BumpPendingSerial();
+    BumpCollectEpoch();
+    {
+        auto over = StorageTexture::PendingOver::NoSerial;
+        const auto serial = StorageTexture::PendingSerial();
+        Require(StorageTexture::NothingPendingOver(address, size, &over) == serial && over == StorageTexture::PendingOver::Nothing, "NothingPendingOver gave no proof with nothing pending");
+    }
+    const auto index = [&](std::size_t bufferBytes = 0) { return CopyDrawInput(context, &recorder, address, size, 4, Use::Index32, bufferBytes); };
+    const auto equalsGuest = [&](const DrawInputCopy& copy) { return std::memcmp(copy.buffer->Bytes().data(), memory, size) == 0; };
+    // (a)
+    const auto first = index();
+    Require(!first.reused && first.generation != 0 && equalsGuest(first), "the first draw input was not copied");
+    expect({{&C::indexCalls, 1}, {&C::inserted, 1}, {&C::present, 0}, {&C::pQuery, 1}, {&C::cNotCovered, one}, {&C::cNoKey, 1 - one}, {&C::mNoLease, 1}, {&C::copied, 1}}, "the first input's lease counts are wrong");
+    KeepDrawInput(&recorder, address, first, Use::Index32, 189);
+    const auto second = index();
+    Require(second.reused && second.buffer == first.buffer && second.derived == 189, "an unchanged draw input was copied again");
+    expect({{&C::present, 1}, {&C::pMemo, 1}, {&C::cWould, one}, {&C::mNoLease, 1}, {&C::mWould, 0}, {&C::reused, 1}, {&C::held, 0}}, "the repeat's lease counts are wrong");
+    const auto third = index();
+    Require(third.reused && third.buffer == first.buffer, "an unchanged draw input was copied a third time");
+    expect({{&C::present, 1}, {&C::pMemo, 1}, {&C::cWould, one}, {&C::mWould, 1}, {&C::reused, 1}, {&C::held, one}}, "a third use did not hold every row");
+    // (c)
+    BumpCollectEpoch();
+    Require(index().reused, "an epoch bump made an unchanged draw input copy");
+    expect({{&C::cEpoch, one}, {&C::cWould, 0}, {&C::pMemo, 1}, {&C::mWould, 1}, {&C::held, 0}}, "an epoch bump did not make row C miss");
+    Require(index().reused, "an unchanged draw input was copied after an epoch bump");
+    expect({{&C::cWould, one}, {&C::held, one}}, "row C did not refill after an epoch bump");
+    // (b)
+    words[5] = 0xdead;
+    BumpCollectEpoch();
+    const auto stored = index();
+    Require(!stored.reused && stored.buffer != first.buffer && equalsGuest(stored), "a draw input outlived a CPU store");
+    expect({{&C::cEpoch, one}, {&C::mWould, 1}, {&C::copied, 1}}, "a CPU store's lease counts are wrong");
+    KeepDrawInput(&recorder, address, stored, Use::Index32, 7);
+    Require(index().derived == 7, "the copy after the CPU store was not kept");
+    expect({{&C::mMoved, 1}, {&C::mWould, 0}, {&C::reused, 1}}, "row M held across its entry's replacement");
+    // (d)
+    Unwatch(address + 3 * block, block);
+    Require(index().derived == 7, "an unwatch elsewhere dropped the kept copy");
+    expect({{&C::cUnwatch, one}, {&C::mWould, 1}}, "an unwatch did not make row C miss");
+    alignas(64) static std::byte other[64];
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(other, sizeof(other), true, true, true);
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(other);
+    }
+    const auto remapped = index();
+    Require(!remapped.reused && equalsGuest(remapped), "a draw input outlived a registry mutation");
+    expect({{&C::cMapping, one}, {&C::mWould, 1}, {&C::copied, 1}}, "an allocation change did not make row C miss, or row M did not find the entry it erased");
+    KeepDrawInput(&recorder, address, remapped, Use::Index32, 9);
+    // (j)
+    const auto padded = index(2 * size);
+    Require(!padded.reused && padded.generation != 0 && padded.buffer->Bytes().size() == 2 * size && equalsGuest(padded), "a kept copy without the padding was reused");
+    expect({{&C::padding, 1}, {&C::copied, 0}, {&C::reused, 0}}, "a padding refusal was not counted");
+    Require(index().derived == 9, "the padding refusal dropped the kept copy");
+    expect({{&C::reused, 1}}, "the kept copy after a padding refusal was not reused");
+    // (h)
+    const auto pool = address + block;
+    const auto vertex = [&](std::size_t length) { return CopyDrawInput(context, &recorder, pool, length, 1, Use::Vertex); };
+    const auto whole = vertex(12288);
+    Require(!whole.reused, "the vertex pool was reused before it was kept");
+    KeepDrawInput(&recorder, pool, whole, Use::Vertex, 0);
+    Require(vertex(4096).buffer == whole.buffer && vertex(4096).buffer == whole.buffer, "a shorter vertex read did not reuse the longer snapshot");
+    expect({{&C::vertexCalls, 3}, {&C::inserted, 2}, {&C::mNoLease, 2}, {&C::mWould, 1}}, "a vertex read served by a wider entry was not leased");
+    const auto middle = std::make_shared<Buffer>(context, 8192, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    recorder.KeepDrawSnapshot(pool, 8192, CollectWrites(pool, 8192), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), middle, Use::Vertex);
+    Require(vertex(4096).buffer == middle, "a vertex read did not take the in-between snapshot kept after its lease");
+    expect({{&C::mMoved, 1}, {&C::mWould, 0}}, "row M held across an in-between vertex snapshot");
+    Require(vertex(4096).buffer == middle, "a vertex read left the in-between snapshot");
+    expect({{&C::mWould, 1}}, "row M did not refill with the in-between snapshot");
+    // Row P's memo after a PendingSerial bump.
+    StorageTexture::BumpPendingSerial();
+    Require(index().derived == 9, "a PendingSerial bump dropped the kept copy");
+    expect({{&C::pMemo, 0}, {&C::pQuery, 1}}, "a PendingSerial bump did not make row P's memo miss");
+    Require(index().derived == 9, "the kept copy was not reused");
+    expect({{&C::pMemo, 1}}, "row P's query did not refill its memo");
+    // A probe without the GpuMutex, an input bound in place, and the additions.
+    bool unleased = false;
+    std::thread([&] { unleased = recorder.InputLeaseFor(address, size, Use::Index32) == nullptr; }).join();
+    Require(unleased, "a probe without the GpuMutex got a lease");
+    {
+        InputLeaseShadow shadow(&recorder, pool, 4096, Use::Vertex);
+        shadow.InPlace();
+    }
+    expect({{&C::withoutGpuMutex, 1}, {&C::vertexCalls, 1}, {&C::inPlace, 1}}, "a probe without the GpuMutex or an input bound in place was not counted");
+    if (counting) {
+        const auto additions = PendingAdditions();
+        NotePendingAddition(PendingAdditionSite::Reconcile);
+        std::thread([] { NotePendingAddition(PendingAdditionSite::Shadow); }).join();
+        const auto now = InputLeaseCountsNow();
+        Require(PendingAdditions() == additions + 2, "the pending additions were not counted");
+        Require(now.unlocked[static_cast<std::size_t>(PendingAdditionSite::Reconcile)] == before.unlocked[static_cast<std::size_t>(PendingAdditionSite::Reconcile)] && now.unlocked[static_cast<std::size_t>(PendingAdditionSite::Shadow)] == before.unlocked[static_cast<std::size_t>(PendingAdditionSite::Shadow)] + 1, "U counted an addition under the GpuMutex, or missed one off it");
+    } else {
+        const auto now = InputLeaseCountsNow();
+        Require(recorder.InputLeaseFor(address, size, Use::Index32) == nullptr, "a lease was handed out without the counters");
+        Require(now.indexCalls == 0 && now.vertexCalls == 0 && now.inserted == 0 && now.present == 0 && now.pQuery == 0 && now.withoutGpuMutex == 0 && now.mNoLease == 0, "the lease counters counted without APS5_PROFILE_DRAW");
+    }
+    recorder.Sync();
+    return true;
 }
 
 // The =3 death case below must end the process with a plain exit code (see Locks.cpp's
@@ -14018,6 +14181,17 @@ int main(int argc, char** argv) {
                 std::cout << "skipped, the device watches no memory for the depth lease counter\n";
                 return 77;
             }
+            return 0;
+        }
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 and 9, I0): the draw-input lease counters
+        // over real CopyDrawInput calls, as the environment sets them up; skipped (77) without write
+        // watching.
+        if (argc == 2 && std::string_view(argv[1]) == "--input-lease-counter-only") {
+            if (!drawInputLeaseCounterTests(device, recorder)) {
+                std::cout << "skipped, the device watches no memory for the draw input lease counters\n";
+                return 77;
+            }
+            std::cout << "draw input lease counter tests passed\n";
             return 0;
         }
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (c)): DepthSurfaceView leases

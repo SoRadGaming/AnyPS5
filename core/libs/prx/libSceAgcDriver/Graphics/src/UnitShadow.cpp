@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InputLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -714,6 +715,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     auto& registry = Registry();
     std::uint64_t bytes = 0;
     std::uint64_t lost = 0;
+    bool live = false;
     {
         std::lock_guard lock(registry.mutex);
         const auto shadow = find(registry, import);
@@ -733,9 +735,13 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 current->lastUse = present;
+                live = true;
             }
         }
         shadow->Recount();
+        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): units went live, an addition to what
+        // a draw input's pending check sees (the PendingSerial bump follows outside this lock).
+        if (live && InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Shadow);
     }
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);
