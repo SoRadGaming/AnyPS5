@@ -11,13 +11,21 @@
 //   wait          WAIT_REG_MEM on a readback destination from queue 0 and from queue 0x48: completes
 //                 (by polling once the copy ran), no hang;
 //   copy-in       a memory -> GDS copy of a dispatch's pending output, read back;
-//   fallbacks     stores while the recorder is idle (reason 1), a readback into memory without a host
-//                 import, and the 3-byte store above take today's path, counted; the decode refusals
-//                 (high word, range, shape) in the decode part (Validate rejects such packets first);
+//   fallbacks     stores while the recorder is idle (reason 1: required whenever the recorder was idle
+//                 after the case's sync), a readback into memory without a host import, and the 3-byte
+//                 store above take today's path, counted; the decode refusals (high word, range, shape)
+//                 and the store refusals' names (reasons 1-5) in the decode part (Validate rejects such
+//                 packets first); reason 3 is the readback case's on a device without a host import of
+//                 the GDS, reason 4 is ResolveStore's (store-shape) before WriteLabelOnGpu sees it;
 //   switch off    nothing counted, nothing armed.
 // Every run checks the values, and cpu-gds-access-unnoted stays 0. A device without a host import of the
 // GDS records nothing: the run says so and checks the fallbacks instead. The mode expected comes from the
 // environment (=1/=2 need APS5_EXPERIMENT_GDS_TARGETED_SYNC and are refused with APS5_PIPELINE_DMA).
+// --behind-completions (its own process) tests reason 5 on the device instead: WriteLabelOnGpu with
+// `behindCompletions` false while recorded work has a completion action (APS5_LABEL_GATE_ALL=1, which
+// that mode sets: through the driver a copied writer over the GDS needs a buffer that spans the GDS
+// mapping and memory the device does not import) returns 5 with nothing recorded, noted or stamped, and
+// the refused bytes never land; a store that accepts the completion path is recorded and lands.
 // A failure prints and leaves at once (std::_Exit): GPU work may still reference the test's memory, which
 // is static or never freed, and a lost device must not hang a teardown.
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -373,6 +381,9 @@ void Decode() {
     Require(!Pm4::ResolveStore(unaligned, queue, 65536, true).has_value(), "ResolveStore: a store into the GDS at an unaligned offset resolved");
     const std::array<std::uint32_t, 7> high{0xc0055000u, 0x40100000u, 0x11223344u, 0, 0x40, 1, 4};
     Require(!Pm4::ResolveStore(high, queue, 65536, true).has_value(), "ResolveStore: a store into the GDS with a high word resolved");
+    // WriteLabelOnGpu's refusals of a store into the GDS by name (any other reason counts as 4).
+    const std::array<std::pair<int, Fallback>, 6> refusals{{{1, Fallback::StoreCpu}, {2, Fallback::StoreDrain}, {3, Fallback::StoreNoImport}, {4, Fallback::StoreUnsuitable}, {5, Fallback::StoreBehindCompletions}, {6, Fallback::StoreUnsuitable}}};
+    for (const auto& [reason, fallback] : refusals) Require(GdsStream::StoreFallback(reason) == fallback, "StoreFallback: reason " + std::to_string(reason) + " counted as " + GdsStream::FallbackName(GdsStream::StoreFallback(reason)) + ", expected " + GdsStream::FallbackName(fallback));
     std::puts("gds in stream: decode passed");
 }
 
@@ -516,10 +527,17 @@ void CopyIn(const Run& run) {
 // import take today's path, counted.
 void Fallbacks(const Run& run) {
     std::deque<Words> kept;
+    // Whether the recorder was idle after the sync: nothing records before the first store then (every
+    // queue finished, and an immediate store into the GDS records nothing ahead of WriteLabelOnGpu), so
+    // that store meets the idle recorder: reason 1.
+    bool idleAfterSync = false;
     {
         AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Flush);
         std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
-        if (auto* recorder = AgcDriver::Graphics::Recorder::Active()) recorder->Sync();
+        if (auto* recorder = AgcDriver::Graphics::Recorder::Active()) {
+            recorder->Sync();
+            idleAfterSync = recorder->Idle();
+        }
     }
     auto before = GdsStream::CurrentTotals();
     Words idle;
@@ -533,7 +551,8 @@ void Fallbacks(const Run& run) {
     if (run.mode != 0) {
         Require(Recorded(delta, Op::Store) + StoreRefusals(delta) == 4, "fallbacks: the four stores on an idle recorder were neither recorded nor counted: " + Describe(delta));
         Require(delta.targetedSyncs == FellAll(delta), "fallbacks: a store fallback did not take the targeted path: " + Describe(delta));
-        if (Fell(delta, Fallback::StoreCpu) == 0) std::puts("gds in stream: fallbacks: the recorder was not idle, reason 1 not reached");
+        if (idleAfterSync) Require(Fell(delta, Fallback::StoreCpu) >= 1, "fallbacks: the recorder was idle after the sync, but no store into the GDS fell back with reason 1: " + Describe(delta));
+        else std::puts("gds in stream: fallbacks: the recorder was not idle after the sync, reason 1 not required");
     }
 
     Unregistered.fill(Untouched);
@@ -552,15 +571,68 @@ void Fallbacks(const Run& run) {
     if (run.mode != 0) Require(Recorded(delta, Op::Readback) == 0 && CopyRefusals(delta) + delta.idleCopies == 1, "fallbacks: the readback into unimported memory was recorded or not counted: " + Describe(delta));
 }
 
+// --behind-completions: reason 5 (judge fix), on a device of its own, with APS5_LABEL_GATE_ALL=1 (main sets
+// it before the first label: WriteLabelOnGpu reads it once), so every label meets the completion path
+// while recorded work has a completion action. A fill makes recorded work, an empty completion action
+// is added to its batch, then a store refuses the completion path (`behindCompletions` false, the GDS
+// stream's store into the GDS) and another accepts it (every other caller). The refused one returns 5
+// with nothing recorded, noted or stamped and never lands (its completion memcpy would land at a reap,
+// after later GPU users of the GDS); the accepted one returns 5 too (the gate was taken) and lands.
+int BehindCompletions() {
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    using AgcDriver::Graphics::Recorder;
+    const auto device = OpenVulkanTestDevice();
+    if (!device) return VulkanTestSkipped;
+    auto& block = Memory();
+    block.readback.fill(0);
+    // Held throughout, as the driver's label paths hold it; released only after the batch finished.
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    const std::array<std::uint32_t, 4> pattern{0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au};
+    if (!device->FillBuffer(Address(block.copiedIn.data()), sizeof(block.copiedIn), pattern)) {
+        std::puts("skipped, the device does not import guest memory");
+        return VulkanTestSkipped;
+    }
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "behind completions: no active recorder after the fill");
+    Require(recorder->AfterRecordedWork([] {}), "behind completions: the completion action was not added (the fill left the recorder idle)");
+    const auto refused = Address(&block.readback[1]);
+    const auto accepted = Address(&block.readback[2]);
+    constexpr std::uint32_t RefusedValue = 0x11223344u;
+    constexpr std::uint32_t AcceptedValue = 0x55667788u;
+    const auto completionLabels = Recorder::PendingCompletionLabels();
+    const auto stamp = GuestMemory::NewestStamp(refused, 4);
+    // A compute queue's store: no opportunistic reap first, so the completion action stays pending.
+    const int reason = device->WriteLabelOnGpu(refused, std::as_bytes(std::span(&RefusedValue, 1)), 1, ProducerQueue, true, false);
+    Require(reason == 5, "behind completions: a store that refuses the completion path returned " + std::to_string(reason) + ", expected 5");
+    Require(!recorder->PendingWriteOverlaps(refused, 4), "behind completions: the refused store left a pending write over its range");
+    Require(!recorder->PendingLabelIn(refused, 4) && !recorder->CompletionLabelIn(refused, 4), "behind completions: the refused store left a label over its range");
+    Require(Recorder::PendingCompletionLabels() == completionLabels, "behind completions: the refused store added a completion label");
+    Require(GuestMemory::NewestStamp(refused, 4) == stamp, "behind completions: the refused store stamped its range");
+    const int acceptedReason = device->WriteLabelOnGpu(accepted, std::as_bytes(std::span(&AcceptedValue, 1)), 2, ProducerQueue, true, true);
+    Require(acceptedReason == 5, "behind completions: a store that accepts the completion path returned " + std::to_string(acceptedReason) + ", expected 5 (APS5_LABEL_GATE_ALL not in effect?)");
+    Require(recorder->PendingWriteOverlaps(accepted, 4), "behind completions: the accepted store left no pending write over its range");
+    device->SubmitRecorded(false);
+    device->WaitIdle();
+    Require(block.readback[1] == 0, "behind completions: the refused store landed (" + std::to_string(block.readback[1]) + ")");
+    Require(block.readback[2] == AcceptedValue, "behind completions: the accepted store holds " + std::to_string(block.readback[2]) + ", expected " + std::to_string(AcceptedValue));
+    RequireValues(block.copiedIn, pattern, "behind completions: the fill");
+    std::puts("gds in stream behind-completions tests passed");
+    return 0;
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
+    const bool behindCompletions = argc > 1 && std::strcmp(argv[1], "--behind-completions") == 0;
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
+    if (behindCompletions) _putenv_s("APS5_LABEL_GATE_ALL", "1");
 #else
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
+    if (behindCompletions) setenv("APS5_LABEL_GATE_ALL", "1", 1);
 #endif
     try {
+        if (behindCompletions) return BehindCompletions();
         Run run;
         run.mode = ExpectedMode();
         Decode();

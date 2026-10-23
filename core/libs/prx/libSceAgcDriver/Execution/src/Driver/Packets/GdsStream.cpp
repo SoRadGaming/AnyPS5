@@ -198,29 +198,36 @@ Expected ExpectCopy(std::uint64_t source, std::size_t bytes) {
     Expected expected;
     expected.source = source;
     expected.bytes.resize(bytes);
+    // Before the read (its lock stamps the host writes that ended so far, which the read then sees): a
+    // host write that ends during or after the read is stamped newer, so it can explain the mismatch it
+    // causes.
+    expected.generation = GuestMemory::TrackerGeneration();
     // Through the flush hook: under the caller's hold its SyncThrough of the source waits locked, and
     // storage results pending over the source are stored first.
     GuestMemory::Read(source, expected.bytes);
-    expected.generation = GuestMemory::TrackerGeneration();
     return expected;
 }
 
 Expected ExpectStore(std::span<const std::byte> bytes) {
     Expected expected;
     expected.bytes.assign(bytes.begin(), bytes.end());
+    expected.generation = GuestMemory::TrackerGeneration();
     return expected;
 }
 
 void VerifyRecorded(Graphics::Recorder& recorder, std::uint32_t queue, Op op, std::uint64_t destination, const Expected& expected) {
     const auto bytes = expected.bytes.size();
     if (bytes == 0) return;
-    // After the operation's own stamp (MarkWritten at its record): a later stamp is someone else's.
-    const auto recordedGeneration = GuestMemory::TrackerGeneration();
     // Locked: the caller's hold is kept, so nothing is recorded between the operation and the compare.
     recorder.SyncThrough(destination, bytes);
     Add(verified);
     if (std::memcmp(reinterpret_cast<const void*>(destination), expected.bytes.data(), bytes) == 0) return;
-    if (GuestMemory::WrittenSince(destination, bytes, recordedGeneration) || (expected.source != 0 && GuestMemory::WrittenSince(expected.source, bytes, expected.generation))) {
+    // Explained only by a CPU stamp over a page of the source or the destination since Expected: an H
+    // host write, or a CPU store a collect stamped. Never by a driver stamp: the operation's own
+    // MarkWritten (a GDS -> GDS copy stamps the source's 64 KiB block too), or a write-back that the
+    // reaps inside the SyncThrough above ran (a stale one over the destination is the defect this
+    // check exists for).
+    if (GuestMemory::CpuWrittenSince(destination, bytes, expected.generation) || (expected.source != 0 && GuestMemory::CpuWrittenSince(expected.source, bytes, expected.generation))) {
         Add(explained);
         return;
     }
@@ -264,7 +271,7 @@ void ReportWindow(const char* window, bool print) {
     }
     if (first) line += " none";
     append(line, "; targeted syncs %llu; cpu-gds-access checks %llu, cpu-gds-access-unnoted %llu", count(now.targetedSyncs - last.targetedSyncs), count(now.accessChecks - last.accessChecks), count(now.unnoted - last.unnoted));
-    if (Verify()) append(line, "; =2 verified %llu, explained by a moved stamp %llu", count(now.verified - last.verified), count(now.explained - last.explained));
+    if (Verify()) append(line, "; =2 verified %llu, explained by a CPU stamp %llu", count(now.verified - last.verified), count(now.explained - last.explained));
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }
 

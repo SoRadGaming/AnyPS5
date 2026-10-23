@@ -2681,9 +2681,15 @@ if(BUILD_TESTING)
     endif()
     # LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): GDS transfers recorded in the
     # stream (tests/execution/GdsInStream.cpp, whose plain run above leaves the switch unset and expects
-    # nothing counted) on (=1), value-checked (=2), on under the D0 stream and GDS counters and under the
-    # barrier validator, and the two refusals the switch must resolve to 0: no targeted GDS sync, and
-    # APS5_PIPELINE_DMA. The test reads the mode it expects from the environment.
+    # nothing counted) on (=1), value-checked (=2), on under the D0 stream and GDS counters, on with the
+    # barrier validator's access notes (a smoke run of those paths only: Recorder::NoteAccess counts the
+    # barriers a hazard tracker would emit or skip and checks nothing, and it does not model the trailing
+    # barriers CopyBuffer's and the store runs' merges rely on; ordering is checked by the cases' values,
+    # =1's cpu-gds-access-unnoted and a run under the validation layer), and the two refusals the switch
+    # must resolve to 0: no targeted GDS sync, and APS5_PIPELINE_DMA. The test reads the mode it expects
+    # from the environment. behind_completions runs its --behind-completions mode (WriteLabelOnGpu's
+    # refusal of the completion path on a device of its own; it sets APS5_LABEL_GATE_ALL itself and reads
+    # no switch).
     set_tests_properties(agc_driver_gds_in_stream PROPERTIES TIMEOUT 120)
     set(gdsStreamTests)
     foreach(gdsStreamCase IN ITEMS
@@ -2703,6 +2709,9 @@ if(BUILD_TESTING)
         set_tests_properties(${gdsStreamTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;${gdsStreamCaseEnvironment}" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
         list(APPEND gdsStreamTests ${gdsStreamTest})
     endforeach()
+    add_test(NAME agc_driver_gds_in_stream_behind_completions COMMAND agc_driver_gds_in_stream_tests --behind-completions)
+    set_tests_properties(agc_driver_gds_in_stream_behind_completions PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    list(APPEND gdsStreamTests agc_driver_gds_in_stream_behind_completions)
     if(WIN32)
         set_tests_properties(${gdsStreamTests} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()

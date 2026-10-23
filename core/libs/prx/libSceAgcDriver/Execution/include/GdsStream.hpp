@@ -91,10 +91,13 @@ void CheckGuestAccess(std::uint64_t address, std::size_t bytes);
 // =2, kept only as a value check (judge fix 2: it syncs around every operation, so it cannot see an
 // ordering defect). Expected holds the bytes the operation must leave at its destination, taken under
 // the caller's hold before the record: a copy's source read through the flush hook (a locked
-// SyncThrough of it, pending results stored), or a store's own bytes. VerifyRecorded then runs a locked
-// SyncThrough of the destination and compares. A disagreement is explained only by a write stamp that
-// moved meanwhile over the source (since Expected) or the destination (since the record): an H host
-// write, or a CPU store racing on another queue. Otherwise it prints
+// SyncThrough of it, pending results stored), or a store's own bytes, with the tracker generation taken
+// before either. VerifyRecorded then runs a locked SyncThrough of the destination and compares. A
+// disagreement is explained only by a CPU stamp newer than that generation on a page of the source or
+// the destination (GuestMemory::CpuWrittenSince): an H host write, or a CPU store a collect stamped.
+// Never by a driver stamp: the operation's own MarkWritten, the write-backs the reaps of that
+// SyncThrough run, or another queue's CPU store into the GDS (the game orders those; the GDS gets no
+// CPU stamps, so a disagreement over it always aborts). Otherwise it prints
 // "[gds-stream] =2 disagreement queue 0x%x kind %s dst 0x%llx bytes %zu", flushes and aborts (the
 // TicketDisagrees convention).
 struct Expected {

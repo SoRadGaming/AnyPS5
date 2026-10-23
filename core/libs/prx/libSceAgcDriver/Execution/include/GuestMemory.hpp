@@ -88,6 +88,14 @@ struct UnchangedQuery {
     std::uint64_t generation;
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM=2, DRAIN-PLAN D2): WrittenSince over the CPU's stamps
+// only: whether a page of the range carries a CPU stamp newer than `generation`, an H host write
+// (NoteHostWrite: this call's tracker lock stamps the queued ones first) or a CPU store a collect already
+// stamped, page by page where the block keeps page stamps (by the block's CPU stamp otherwise), as
+// UnchangedSinceCollected compares. Never the driver's own stores (MarkWritten, Write, WriteChanged and
+// the completions' write-backs, StoreOwnBytes), and nothing is collected. False when the arena is not
+// watched, the generation is 0, or the range is empty or not covered (it proves nothing), as WrittenSince.
+bool CpuWrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): UnchangedSinceAll over
 // `unchanged` and !StoredOver over `notStoredOver` (its watched, covered, generation, length and

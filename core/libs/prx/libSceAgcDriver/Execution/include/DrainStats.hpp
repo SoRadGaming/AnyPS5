@@ -67,7 +67,11 @@ void ReportWindow(Window window, bool print = true);
 // GuestMemory::Write; after a GPU wait or not), DeviceDrain (preparePacketMemory drained the device
 // for it, nothing named before), and Fallback (WriteLabelOnGpu refused, its reason kept: 1 CPU store,
 // 3/4/6 drained, 5 behind completions). A record's GPU wait is the thread's GPU-wait clock plus the
-// device drain's unlocked wait (NoteDeviceDrain), which that clock does not see.
+// device drain's unlocked wait (NoteDeviceDrain), which that clock does not see. LOCAL EXPERIMENT
+// (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): a store into the GDS that WriteLabelOnGpu refused is
+// not named Fallback: it takes the targeted path and is named CpuAfterWait / CpuIdle, as before the
+// switch (the refusal's reason is counted on [gds-stream]); its GpuStore / GpuStoreAfterRead and the
+// GDS copies' GpuCopy are named as above.
 enum class DmaKind : std::uint8_t { ImmToMem, MemToMem, ImmToGds, MemToGds, GdsToMem, GdsToGds, Prefetch, Count };
 enum class DmaPath : std::uint8_t { Item, Nothing, GpuStore, GpuStoreAfterRead, GpuCopy, GpuFill, CpuAfterWait, CpuIdle, DeviceDrain, Fallback, Count };
 constexpr std::size_t DmaKinds = static_cast<std::size_t>(DmaKind::Count);

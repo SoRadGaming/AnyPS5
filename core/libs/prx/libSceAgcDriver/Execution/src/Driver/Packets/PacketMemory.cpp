@@ -230,8 +230,13 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 // (reason 0); the completion path is refused before anything is recorded (5), and every
                 // refusal leaves the packet drained for the targeted path below.
                 const bool gdsStore = gdsStream && !gdsCopyRefused && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds;
+                // =2: the bytes the store must leave, and the generation before its record.
+                const auto expectedStore = gdsStore && GdsStream::Verify() ? GdsStream::ExpectStore(bytes) : GdsStream::Expected{};
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue, true, !gdsStore) : 4;
-                if (opcode == 0x50) Drain::NoteDmaPath(reason == 0 ? (sourceWaited ? Drain::DmaPath::GpuStoreAfterRead : Drain::DmaPath::GpuStore) : Drain::DmaPath::Fallback, reason);
+                // A store into the GDS that WriteLabelOnGpu refused is not named here: it takes the
+                // targeted path, which PacketRecord names as today's (cpu-after-wait or cpu-idle), as
+                // every other refusal of a transfer into the GDS; its reason is counted on [gds-stream].
+                if (opcode == 0x50 && !(gdsStore && reason != 0)) Drain::NoteDmaPath(reason == 0 ? (sourceWaited ? Drain::DmaPath::GpuStoreAfterRead : Drain::DmaPath::GpuStore) : Drain::DmaPath::Fallback, reason);
                 if (gdsStore) {
                     if (reason == 0) {
                         noteLabelStore(store->address, bytes, stamp, submission.queue);
@@ -241,7 +246,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                         const auto source = Pm4::DmaSource(packet);
                         const auto op = source == Pm4::DmaSourceData ? GdsStream::Op::Store : source == Pm4::DmaSelectGds ? GdsStream::Op::StoreFromGds : GdsStream::Op::StoreFromMemory;
                         GdsStream::NoteRecorded(*recorder, op);
-                        if (GdsStream::Verify()) GdsStream::VerifyRecorded(*recorder, submission.queue, op, store->address, GdsStream::ExpectStore(bytes));
+                        if (GdsStream::Verify()) GdsStream::VerifyRecorded(*recorder, submission.queue, op, store->address, expectedStore);
                         ++storesOnGpu;
                         wroteOnGpu = true;
                         drained = false;
