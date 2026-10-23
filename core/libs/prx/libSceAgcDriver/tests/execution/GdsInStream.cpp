@@ -3,8 +3,10 @@
 // compute queue 0x40 (queue 0x48 and queue 0 wait), with the append kernel and the GDS counter packets
 // of GdsAppendConsume.cpp (SetCounters: DMA_DATA 0x40100000, ReadCounters: 0x20000000):
 //   readback      an append dispatch, the counters stored between it and a second one, a readback:
-//                 =1/=2 record the readback (CopyBuffer path 1 or 3) and the four stores (no targeted
-//                 sync), and the second dispatch sees the stored values;
+//                 =1/=2 record the readback (CopyBuffer path 1 or 3), =1 the four stores (no targeted
+//                 sync); =2 records the first store, whose value check syncs the recorder idle, so each
+//                 later one is recorded and checked or refused with reason 1 (the targeted path, as
+//                 today); the second dispatch sees the stored values;
 //   write-after   a readback recorded behind a slow non-GDS dispatch in a batch newer than every GDS
 //                 user, then a fallback CPU store into the GDS (3 bytes: not a GPU store): the store
 //                 waits for the readback's batch (judge fix 1), so the readback holds the counter;
@@ -26,8 +28,14 @@
 // that mode sets: through the driver a copied writer over the GDS needs a buffer that spans the GDS
 // mapping and memory the device does not import) returns 5 with nothing recorded, noted or stamped, and
 // the refused bytes never land; a store that accepts the completion path is recorded and lands.
-// A failure prints and leaves at once (std::_Exit): GPU work may still reference the test's memory, which
-// is static or never freed, and a lost device must not hang a teardown.
+// A failure prints and leaves at once, with no teardown: GPU work may still reference the test's memory,
+// which is static or never freed, and a lost device must not hang a teardown. On Windows that takes
+// TerminateProcess: std::_Exit there is ExitProcess, which ends the other threads where they stand and
+// then runs every DLL's detach, where libSceAgcDriver's static Driver stops the device against the
+// killed workers (and an ICD loaded at run time, so detached first) and never returned (a failed =2 run
+// printed its "host imports at shutdown" line, then hung until ctest killed it). A watchdog fails a run
+// that is not done in 60 s (a wait with no limit of its own); the end syncs the recorder idle before
+// the driver's shutdown, so the teardown waits on nothing left in an open batch.
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GdsStream.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -65,13 +73,29 @@ using GdsStream::Fallback;
 using GdsStream::Op;
 
 [[noreturn]] void Fail(const std::string& what) {
+    // The case's own lines first (stdout is buffered, and nothing flushes it after this).
+    std::fflush(stdout);
     std::fprintf(stderr, "gds in stream: %s\n", what.c_str());
     std::fflush(stderr);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), 1);
+#endif
     std::_Exit(1);
 }
 
 void Require(bool condition, const std::string& what) {
     if (!condition) Fail(what);
+}
+
+// The whole run's limit (ctest allows 120 s; a run takes about a second): a wait with no limit of its
+// own (a checked read, a recorder sync, the driver's shutdown) that never ends fails here.
+constexpr std::chrono::seconds RunLimit{60};
+
+void StartWatchdog() {
+    std::thread([] {
+        std::this_thread::sleep_for(RunLimit);
+        Fail("the run did not finish in " + std::to_string(RunLimit.count()) + " s (a wait with no limit of its own hung)");
+    }).detach();
 }
 
 constexpr std::uint32_t ProducerQueue = 0x40;
@@ -418,8 +442,23 @@ void ReadbackAndStores(Run& run) {
         std::puts("gds in stream: the readback was not recorded on this device (no host import of the GDS?): the GPU half is not tested, the fallbacks are");
         return;
     }
-    Require(Recorded(delta, Op::Store) == 4, "readback: the four stores between the dispatches were not recorded on the GPU: " + Describe(delta));
-    Require(delta.targetedSyncs == 0 && FellAll(delta) == 0, "readback: a store into the GDS synced or fell back: " + Describe(delta));
+    if (run.mode == 1) {
+        Require(Recorded(delta, Op::Store) == 4, "readback: the four stores between the dispatches were not recorded on the GPU: " + Describe(delta));
+        Require(delta.targetedSyncs == 0 && FellAll(delta) == 0, "readback: a store into the GDS synced or fell back: " + Describe(delta));
+        return;
+    }
+    // =2: VerifyRecorded syncs the destination after each recorded operation, and the GDS is the open
+    // batch's pending write (the whole-GDS note), so that sync completes every batch: the next store
+    // meets an idle recorder and WriteLabelOnGpu refuses it with reason 1, which takes the targeted path
+    // (today's: a SyncThrough of the GDS, then the CPU store). The first store follows the pending
+    // dispatch, so it is recorded and value-checked (RequireBookkeeping: verified == recorded); every
+    // store is that or a reason-1 refusal that synced, nothing else falls back, and the destination
+    // above holds the values the stores left.
+    const auto stores = Recorded(delta, Op::Store);
+    const auto idle = Fell(delta, Fallback::StoreCpu);
+    Require(stores >= 1 && stores + idle == 4, "readback: =2: the four stores were neither recorded and checked nor refused on an idle recorder (reason 1), or none was recorded: " + Describe(delta));
+    Require(FellAll(delta) == idle && delta.targetedSyncs == idle, "readback: =2: a store fell back other than on an idle recorder, or a reason-1 refusal did not take the targeted path: " + Describe(delta));
+    std::printf("gds in stream: readback: =2 recorded %llu of the four stores, %llu refused on the recorder its value check left idle (reason 1)\n", static_cast<unsigned long long>(stores), static_cast<unsigned long long>(idle));
 }
 
 // Row 3: write-after-read. S1 ends with GDS users in a submitted batch; S2 records a readback behind a
@@ -631,6 +670,7 @@ int main(int argc, char** argv) {
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
     if (behindCompletions) setenv("APS5_LABEL_GATE_ALL", "1", 1);
 #endif
+    StartWatchdog();
     try {
         if (behindCompletions) return BehindCompletions();
         Run run;
@@ -653,6 +693,18 @@ int main(int argc, char** argv) {
         Require(totals.unnoted == 0, "cpu-gds-access-unnoted " + std::to_string(totals.unnoted));
         if (run.mode == 0) Require(!GdsStream::Armed(), "the switch is off but the GDS stream was armed");
         if (run.mode != 0 && RecordedAll(totals) != 0) Require(GdsStream::Armed() && totals.accessChecks != 0, "operations were recorded but no CPU access to the GDS was checked");
+        // The teardown waits on nothing left in an open batch: every queue idle, then the recorder
+        // synced under the GPU lock (as Fallbacks does) while the workers still run, so the device's
+        // teardown in the shutdown finds it idle. The watchdog limits both.
+        Idle("teardown");
+        {
+            AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Flush);
+            std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+            if (auto* recorder = AgcDriver::Graphics::Recorder::Active()) {
+                recorder->Sync();
+                Require(recorder->Idle(), "teardown: the recorder is not idle after its sync");
+            }
+        }
         AgcDriverShutdown_nid_postfix();
         std::puts("gds in stream tests passed");
         return 0;
