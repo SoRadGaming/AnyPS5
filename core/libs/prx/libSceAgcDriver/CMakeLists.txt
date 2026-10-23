@@ -726,12 +726,16 @@ if(BUILD_TESTING)
     # and an allocation change, each alone.
     add_test(NAME agc_write_tracking_collect_memo_key COMMAND agc_write_tracking_tests --collect-memo-key)
     set_tests_properties(agc_write_tracking_collect_memo_key PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1")
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): StampsHold and the
+    # collect coverage, with the epoch coverage on and the walks counted.
+    add_test(NAME agc_write_tracking_stamps_hold COMMAND agc_write_tracking_tests --stamps-hold)
+    set_tests_properties(agc_write_tracking_stamps_hold PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_stamps_hold agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1598,6 +1602,30 @@ if(BUILD_TESTING)
     set_tests_properties(agc_storage_target_memos2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_MEMOS=2")
     if(WIN32)
         set_tests_properties(agc_storage_target_memos agc_storage_target_memos1 agc_storage_target_memos2 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the lease refreshes and
+    # the lease draws (every row with the epoch coverage that gives the lookups a collect memo key):
+    # leases off (P1 and K1 off too), on and verified with P1 and K1 on as the play arms run them, the
+    # verify while profiling (the D4-0 counter beside it, the walk check counted), and on under P1's
+    # and K1's own verify (their proofs then miss). The lease draws are the leases' draw-level rows:
+    # each lookup is the slot loop's (both materializations included). The draw suites 9.4.3 test 3
+    # names cannot make a lease here (their targets lie outside the watched guest arena, so no
+    # refresh is ever proved; the CMASK suite's draws take no collect epoch and fast-clear every
+    # target; agc_dcc_key_sharing_tests links no driver), so they have no lease rows.
+    add_test(NAME agc_storage_target_lease COMMAND agc_driver_recorder_tests --target-lease-only)
+    add_test(NAME agc_storage_target_lease1 COMMAND agc_driver_recorder_tests --target-lease-only)
+    add_test(NAME agc_storage_target_lease2 COMMAND agc_driver_recorder_tests --target-lease-only)
+    add_test(NAME agc_storage_target_lease2_profile COMMAND agc_driver_recorder_tests --target-lease-only)
+    add_test(NAME agc_storage_target_lease1_units2_pin2 COMMAND agc_driver_recorder_tests --target-lease-only)
+    set_tests_properties(agc_storage_target_lease agc_storage_target_lease1 agc_storage_target_lease2 agc_storage_target_lease2_profile agc_storage_target_lease1_units2_pin2 PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_storage_target_lease PROPERTIES ENVIRONMENT "APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_storage_target_lease1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_LEASES=1;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_storage_target_lease2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_LEASES=2;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_storage_target_lease2_profile PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_LEASES=2;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
+    set_tests_properties(agc_storage_target_lease1_units2_pin2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_LEASES=1;APS5_EXPERIMENT_PROOF_UNITS=2;APS5_EXPERIMENT_KEY_PIN=2;APS5_DEBUG_COVERAGE=1")
+    if(WIN32)
+        set_tests_properties(agc_storage_target_lease agc_storage_target_lease1 agc_storage_target_lease2 agc_storage_target_lease2_profile agc_storage_target_lease1_units2_pin2 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_storage_integer_clear COMMAND agc_driver_recorder_tests --integer-clear-only)
@@ -3189,7 +3217,13 @@ if(BUILD_TESTING)
             # verified (=2: every hit computed too, a difference fatal) and on; their own cases are in
             # agc_storage_target_memos*.
             "target_memos|APS5_EXPERIMENT_TARGET_MEMOS=2"
-            "target_memos_on|APS5_EXPERIMENT_TARGET_MEMOS=1")
+            "target_memos_on|APS5_EXPERIMENT_TARGET_MEMOS=1"
+            # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.3 D4-B): epoch-owned target leases verified (=2: every
+            # lease's prediction checked against today's lookup) and on, each with P1 and K1 on as the
+            # play arms run them and the epoch coverage that gives the committer's lookups a collect
+            # memo key (without it no lookup is eligible); their own cases are in agc_storage_target_lease*.
+            "target_leases|APS5_EXPERIMENT_TARGET_LEASES=2,APS5_EXPERIMENT_PROOF_UNITS=1,APS5_EXPERIMENT_KEY_PIN=1,APS5_DEBUG_COVERAGE=1"
+            "target_leases_on|APS5_EXPERIMENT_TARGET_LEASES=1,APS5_EXPERIMENT_PROOF_UNITS=1,APS5_EXPERIMENT_KEY_PIN=1,APS5_DEBUG_COVERAGE=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

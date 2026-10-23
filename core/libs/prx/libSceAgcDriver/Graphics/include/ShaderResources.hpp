@@ -49,6 +49,12 @@ std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): CompletePendingCpuWrites'
+// checks without its sync (it calls this first): the writer that would make it sync over the range,
+// a copied writer of the device or of a draw or a pending completion label, or None when it would
+// return false at once. No side effect.
+enum class CpuWriteSync : std::uint8_t { None, DeviceWriter, DrawWriter, Label };
+CpuWriteSync CpuWritesWouldSync(const Context& context, std::uint64_t address, std::size_t bytes);
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS) and LOCAL EXPERIMENT (APS5_EXPERIMENT_NARROW_FLUSH_SYNC, F1;
 // FlushGuard.hpp): whether a listed copied writer (a dispatch's, in the context's copiedWriters, or
 // a draw's, in DrawCopiedWriters; listed until its batch's completion stores its copied buffers on
@@ -64,6 +70,19 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // keys surfaces under (StorageSurface); moves only when a chain is recorded or grows, so while it
 // holds a surface maps to the same storage key.
 std::uint64_t StorageLevelsSerial();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B; TargetLease.cpp): the
+// storage key a lookup of `requested` finds its image under (cachedStorageTexture's ArrayLayerWindow,
+// StorageSurface and memoized SurfaceKey), into `words`, when the cache holds `expected` under it
+// and the lookup would neither evict an allocated mip chain first nor the entry itself
+// (MetadataMoved); false otherwise, with nothing written.
+bool StorageLeaseKey(const Context& context, const GuestTextureResource& requested, const StorageTexture* expected, std::array<std::uint32_t, 8>& words);
+// A lease hit's stand-in for the lookup's refresh of a cached image: under the cache mutex, where the
+// lookup refreshes it, the image cached under `words` (null: none) goes to `refresh`; when that
+// answers true and `apply`, the entry moves to the front of the use order and counts as a storage
+// hit, as the lookup's refresh path does, and the image is returned. Null otherwise, with nothing
+// else done. A function pointer and a context, so nothing allocates.
+using LeaseRefresh = bool (*)(StorageTexture* image, void* user);
+std::shared_ptr<StorageTexture> RefreshLeasedStorage(const Context& context, const std::array<std::uint32_t, 8>& words, LeaseRefresh refresh, void* user, bool apply);
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_MEMOS, GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache asks
 // a surface's size and storage key of two 8-entry memos per thread, keyed on every field of the
 // resource (and the context, for the key). Unset or 0: today's calls. 1: memos used. 2: verify: a

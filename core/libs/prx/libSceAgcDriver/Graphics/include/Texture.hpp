@@ -437,6 +437,58 @@ public:
         std::uint64_t scansChecked = 0;
     };
     static ProofUnitCounts ProofUnitTotals();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): a target lease's
+    // refresh (TargetLease.cpp) in place of Refresh() inside the storage cache's lookup, under its
+    // mutex and the GPU mutex: refresh()'s proved route, unscoped, with its collects skipped (the
+    // lease's ranges are covered under the collect memo key it re-checked, so they would be memo
+    // hits). First the head of refresh()'s two CompletePendingCpuWrites (CpuWritesWouldSync: a writer
+    // that would sync is a miss before anything ran), then refreshProved with one StampsHold over the
+    // image's rows, the lease's target-key row (unchanged since) and its CMASK row (not stored over
+    // since), P1's live per-use check and K1's pin and generation advance included, then the proved
+    // exit's bookkeeping. A refusal writes and counts nothing: the full path the lease falls back to
+    // counts its own. `apply` false (=2's prediction) writes nothing at all, K1's advance included,
+    // and `drain` false checks the stamps without stamping the queued host writes first; the rows
+    // then receive what a hit would leave.
+    enum class LeaseVerdict : std::uint8_t { Hit, NoProof, Moved, Collect, KeyProof, Stamped, OtherPending, KeyPin, P1Verifying, K1Verifying, CopiedWriter, Count };
+    struct LeaseRow {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t generation = 0;
+    };
+    struct LeaseRows {
+        // In (generation 0: no such row).
+        LeaseRow targetKeys;
+        LeaseRow cmask;
+        bool apply = true;
+        bool drain = true;
+        // Out: the verdict (a refusal names refreshProved's failure, the verify mode of P1 or K1 that
+        // would hand the refresh to today's path, or the copied writer), the other pending images'
+        // reason and the pin's refusal when those refused, the image's own rows as checked, and the
+        // hit's proof: unit-checked, pinned, the pending serial it leaves and the one it read, and the
+        // generation K1's advance moves every layer to (read under StampsHold's lock).
+        LeaseVerdict verdict = LeaseVerdict::NoProof;
+        OtherPending other = OtherPending::Outside;
+        KeyPin pin = KeyPin::Holds;
+        LeaseRow surface;
+        LeaseRow keys;
+        bool unitChecked = false;
+        bool pinned = false;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t serial = 0;
+        std::uint64_t current = 0;
+    };
+    LeaseVerdict RefreshForLease(LeaseRows& rows);
+    // The refresh proof as it stands (`proofGeneration` 0: none), for the lease's creation and =2's
+    // check of today's path against a prediction; `layersAt`: every tracked layer is at `generation`.
+    struct LeaseProofState {
+        std::uint64_t proofGeneration = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t generation = 0;
+        bool unitChecked = false;
+        bool keyPinned = false;
+        bool layersAt = false;
+    };
+    LeaseProofState LeaseState() const;
     static std::uint64_t ClearHandOvers();
     static std::uint64_t HandedOverSuperseded();
     static void SetClearHandOver(bool enabled);
@@ -552,8 +604,9 @@ private:
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
     // `profile`: LookupOutcomes::Profiled(), for the [proofs] line's reasons (LOCAL DEBUG, L2-0).
     // `scoped`: the refresh covers only some tracked layers (refresh()'s own test; LOCAL EXPERIMENT,
-    // APS5_EXPERIMENT_KEY_PIN, K1: a pinned key proof answers unscoped refreshes only).
-    bool refreshProved(bool profile, bool scoped);
+    // APS5_EXPERIMENT_KEY_PIN, K1: a pinned key proof answers unscoped refreshes only). `lease` (LOCAL
+    // EXPERIMENT, APS5_EXPERIMENT_TARGET_LEASES, D4-B): RefreshForLease's rows; null is today's check.
+    bool refreshProved(bool profile, bool scoped, LeaseRows* lease = nullptr);
     void takeRefreshProof(bool aliased, bool profile);
     bool otherPendingOverlaps() const;
     OtherPending otherPendingReason() const;
