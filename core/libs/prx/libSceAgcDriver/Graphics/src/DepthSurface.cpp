@@ -2545,6 +2545,19 @@ void verifyDepthViewPrediction(DepthViewLease& view, const DepthTarget& target, 
     facts.identity = view.evidence[0];
     facts.synced = view.synced;
     facts.sync = view.evidence[1];
+    // A sync (already a disagreement): whether the plane itself was stamped since the prediction, the
+    // only update besides the sync point's memo key, serials and units that makes WrittenUnits change a
+    // unit (the r73 review: a clock move elsewhere excuses nothing). The prediction's plane row, from
+    // its oldest, in one tracker lock without the drain (surfaces -> tracker, SyncFromMemory's order;
+    // a report's plain lock, not counted on [guestmem]); a stamp before today's WrittenSince is still
+    // there, as stamps only rise. A row with no proof left counts as stamped.
+    if (facts.synced) {
+        const GuestMemory::UnchangedQuery planeRow{target.address, static_cast<std::size_t>(prediction.planeBytes), prediction.oldest};
+        auto row = GuestMemory::StampRow::Held;
+        GuestMemory::StampsHoldReport report{std::span(&row, 1)};
+        static_cast<void>(GuestMemory::StampsHold({}, {}, std::span(&planeRow, 1), false, nullptr, nullptr, &report));
+        facts.planeStamped = row != GuestMemory::StampRow::Held;
+    }
     if (prediction.route == DepthViewRoute::NotPending || prediction.route == DepthViewRoute::Pending) {
         std::lock_guard reads(htileReadsMutex());
         if (const auto found = htileReads().find(target.htileAddress); found != htileReads().end()) {
@@ -2572,11 +2585,11 @@ void verifyDepthViewPrediction(DepthViewLease& view, const DepthTarget& target, 
         return std::string(text);
     };
     char text[1536];
-    std::snprintf(text, sizeof(text), "target 0x%llx (stencil 0x%llx, HTILE 0x%llx): the lease predicted a hit (route %s, oldest %llu, h %llu, current %llu, memo-current %llu) but today's %s part disagrees: %s (today: store-back %s returned 0x%x, cleared HTILE taken %d, created %d, the predicted surface %d, retired %d, synced %d; HTILE read proof %s%llu, units %llu..%llu, depth memory %llu, stencil memory %llu; evidence: store-back memo key %d, Accessible %d, read proof %d, collect above %d; identity: %s; sync: %s)",
+    std::snprintf(text, sizeof(text), "target 0x%llx (stencil 0x%llx, HTILE 0x%llx): the lease predicted a hit (route %s, oldest %llu, h %llu, current %llu, memo-current %llu) but today's %s part disagrees: %s (today: store-back %s returned 0x%x, cleared HTILE taken %d, created %d, the predicted surface %d, retired %d, synced %d; HTILE read proof %s%llu, units %llu..%llu, depth memory %llu, stencil memory %llu; evidence: store-back memo key %d, Accessible %d, read proof %d, collect above %d; identity: %s; sync: %s, plane stamped %d)",
                   static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.htileAddress), DepthViewRouteName(prediction.route), static_cast<unsigned long long>(prediction.oldest), static_cast<unsigned long long>(prediction.h), static_cast<unsigned long long>(prediction.current), static_cast<unsigned long long>(prediction.memoCurrent),
                   DepthViewPartName(check.part), check.reason, HtileVerdictName(verdict.kind), static_cast<unsigned>(htileCleared), cleared ? 1 : 0, created ? 1 : 0, facts.sameSurface ? 1 : 0, view.retiredBefore ? 1 : 0, view.synced ? 1 : 0, facts.htileReadFound ? "" : "absent, ", static_cast<unsigned long long>(facts.htileRead),
                   static_cast<unsigned long long>(facts.unitsLow), static_cast<unsigned long long>(facts.unitsHigh), static_cast<unsigned long long>(facts.depthMemory), static_cast<unsigned long long>(facts.stencilMemory), facts.storeBack.memoMoved ? 1 : 0, facts.storeBack.accessibleDiffers ? 1 : 0, facts.storeBack.foundDiffers ? 1 : 0, facts.storeBack.collectedAbove ? 1 : 0,
-                  evidence(facts.identity).c_str(), evidence(facts.sync).c_str());
+                  evidence(facts.identity).c_str(), evidence(facts.sync).c_str(), facts.planeStamped ? 1 : 0);
     if (check.raced) {
         countView(counters.raced[DepthViewIndex(check.part) - 1]);
         static std::atomic<int> reports{0};
@@ -2846,12 +2859,20 @@ std::string DepthViewLeaseReport() {
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.9): see DepthLease.hpp.
 DepthViewCheck CheckDepthViewPrediction(const DepthViewFacts& facts) {
     const auto expected = facts.route == DepthViewRoute::NoHtile ? HtileVerdictKind::NoHtile : facts.route == DepthViewRoute::NotAccessible ? HtileVerdictKind::NotAccessible : facts.route == DepthViewRoute::NotPending ? HtileVerdictKind::NotPendingProved : HtileVerdictKind::PendingCovered;
-    if (facts.verdict != expected || facts.htileCleared != 0) return {DepthViewPart::StoreBack, facts.storeBack.Any(), facts.htileCleared != 0 ? "today's store-back cleared the HTILE" : "today's store-back took another route"};
+    // Each part is excused only by the evidence that can change it (the r73 review; DepthLease.hpp).
+    if (facts.verdict != expected || facts.htileCleared != 0) return {DepthViewPart::StoreBack, facts.storeBack.Explains(facts.route), facts.htileCleared != 0 ? "today's store-back cleared the HTILE" : "today's store-back took another route"};
     if (facts.cleared || facts.created || !facts.sameSurface || facts.retiredBefore) {
         const char* reason = facts.cleared ? "today took a cleared HTILE" : facts.created ? "today created the surface" : !facts.sameSurface ? "today found another surface" : "today found the surface retired";
-        return {DepthViewPart::Identity, facts.identity.Any(), reason};
+        return {DepthViewPart::Identity, facts.identity.ExplainsIdentity(), reason};
     }
-    if (facts.synced) return {DepthViewPart::Sync, facts.sync.Any() || facts.unitsLow > facts.current0, "today synced the depth plane"};
+    // A sync: the memo key (a walk, or an unwatch), the surfaces serials (then the units were not read)
+    // or the units moved; or a clock move that a stamp on the plane itself explains. Retired and a
+    // cleared HTILE entry change no unit.
+    if (facts.synced) {
+        const auto& at = facts.sync;
+        const bool clock = at.clockMoved || facts.unitsLow > facts.current0;
+        return {DepthViewPart::Sync, at.memoMoved || at.surfacesMoved || at.oldestMoved || (clock && facts.planeStamped), "today synced the depth plane"};
+    }
     bool lower = false;
     bool higher = false;
     const auto compare = [&](std::uint64_t value, std::uint64_t predicted) {

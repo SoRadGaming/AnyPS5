@@ -13101,7 +13101,9 @@ bool depthLeaseCounterTests(const Device& device, Recorder& recorder) {
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (b)): =2's classification of a
 // verified DepthSurfaceView call (CheckDepthViewPrediction), without a device. Every part failing with
-// no evidence aborts; the same with evidence read at its own point is raced; evidence read only at
+// no evidence aborts; the same with evidence read at its own point is raced only when that evidence can
+// change the part (the store-back's per predicted route, the identity's by the surfaces serials, retired
+// and a cleared HTILE entry, a sync's clock move only with the plane stamped); evidence read only at
 // another part's point never excuses it; refresh values equal verify, above race and below abort, with
 // the read proof checked per route (pending: the memo-hit generation; not pending: the prediction's;
 // none for no HTILE or not accessible) and the stencil memory exactly 0 without a stencil plane. The
@@ -13180,7 +13182,30 @@ void depthViewLeaseClassifyTests() {
         storedBack.verdict = HtileVerdictKind::StoredBack;
         storedBack.htileCleared = 1;
         expect(storedBack, DepthViewPart::StoreBack, false, "an HTILE clear stored back, no evidence");
-        for (int which = 0; which < 4; ++which) expect(storeBackEvidence(storedBack, which), DepthViewPart::StoreBack, true, "an HTILE clear stored back, with store-back evidence " + std::to_string(which));
+        // Only the evidence that can change the predicted route's verdict excuses it (the r73 review):
+        // not pending, all four; pending and not accessible, Accessible only (memo key 0, Accessible 1,
+        // read proof 2, collect above 3); no HTILE, none.
+        for (const auto route : {DepthViewRoute::Pending, DepthViewRoute::NotPending, DepthViewRoute::NotAccessible, DepthViewRoute::NoHtile}) {
+            auto facts = storedBack;
+            facts.route = route;
+            if (route == DepthViewRoute::NotPending) {
+                facts.h = 40;
+                facts.htileRead = 40;
+            } else if (route != DepthViewRoute::Pending) {
+                facts.htileReadFound = false;
+                facts.htileRead = 0;
+            }
+            expect(facts, DepthViewPart::StoreBack, false, std::string("an HTILE clear stored back (") + DepthViewRouteName(route) + "), no evidence");
+            for (int which = 0; which < 4; ++which) {
+                const bool excuses = route == DepthViewRoute::NotPending || (which == 1 && route != DepthViewRoute::NoHtile);
+                expect(storeBackEvidence(facts, which), DepthViewPart::StoreBack, excuses, std::string("an HTILE clear stored back (") + DepthViewRouteName(route) + "), with store-back evidence " + std::to_string(which));
+            }
+            auto all = facts;
+            all.storeBack.memoMoved = true;
+            all.storeBack.foundDiffers = true;
+            all.storeBack.collectedAbove = true;
+            expect(all, DepthViewPart::StoreBack, route == DepthViewRoute::NotPending, std::string("an HTILE clear stored back (") + DepthViewRouteName(route) + "), with every store-back evidence but Accessible");
+        }
         auto later = storedBack;
         later.identity.clockMoved = true;
         later.sync.memoMoved = true;
@@ -13197,6 +13222,9 @@ void depthViewLeaseClassifyTests() {
         auto pendingNot = agreed;
         pendingNot.verdict = HtileVerdictKind::PendingNotCovering;
         expect(pendingNot, DepthViewPart::StoreBack, false, "a pending fill no longer covering, no evidence");
+        // The recorder's answer, which no other thread moves: a tracker or memo key move excuses nothing.
+        for (const int which : {0, 3}) expect(storeBackEvidence(pendingNot, which), DepthViewPart::StoreBack, false, "a pending fill no longer covering, with store-back evidence " + std::to_string(which));
+        expect(storeBackEvidence(pendingNot, 1), DepthViewPart::StoreBack, true, "a pending fill no longer covering, after the HTILE's Accessible answer moved");
     }
     // The identity part, by each way it fails.
     for (int way = 0; way < 4; ++way) {
@@ -13207,11 +13235,18 @@ void depthViewLeaseClassifyTests() {
         else facts.retiredBefore = true;
         const auto what = "identity failure " + std::to_string(way);
         expect(facts, DepthViewPart::Identity, false, what + ", no evidence");
+        // Only the surfaces serials (1), retired (2) and a cleared HTILE entry (4) can change the
+        // identity's facts (the r73 review); the memo key (0), the units (3) and the clock (5) cannot.
         for (int which = 0; which < 6; ++which) {
             auto raced = facts;
             raced.identity = pointEvidence(raced.identity, which);
-            expect(raced, DepthViewPart::Identity, true, what + ", with identity evidence " + std::to_string(which));
+            expect(raced, DepthViewPart::Identity, which == 1 || which == 2 || which == 4, what + ", with identity evidence " + std::to_string(which));
         }
+        auto unrelated = facts;
+        unrelated.identity.memoMoved = true;
+        unrelated.identity.oldestMoved = true;
+        unrelated.identity.clockMoved = true;
+        expect(unrelated, DepthViewPart::Identity, false, what + ", with the memo key, units and clock moved only");
         auto earlier = storeBackEvidence(facts, 0);
         expect(earlier, DepthViewPart::Identity, false, what + ", with store-back evidence only");
         auto later = facts;
@@ -13224,15 +13259,25 @@ void depthViewLeaseClassifyTests() {
         auto synced = agreed;
         synced.synced = true;
         expect(synced, DepthViewPart::Sync, false, "a sync, no evidence");
+        // The memo key (0), the surfaces serials (1) and the units (3) excuse it; retired (2) and a
+        // cleared HTILE entry (4) change no unit; the clock (5) only with the plane itself stamped since
+        // the prediction (the r73 review).
         for (int which = 0; which < 6; ++which) {
             auto raced = synced;
             raced.sync = pointEvidence(raced.sync, which);
-            expect(raced, DepthViewPart::Sync, true, "a sync, with sync evidence " + std::to_string(which));
+            expect(raced, DepthViewPart::Sync, which == 0 || which == 1 || which == 3, "a sync, with sync evidence " + std::to_string(which));
+            raced.planeStamped = true;
+            expect(raced, DepthViewPart::Sync, which != 2 && which != 4, "a sync with the plane stamped, with sync evidence " + std::to_string(which));
         }
+        auto stamped = synced;
+        stamped.planeStamped = true;
+        expect(stamped, DepthViewPart::Sync, false, "a sync with the plane stamped but no clock move by the sync point or WrittenUnits' decision");
         auto written = synced;
         written.unitsLow = 51;
         written.unitsHigh = 51;
-        expect(written, DepthViewPart::Sync, true, "a sync whose WrittenUnits read a generation above the prediction's");
+        expect(written, DepthViewPart::Sync, false, "a sync whose WrittenUnits read a generation above the prediction's, the plane not stamped");
+        written.planeStamped = true;
+        expect(written, DepthViewPart::Sync, true, "a sync whose WrittenUnits read a generation above the prediction's, the plane stamped");
         auto earlier = synced;
         earlier.identity.clockMoved = true;
         earlier.storeBack.collectedAbove = true;

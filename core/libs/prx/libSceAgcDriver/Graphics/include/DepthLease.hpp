@@ -218,13 +218,29 @@ struct DepthViewStoreBackEvidence {
     bool accessibleDiffers = false;
     bool foundDiffers = false;
     bool collectedAbove = false;
-    bool Any() const { return memoMoved || accessibleDiffers || foundDiffers || collectedAbove; }
+    // Only the evidence that can change today's verdict on the predicted route excuses a store-back
+    // disagreement (the r73 review): not pending, all four (a walk under a moved key or another thread's
+    // stamp fails UnchangedSince, forgetHtileReads moves the lookup, the page protection moves
+    // Accessible); pending, and not accessible, only Accessible (the rest of the verdict is the
+    // recorder's, which no other thread moves while this one holds the GPU lock, and the pending fills
+    // switch, read once: a collect's value is stored, never tested); no HTILE, none (htileAddress is a
+    // key field).
+    bool Explains(DepthViewRoute route) const {
+        if (route == DepthViewRoute::NotPending) return memoMoved || accessibleDiffers || foundDiffers || collectedAbove;
+        if (route == DepthViewRoute::Pending || route == DepthViewRoute::NotAccessible) return accessibleDiffers;
+        return false;
+    }
 };
 // The identity point's (after the surfaces mutex is taken, before takeClearedHtile) and the sync
 // point's (before SyncFromMemory): the memo key moved; the surfaces or released serial moved (then
 // nothing of the predicted surface is read); the predicted surface retired, or its units resized or
 // their oldest generation moved; a cleared HTILE entry covers the target's HTILE; the tracker
-// generation (no drain) is above the prediction's.
+// generation (no drain) is above the prediction's. Each part is excused only by the evidence that can
+// change its own facts (the r73 review; CheckDepthViewPrediction): the identity's (a cleared HTILE
+// taken, the surface created, another or a retired surface found) change only through the surface
+// list, retire and active, and clearedHtiles, all frozen under the surfaces mutex from the identity
+// point on, so only the surfaces serials, retired and a cleared HTILE entry excuse it; the memo key,
+// the units and the clock are printed there, never an excuse.
 struct DepthViewEvidence {
     bool memoMoved = false;
     bool surfacesMoved = false;
@@ -232,7 +248,7 @@ struct DepthViewEvidence {
     bool oldestMoved = false;
     bool clearedHtile = false;
     bool clockMoved = false;
-    bool Any() const { return memoMoved || surfacesMoved || retired || oldestMoved || clearedHtile || clockMoved; }
+    bool ExplainsIdentity() const { return surfacesMoved || retired || clearedHtile; }
 };
 // One verified call: the prediction, today's route and refresh values (read at the call's end, under
 // the surfaces mutex), and the evidence at each part's point.
@@ -258,6 +274,11 @@ struct DepthViewFacts {
     // Today's sync (SyncFromMemory copied the mirror in).
     bool synced = false;
     DepthViewEvidence sync;
+    // Read at the call's end, on a synced call only (a disagreement; one tracker lock without the
+    // drain): the plane's not-written row from the prediction's oldest unit generation no longer holds,
+    // so a stamp landed on the plane since the prediction (stamps only rise, so one before today's
+    // WrittenSince is still there). A clock move excuses a sync only with it.
+    bool planeStamped = false;
     // Today's refresh values: the HTILE's read proof, the lowest and highest unit generation (each
     // unit holds what WrittenUnits read at its decision), the depth and stencil memory.
     bool htileReadFound = false;
@@ -273,12 +294,16 @@ struct DepthViewCheck {
     const char* reason = "verified";
 };
 // Pure. The parts in today's order; the first that disagrees decides: raced when the evidence read at
-// its own point names an update since the prediction, else an abort (evidence read only at a later
-// point never excuses it). Store-back agrees when the verdict is the predicted route's (pending:
-// pending covered; not pending: not pending proved) and nothing was cleared; identity when no cleared
-// HTILE was taken, nothing created, and the predicted surface was found and not retired; sync when
-// nothing synced (raced also when the units hold a generation above the prediction's: WrittenUnits read
-// it at its own decision); refresh when every value equals its prediction (pending: the read proof is
+// its own point names an update since the prediction that can change that part (store-back:
+// DepthViewStoreBackEvidence::Explains for the predicted route; identity: ExplainsIdentity), else an
+// abort (evidence read only at a later point never excuses it). Store-back agrees when the verdict is
+// the predicted route's (pending: pending covered; not pending: not pending proved) and nothing was
+// cleared; identity when no cleared HTILE was taken, nothing created, and the predicted surface was
+// found and not retired; sync when nothing synced, and a sync is raced when the sync point's memo key,
+// surfaces serials or units moved, or when the clock moved (at the sync point, or the units hold a
+// generation above the prediction's: WrittenUnits read it at its own decision) and the plane itself
+// was stamped since the prediction (planeStamped: a clock move elsewhere cannot make WrittenUnits
+// change a unit); refresh when every value equals its prediction (pending: the read proof is
 // the memo-hit generation; not pending: it is the prediction's; no HTILE or not accessible: not
 // checked; every unit the TrackerGeneration answer; depth memory the memo-hit generation; stencil
 // memory that too with a stencil plane, else exactly 0). A refresh value above its prediction is
