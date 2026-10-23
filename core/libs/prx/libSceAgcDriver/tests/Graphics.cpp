@@ -11172,6 +11172,14 @@ int main(int argc, char** argv) {
             descriptorCacheTests();
             return 0;
         }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12): the DepthSurfaceView reuse
+        // cases alone (their own mock context, no recorder: every call ineligible for a lease), for the
+        // rows that run them with the leases on and verified.
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-surface-reuse") {
+            RunDepthSurfaceReuseTests();
+            std::cout << "depth surface reuse tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unused-viewport-depth") {
             UnusedViewportDepthTests();
             DepthClipTests();
