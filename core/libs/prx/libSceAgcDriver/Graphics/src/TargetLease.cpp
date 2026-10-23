@@ -40,8 +40,8 @@ void countLease(std::atomic<std::uint64_t>& counter) {
 // deltas): events, misses by their first reason (a refusal of the lease's refresh by its verdict,
 // "other pending" by OtherPending in its order), and creations refused by their first reason.
 enum LeaseEvent : std::size_t { EventLookups, EventEligible, EventHits, EventUnitChecked, EventPinned, EventTargetKeysLive, EventWouldHits, EventVerified, EventRaced, EventCreated, LeaseEventCount };
-enum LeaseMiss : std::size_t { LeaseMissNone, LeaseMissNoLease, LeaseMissEpoch, LeaseMissAllocations, LeaseMissUnwatch, LeaseMissLevels, LeaseMissDepthPlane, LeaseMissMovedLate, LeaseMissNotCached, LeaseMissReplaced, LeaseMissCmask, LeaseMissCopiedWriter, LeaseMissNoProof, LeaseMissMoved, LeaseMissCollect, LeaseMissKeyProof, LeaseMissStamped, LeaseMissOtherOutside, LeaseMissOtherFlushing, LeaseMissOtherSameRange, LeaseMissOtherInside, LeaseMissOtherKeyRange, LeaseMissOtherDepthPlane, LeaseMissKeyPin, LeaseMissP1Verifying, LeaseMissK1Verifying, LeaseMissCount };
-constexpr std::array<const char*, LeaseMissCount> LeaseMissNames{"none", "no lease", "memo key moved: epoch", "allocations", "unwatch", "levels moved", "depth plane", "moved by the kept-bytes bound", "not cached", "replaced", "CMASK moved", "CPCW would sync", "no proof", "generation/keys moved", "collect 0", "key proof", "stamped", "other pending: outside only (P1 off)", "flushing", "same range", "unit inside", "key range", "depth plane stale", "K1 pin refusal", "P1 verifying", "K1 verifying"};
+enum LeaseMiss : std::size_t { LeaseMissNone, LeaseMissNoLease, LeaseMissEpoch, LeaseMissAllocations, LeaseMissUnwatch, LeaseMissLevels, LeaseMissMultisample, LeaseMissDepthPlane, LeaseMissMovedLate, LeaseMissNotCached, LeaseMissReplaced, LeaseMissCmask, LeaseMissCopiedWriter, LeaseMissNoProof, LeaseMissMoved, LeaseMissCollect, LeaseMissKeyProof, LeaseMissStamped, LeaseMissOtherOutside, LeaseMissOtherFlushing, LeaseMissOtherSameRange, LeaseMissOtherInside, LeaseMissOtherKeyRange, LeaseMissOtherDepthPlane, LeaseMissKeyPin, LeaseMissP1Verifying, LeaseMissK1Verifying, LeaseMissCount };
+constexpr std::array<const char*, LeaseMissCount> LeaseMissNames{"none", "no lease", "memo key moved: epoch", "allocations", "unwatch", "levels moved", "MSAA guard (=2)", "depth plane", "moved by the kept-bytes bound", "not cached", "replaced", "CMASK moved", "CPCW would sync", "no proof", "generation/keys moved", "collect 0", "key proof", "stamped", "other pending: outside only (P1 off)", "flushing", "same range", "unit inside", "key range", "depth plane stale", "K1 pin refusal", "P1 verifying", "K1 verifying"};
 static_assert(LeaseMissOtherDepthPlane - LeaseMissOtherOutside + 1 == static_cast<std::size_t>(StorageTexture::OtherPending::Count), "the lease's other-pending misses follow OtherPending");
 enum LeaseRefusal : std::size_t { RefuseNotProved, RefuseClearWork, RefuseWalked, RefuseMemoMoved, RefuseLevelsMoved, RefuseNoProof, RefuseShape, RefuseKeyNotFound, RefuseNotCovered, RefuseCmaskProof, LeaseRefusalCount };
 constexpr std::array<const char*, LeaseRefusalCount> LeaseRefusalNames{"not proved", "clear work", "ranges not covered before (walked)", "memo key moved", "levels moved", "no refresh proof", "image shape", "key not found or the lookup would act", "ranges not covered", "no CMASK proof"};
@@ -180,6 +180,10 @@ void classifyLookup(TargetLeaseUse& use, bool resident) {
     else if (worked) outcome = MissClearWork;
     else if (walked) outcome = MissWalked;
     countLease(leaseCounts.outcomes[outcome]);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, D4-B): while the switch is set the table is the
+    // leases' own, renewed by their hits and written by their creations only, so which way a set
+    // conflict replaces does not depend on APS5_PROFILE_DRAW; the counter then only classifies.
+    if (TargetLeases() != 0) return;
     if (entry != nullptr) entry->used = ++table.tick;
     // Only a quiet lookup under the key it started with makes or renews an entry (fix 3 of 9.2: a
     // move during the lookup refuses the creation).
@@ -287,6 +291,10 @@ bool probeLease(StorageTexture* image, void* user) {
     // A replaced entry is a miss (the stricter reading of fix 2 of 9.2): the full path runs the
     // lookup's Requires on the new image and the lease is made again over it.
     if (image != entry.texture || image->Descriptor().dccAddress != color.dccAddress) return missed(LeaseMissReplaced);
+    // =2: the lookup closure's two Requires as predicates (=1's hit runs them as Requires, step 6), so no
+    // prediction stands where today's closure would throw. Both are fixed when an image is made and
+    // held on this one when the lease was made, so only another image fails them: replaced.
+    if (!probe.apply && (!image->Attachable() || image->GuestBytes() != use.colorBytes)) return missed(LeaseMissReplaced);
     // Fix 1 of 9.2: the kept-bytes bound ran since the first test, and a submit, a finish or a
     // deferred destruction may move the memo key; the depth planes are read again with it.
     if (GuestMemory::CurrentCollectMemoKey() != entry.memo || StorageLevelsSerial() != entry.levels) return missed(LeaseMissMovedLate);
@@ -319,40 +327,80 @@ void countRefusal(LeaseRefusal refusal) {
     leaseExperiment.refusals[refusal].fetch_add(1, std::memory_order_relaxed);
 }
 
+// =2: what landed since the prediction, as the race test reads it now (null: nothing), in this order:
+// a change of the pending registry; a store into the lease's rows (the draining stamp check: the
+// prediction left the queued host writes queued, and today's next tracker lock stamps them); a move
+// of the collect memo key or the levels serial; the end of the pin's window. The last two also follow
+// a change the prediction could not see coming: today's lookup runs the kept-bytes bound after it
+// (=2 skips it), whose submit, finish or deferred destruction may end the pin (a reap) or move the
+// memo key (an unwatch), as fix 1 of 9.2 re-checks for =1's hit.
+const char* landedSincePrediction(const TargetLeaseUse& use) {
+    const auto& prediction = use.prediction;
+    const auto& color = *use.color;
+    if (StorageTexture::PendingSerial() != prediction.serial) return "a change of the pending registry";
+    if (!GuestMemory::StampsHold(std::span(prediction.unchanged.data(), prediction.unchangedRows), std::span(&prediction.cmask, prediction.cmask.generation != 0 ? 1 : 0))) return "a store into the lease's rows";
+    if (GuestMemory::CurrentCollectMemoKey() != use.memo || StorageLevelsSerial() != use.levels) return "a move of the collect memo key or the levels serial";
+    if (prediction.pinned && DccKeyPinRefusal(color.dccAddress, use.colorBytes / 256, prediction.pinNote) != KeyPin::Holds) return "the end of the pin's window";
+    return nullptr;
+}
+
+// =2: the race test at one point of today's path, with the walked count there (TargetLeasePrediction).
+void notePoint(TargetLeaseUse& use, TargetLeasePoint point) {
+    auto& prediction = use.prediction;
+    const auto at = static_cast<std::size_t>(point);
+    prediction.reached[at] = true;
+    prediction.landed[at] = landedSincePrediction(use);
+    prediction.walkedAt[at] = GuestMemory::ThreadCollectedBytes();
+}
+
 // =2: today's full path against the prediction (9.4.3 (a)-(f); (c) also without profiling, where
 // ThreadCollectedBytes counts nothing: the coverage the hit's skipped collects rely on held before
-// the lookup). The lookup's own part ((b), (c), (e)) is read as it returned (TargetLeaseLookedUp):
-// a materialization the hit does not skip runs live in both and may refresh or rescan; (f) checks
-// the proofs of the skipped ones. A failure whose rows now fail the draining stamp check, or whose pending serial moved,
-// or K1's advance at a later reading of the tracker clock, landed after the prediction: raced (the
-// first 8 printed). So does one after a change the prediction could not see coming that moves
-// neither: today's lookup runs the kept-bytes bound after the prediction (=2 skips it), whose submit,
-// finish or deferred destruction may end the pin (a reap) or move the memo key (an unwatch), as fix 1
-// of 9.2 re-checks for =1's hit. Any other aborts.
+// the lookup), part by part in today's order. The lookup's part ((a), (b), (c), (e)) is read as it
+// returned (TargetLeaseLookedUp): a materialization the hit does not skip runs live in both and may
+// refresh or rescan. Each materialization the hit skips has its own part: no work (d), no walk (c)
+// and its proof unchanged (f). A failure after which something landed (landedSincePrediction), read
+// at the point before the failing part ran, or K1's advance at a later reading of the tracker clock,
+// is raced (the first 8 printed): a part's own stamps, pending marks and reaps come after its point,
+// so they never excuse its own failure (today's lookup is read after it returned, so its own may).
+// Any other aborts.
 void verifyPrediction(TargetLeaseUse& use, StorageTexture* resident) {
     const auto& prediction = use.prediction;
     const auto& color = *use.color;
     const auto walkedNow = GuestMemory::ThreadCollectedBytes();
+    const auto reached = [&](TargetLeasePoint point) { return prediction.reached[static_cast<std::size_t>(point)]; };
+    const auto walkedAt = [&](TargetLeasePoint point) { return prediction.walkedAt[static_cast<std::size_t>(point)]; };
     const char* failed = nullptr;
+    auto point = TargetLeasePoint::Lookup;
     bool clockMoved = false;
-    if (resident != prediction.texture || !prediction.lookedUp) failed = "(a) the lookup returned another image";
+    if (!prediction.lookedUp) failed = "(a) the lookup threw or returned no image";
+    else if (resident != prediction.texture) failed = "(a) the lookup returned another image";
     else if (prediction.provedAfter != use.proved + 1) failed = "(b) the lookup's refresh was not proved once";
     else if (!use.covered) failed = "(c) the lease's ranges were not all covered under its memo key before the lookup";
-    else if ((prediction.skipRegisterClear ? walkedNow : prediction.walkedAfter) != use.walked) failed = "(c) the collects the hit skips walked";
-    else if (prediction.skipRegisterClear && use.registerClearWorked) failed = "(d) the register clear a hit skips did work";
-    else if (prediction.skipCmaskProof && use.cmaskClearWorked) failed = "(d) the CMASK clear a hit proves done did work";
+    else if (walkedAt(TargetLeasePoint::Lookup) != use.walked) failed = "(c) the lookup's collects walked";
     else if (prediction.proofPendingSerial != prediction.pendingSerial) failed = "(e) the refresh proof's pending serial differs";
     else if (prediction.proofUnitChecked != prediction.unitChecked) failed = "(e) the refresh proof's unit check differs";
     else if (prediction.pinned && (!prediction.layersAt || prediction.proofGeneration != prediction.imageGeneration || prediction.imageGeneration != prediction.current)) {
         failed = "(e) K1's generation advance differs";
         clockMoved = prediction.layersAt && prediction.proofGeneration == prediction.imageGeneration && prediction.imageGeneration > prediction.current;
     } else {
-        const auto& keys = resident->TargetKeyProof();
-        const auto& before = prediction.targetKeys;
-        if (prediction.skipRegisterClear && (keys.address != before.address || keys.count != before.count || keys.keys != before.keys || keys.generation != before.generation)) failed = "(f) the target-key proof changed";
-        else if (prediction.skipCmaskProof) {
+        // The register clear's part (skipped only on a DCC target whose target-key row held), up to the
+        // CMASK's point (or now, on a target without a CMASK).
+        if (prediction.skipRegisterClear && color.dccAddress != 0 && reached(TargetLeasePoint::RegisterClear)) {
+            point = TargetLeasePoint::RegisterClear;
+            const auto walkedEnd = reached(TargetLeasePoint::Cmask) ? walkedAt(TargetLeasePoint::Cmask) : walkedNow;
+            const auto& keys = resident->TargetKeyProof();
+            const auto& before = prediction.targetKeys;
+            if (use.registerClearWorked) failed = "(d) the register clear a hit skips did work";
+            else if (walkedEnd != walkedAt(TargetLeasePoint::RegisterClear)) failed = "(c) the register clear's collects walked";
+            else if (keys.address != before.address || keys.count != before.count || keys.keys != before.keys || keys.generation != before.generation) failed = "(f) the target-key proof changed";
+        }
+        // The CMASK's part, to now.
+        if (failed == nullptr && prediction.skipCmaskProof && reached(TargetLeasePoint::Cmask)) {
+            point = TargetLeasePoint::Cmask;
             const auto cmask = CmaskProofFor(color.cmaskAddress);
-            if (cmask.found != prediction.cmaskFound || cmask.bytes != prediction.cmaskBytes || cmask.generation != prediction.cmaskGeneration) failed = "(f) the CMASK proof changed";
+            if (use.cmaskClearWorked) failed = "(d) the CMASK clear a hit proves done did work";
+            else if (walkedNow != walkedAt(TargetLeasePoint::Cmask)) failed = "(c) the CMASK proof's collect walked";
+            else if (cmask.found != prediction.cmaskFound || cmask.bytes != prediction.cmaskBytes || cmask.generation != prediction.cmaskGeneration) failed = "(f) the CMASK proof changed";
         }
     }
     if (failed == nullptr) {
@@ -360,13 +408,13 @@ void verifyPrediction(TargetLeaseUse& use, StorageTexture* resident) {
         return;
     }
     const auto serialNow = StorageTexture::PendingSerial();
-    const bool rowsHold = GuestMemory::StampsHold(std::span(prediction.unchanged.data(), prediction.unchangedRows), std::span(&prediction.cmask, prediction.cmask.generation != 0 ? 1 : 0));
-    const bool keyMoved = GuestMemory::CurrentCollectMemoKey() != use.memo || StorageLevelsSerial() != use.levels;
-    const bool pinEnded = prediction.pinned && DccKeyPinRefusal(color.dccAddress, use.colorBytes / 256, prediction.pinNote) != KeyPin::Holds;
+    // The point before the failing part (read now when the lookup threw: nothing of today's path ran
+    // after it).
+    const auto at = static_cast<std::size_t>(point);
+    const char* landed = clockMoved ? "a stamp elsewhere (K1's advance read the clock later)" : prediction.reached[at] ? prediction.landed[at] : landedSincePrediction(use);
     static std::atomic<int> reports{0};
-    if (clockMoved || serialNow != prediction.serial || !rowsHold || keyMoved || pinEnded) {
+    if (landed != nullptr) {
         countEvent(EventRaced);
-        const char* landed = clockMoved ? "a stamp elsewhere (K1's advance read the clock later)" : serialNow != prediction.serial ? "a change of the pending registry" : !rowsHold ? "a store into the lease's rows" : keyMoved ? "a move of the collect memo key or the levels serial" : "the end of the pin's window";
         if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[target-lease] slot %u target 0x%llx+0x%zx: %s after %s that landed after the lease's prediction (not a disagreement)\n", color.slot, static_cast<unsigned long long>(color.address), use.colorBytes, failed, landed);
         return;
     }
@@ -433,6 +481,18 @@ void createLease(TargetLeaseUse& use, StorageTexture* resident) {
     countEvent(EventCreated);
 }
 
+// =2's step 2: RequireNoMultisampleTarget is pure, so the prediction tests it without letting it throw.
+// Where it throws there is no prediction, and today's lookup, whose first check it is, throws it
+// itself (as =1's hit would at the same step).
+bool multisampleGuardsAllow(std::uint64_t address) {
+    try {
+        RequireNoMultisampleTarget(address, 1, "a storage image access");
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 }
 
 int TargetLeases() {
@@ -470,9 +530,10 @@ void TargetLeaseBefore(TargetLeaseUse& use) {
 }
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): a hit, steps 1-7 of
-// 9.4.3 in the lookup's order (TargetLease.hpp); =2 runs the same check without side effects (no
-// RequireNoMultisampleTarget, which today's lookup calls first itself, no kept-bytes bound, no
-// splice or count, refresh writes or drain) and keeps what it found.
+// 9.4.3 in the lookup's order (TargetLease.hpp), which renews the entry for the table's replacement;
+// =2 runs the same check without side effects (RequireNoMultisampleTarget and the closure's Requires
+// as predicates, no kept-bytes bound, no splice or count, refresh writes or drain) and keeps what it
+// found.
 std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use) {
     const int mode = TargetLeases();
     if (mode == 0) return nullptr;
@@ -491,8 +552,10 @@ std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use) {
     else if (entry->memo.mapping != use.memo.mapping) probe.miss = LeaseMissAllocations;
     else if (entry->memo.unwatched != use.memo.unwatched) probe.miss = LeaseMissUnwatch;
     else if (entry->levels != use.levels) probe.miss = LeaseMissLevels;
+    // 2. cachedStorageTexture's first check, with its arguments (a guestBytes of 0 checks a byte): =2
+    // tests it (no prediction where it would throw), =1 calls it below.
+    else if (!apply && !multisampleGuardsAllow(color.address)) probe.miss = LeaseMissMultisample;
     else {
-        // 2. cachedStorageTexture's first check, with its arguments (a guestBytes of 0 checks a byte).
         if (apply) RequireNoMultisampleTarget(color.address, 1, "a storage image access");
         // 3. Its FlushDepthPlanes(Overlapped) would store nothing.
         if (DepthPlanesStaleOver(color.address, use.colorBytes)) probe.miss = LeaseMissDepthPlane;
@@ -514,6 +577,9 @@ std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use) {
         use.hit = true;
         use.skipRegisterClear = color.dccAddress == 0 || probe.rows.targetKeys.generation != 0;
         use.skipCmaskProof = color.cmaskAddress != 0;
+        // The way's tick, so a set conflict replaces the least recently used lease, with or without
+        // APS5_PROFILE_DRAW (only creations and hits write the table while the switch is set).
+        entry->used = ++table.tick;
         countEvent(EventHits);
         if (probe.rows.unitChecked) countEvent(EventUnitChecked);
         if (probe.rows.pinned) countEvent(EventPinned);
@@ -553,16 +619,25 @@ std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use) {
 
 void TargetLeaseLookedUp(TargetLeaseUse& use, StorageTexture* resident) {
     auto& prediction = use.prediction;
-    if (!prediction.hit || resident == nullptr) return;
-    const auto state = resident->LeaseState();
-    prediction.lookedUp = true;
-    prediction.provedAfter = StorageTexture::RefreshesProved();
-    prediction.walkedAfter = GuestMemory::ThreadCollectedBytes();
-    prediction.proofGeneration = state.proofGeneration;
-    prediction.proofPendingSerial = state.pendingSerial;
-    prediction.imageGeneration = state.generation;
-    prediction.proofUnitChecked = state.unitChecked;
-    prediction.layersAt = state.layersAt;
+    if (!prediction.hit) return;
+    if (resident != nullptr) {
+        const auto state = resident->LeaseState();
+        prediction.lookedUp = true;
+        prediction.provedAfter = StorageTexture::RefreshesProved();
+        prediction.proofGeneration = state.proofGeneration;
+        prediction.proofPendingSerial = state.pendingSerial;
+        prediction.imageGeneration = state.generation;
+        prediction.proofUnitChecked = state.unitChecked;
+        prediction.layersAt = state.layersAt;
+    }
+    notePoint(use, TargetLeasePoint::Lookup);
+}
+
+void TargetLeaseBeforeMaterialize(TargetLeaseUse& use, bool cmask) {
+    const auto& prediction = use.prediction;
+    if (!prediction.hit) return;
+    if (cmask ? !prediction.skipCmaskProof : (!prediction.skipRegisterClear || use.color->dccAddress == 0)) return;
+    notePoint(use, cmask ? TargetLeasePoint::Cmask : TargetLeasePoint::RegisterClear);
 }
 
 void TargetLeaseAfter(TargetLeaseUse& use, StorageTexture* resident) {
@@ -584,7 +659,8 @@ TargetLeaseCounts TargetLeaseTotals() {
 std::string TargetLeaseReport() {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     std::string line;
-    char text[192];
+    // Room for the longest piece, D4-B's summary (156 fixed characters and nine counts).
+    char text[512];
     const auto lookups = take(leaseCounts.lookups);
     std::snprintf(text, sizeof(text), "; target leases (D4-0): eligible %llu of %llu (ineligible by reason:", take(leaseCounts.ineligible[Eligible]), lookups);
     line += text;

@@ -1998,7 +1998,9 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         }
         if (profile) noteTargetRefreshes(outcome, true);
         // LOCAL EXPERIMENT (D4-B): skipped after a hit whose lock held the target keys' row (the range
-        // proof answers, so this would return at ProvedCurrentDccKeys), or of a target without DCC.
+        // proof answers, so this would return at ProvedCurrentDccKeys), or of a target without DCC. =2
+        // reads its race test right before each materialization a prediction skips.
+        if (lease != nullptr && lease->prediction.hit && resident != nullptr) TargetLeaseBeforeMaterialize(*lease, false);
         if (resident != nullptr && (lease == nullptr || !lease->skipRegisterClear)) materializeRegisterClear(context, color, *resident, lease != nullptr ? &lease->registerClearWorked : nullptr);
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
@@ -2006,6 +2008,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
+    if (lease != nullptr && lease->prediction.hit && resident != nullptr) TargetLeaseBeforeMaterialize(*lease, true);
     if (resident != nullptr) materializeCmaskClear(context, color, resident, lease != nullptr ? &lease->cmaskClearWorked : nullptr, lease != nullptr && lease->skipCmaskProof);
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();

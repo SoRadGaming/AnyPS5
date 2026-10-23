@@ -1147,14 +1147,8 @@ configure_windows_unwind(agc_dcc_key_sharing_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_dcc_key_sharing_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_dcc_key_sharing COMMAND agc_dcc_key_sharing_tests)
-    # LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the key sharing rules
-    # with the leases verified and on.
-    add_test(NAME agc_dcc_key_sharing_target_leases2 COMMAND agc_dcc_key_sharing_tests)
-    add_test(NAME agc_dcc_key_sharing_target_leases1 COMMAND agc_dcc_key_sharing_tests)
-    set_tests_properties(agc_dcc_key_sharing_target_leases2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_LEASES=2;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1")
-    set_tests_properties(agc_dcc_key_sharing_target_leases1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_TARGET_LEASES=1;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1")
     if(WIN32)
-        set_tests_properties(agc_dcc_key_sharing agc_dcc_key_sharing_target_leases2 agc_dcc_key_sharing_target_leases1 PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_dcc_key_sharing PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1614,7 +1608,11 @@ if(BUILD_TESTING)
     # the lease draws (every row with the epoch coverage that gives the lookups a collect memo key):
     # leases off (P1 and K1 off too), on and verified with P1 and K1 on as the play arms run them, the
     # verify while profiling (the D4-0 counter beside it, the walk check counted), and on under P1's
-    # and K1's own verify (their proofs then miss).
+    # and K1's own verify (their proofs then miss). The lease draws are the leases' draw-level rows:
+    # each lookup is the slot loop's (both materializations included). The draw suites 9.4.3 test 3
+    # names cannot make a lease here (their targets lie outside the watched guest arena, so no
+    # refresh is ever proved; the CMASK suite's draws take no collect epoch and fast-clear every
+    # target; agc_dcc_key_sharing_tests links no driver), so they have no lease rows.
     add_test(NAME agc_storage_target_lease COMMAND agc_driver_recorder_tests --target-lease-only)
     add_test(NAME agc_storage_target_lease1 COMMAND agc_driver_recorder_tests --target-lease-only)
     add_test(NAME agc_storage_target_lease2 COMMAND agc_driver_recorder_tests --target-lease-only)
@@ -2533,16 +2531,6 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_cmask_fast_clear_target_memos2 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    # LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the same draws with the
-    # target leases verified (=2: every lease's prediction checked against today's lookup) and on.
-    add_test(NAME agc_driver_cmask_fast_clear_target_leases2 COMMAND agc_driver_cmask_fast_clear_tests)
-    add_test(NAME agc_driver_cmask_fast_clear_target_leases1 COMMAND agc_driver_cmask_fast_clear_tests)
-    set_tests_properties(agc_driver_cmask_fast_clear_target_leases2 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_TARGET_LEASES=2;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    set_tests_properties(agc_driver_cmask_fast_clear_target_leases1 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_TARGET_LEASES=1;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    if(WIN32)
-        set_tests_properties(agc_driver_cmask_fast_clear_target_leases2 agc_driver_cmask_fast_clear_target_leases1 PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
     add_test(NAME agc_driver_guarded_direct_root COMMAND agc_driver_guarded_null_pointer_tests --direct-root-only)
     set_tests_properties(agc_driver_guarded_direct_root PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -3075,16 +3063,6 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_graphics_snapshot_hash3 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_SNAPSHOT_HASH=3" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
         set_tests_properties(agc_driver_graphics_snapshot_hash3 PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-    endif()
-    # LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the graphics suite (its
-    # DepthSurfaceReuse cases included) with the target leases verified and on.
-    add_test(NAME agc_driver_graphics_target_leases2 COMMAND agc_driver_graphics_tests)
-    add_test(NAME agc_driver_graphics_target_leases1 COMMAND agc_driver_graphics_tests)
-    set_tests_properties(agc_driver_graphics_target_leases2 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_TARGET_LEASES=2;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    set_tests_properties(agc_driver_graphics_target_leases1 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EXPERIMENT_TARGET_LEASES=1;APS5_EXPERIMENT_PROOF_UNITS=1;APS5_EXPERIMENT_KEY_PIN=1;APS5_DEBUG_COVERAGE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    if(WIN32)
-        set_tests_properties(agc_driver_graphics_target_leases2 agc_driver_graphics_target_leases1 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
