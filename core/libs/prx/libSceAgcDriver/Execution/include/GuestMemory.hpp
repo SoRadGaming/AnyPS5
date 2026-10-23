@@ -108,8 +108,29 @@ enum class StampRow : std::uint8_t { Held, Unproven, Stamped };
 struct StampsHoldReport {
     std::span<StampRow> rows;
     bool hostWritesOver = false;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.9): whether any host write had
+    // ended unstamped when a lock without the drain was taken (false when it drains): the drain today's
+    // next tracker lock makes would move the generation, so a prediction under it is a miss.
+    bool hostWritesPending = false;
 };
 bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain = true, std::uint64_t* current = nullptr, StampsHoldReport* report = nullptr);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.10 D5): the form above (which
+// forwards here with no not-written rows) plus `notWritten` rows, each answering !WrittenSince's test
+// in the same lock: Unproven when the tracker is not watched, the generation is 0, the row is empty or
+// not covered (where WrittenSince answers false: such a row proves nothing); otherwise Held when no
+// 64 KiB block of the row was stamped after its generation (block-coarse, as WrittenSince and unlike
+// the unchanged rows' sub-block storedOver), else Stamped. A report holds the unchanged rows' answers,
+// then the not-stored-over rows', then the not-written rows'. `memoCurrent`, when given, receives what
+// a memoized collect (hitGeneration) answers under this lock: the tracker generation, as `current`
+// (TrackerGeneration's answer) does on this tree; a merge that makes a memo hit answer another value
+// (upstream 2df7e993d's published `stable` generation) must keep the two apart here. Mirror tripwire
+// (GPU-OWNED-PLAN 9.6, 11.13): WrittenSince, rangeUnchanged, unchanged, stamp, hitGeneration,
+// TrackerGeneration and lockTracker.
+bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, std::span<const UnchangedQuery> notWritten, bool drain, std::uint64_t* current, std::uint64_t* memoCurrent, StampsHoldReport* report);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.9): the tracker generation as one
+// acquire load, without the tracker lock and without stamping the host writes queued meanwhile (=2's
+// race evidence: a value above an earlier reading proves an update since, by anyone).
+std::uint64_t TrackerGenerationNoDrain();
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):

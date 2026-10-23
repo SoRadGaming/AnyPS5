@@ -1643,6 +1643,29 @@ if(BUILD_TESTING)
         set_tests_properties(agc_depth_lease_classify agc_depth_lease_counter agc_depth_lease_counter_no_key agc_depth_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 D5): DepthSurfaceView leases:
+    # =2's classification without a device, then real DepthSurfaceView calls (every row with the epoch
+    # coverage that gives the calls a collect memo key, but the last): off (nothing counted, today's
+    # state), on, verified, verified while profiling (D5-0 must count nothing), on with the host-write
+    # stamps switch, and on without a memo key (every call ineligible).
+    add_test(NAME agc_depth_view_lease_classify COMMAND agc_driver_recorder_tests --depth-view-lease-classify-only)
+    add_test(NAME agc_depth_view_lease COMMAND agc_driver_recorder_tests --depth-view-lease-only)
+    add_test(NAME agc_depth_view_lease1 COMMAND agc_driver_recorder_tests --depth-view-lease-only)
+    add_test(NAME agc_depth_view_lease2 COMMAND agc_driver_recorder_tests --depth-view-lease-only)
+    add_test(NAME agc_depth_view_lease2_profile COMMAND agc_driver_recorder_tests --depth-view-lease-only)
+    add_test(NAME agc_depth_view_lease1_host_writes COMMAND agc_driver_recorder_tests --depth-view-lease-only)
+    add_test(NAME agc_depth_view_lease1_no_key COMMAND agc_driver_recorder_tests --depth-view-lease-only)
+    set_tests_properties(agc_depth_view_lease_classify agc_depth_view_lease agc_depth_view_lease1 agc_depth_view_lease2 agc_depth_view_lease2_profile agc_depth_view_lease1_host_writes agc_depth_view_lease1_no_key PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_depth_view_lease PROPERTIES ENVIRONMENT "APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_depth_view_lease1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DEPTH_LEASES=1;APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_depth_view_lease2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DEPTH_LEASES=2;APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_depth_view_lease2_profile PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DEPTH_LEASES=2;APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
+    set_tests_properties(agc_depth_view_lease1_host_writes PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DEPTH_LEASES=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_HOST_WRITE_STAMPS=1")
+    set_tests_properties(agc_depth_view_lease1_no_key PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DEPTH_LEASES=1")
+    if(WIN32)
+        set_tests_properties(agc_depth_view_lease_classify agc_depth_view_lease agc_depth_view_lease1 agc_depth_view_lease2 agc_depth_view_lease2_profile agc_depth_view_lease1_host_writes agc_depth_view_lease1_no_key PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_storage_integer_clear COMMAND agc_driver_recorder_tests --integer-clear-only)
     set_tests_properties(agc_storage_integer_clear PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
@@ -2099,6 +2122,19 @@ if(BUILD_TESTING)
     set_tests_properties(agc_command_batch_fence_failure PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_command_batch_fence_failure PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 D5): the DepthSurfaceView reuse
+    # cases (tests/DepthSurfaceReuse.cpp) alone, then with the leases on and verified (with the epoch
+    # coverage; their mock context has no recorder, so every call is ineligible and takes today's path).
+    add_test(NAME agc_driver_depth_surface_reuse COMMAND agc_driver_graphics_tests --depth-surface-reuse)
+    add_test(NAME agc_driver_depth_surface_reuse_lease1 COMMAND agc_driver_graphics_tests --depth-surface-reuse)
+    add_test(NAME agc_driver_depth_surface_reuse_lease2 COMMAND agc_driver_graphics_tests --depth-surface-reuse)
+    set_tests_properties(agc_driver_depth_surface_reuse agc_driver_depth_surface_reuse_lease1 agc_driver_depth_surface_reuse_lease2 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    set_tests_properties(agc_driver_depth_surface_reuse_lease1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DEPTH_LEASES=1;APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_driver_depth_surface_reuse_lease2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_DEPTH_LEASES=2;APS5_DEBUG_COVERAGE=1")
+    if(WIN32)
+        set_tests_properties(agc_driver_depth_surface_reuse agc_driver_depth_surface_reuse_lease1 agc_driver_depth_surface_reuse_lease2 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -3239,7 +3275,13 @@ if(BUILD_TESTING)
             # play arms run them and the epoch coverage that gives the committer's lookups a collect
             # memo key (without it no lookup is eligible); their own cases are in agc_storage_target_lease*.
             "target_leases|APS5_EXPERIMENT_TARGET_LEASES=2,APS5_EXPERIMENT_PROOF_UNITS=1,APS5_EXPERIMENT_KEY_PIN=1,APS5_DEBUG_COVERAGE=1"
-            "target_leases_on|APS5_EXPERIMENT_TARGET_LEASES=1,APS5_EXPERIMENT_PROOF_UNITS=1,APS5_EXPERIMENT_KEY_PIN=1,APS5_DEBUG_COVERAGE=1")
+            "target_leases_on|APS5_EXPERIMENT_TARGET_LEASES=1,APS5_EXPERIMENT_PROOF_UNITS=1,APS5_EXPERIMENT_KEY_PIN=1,APS5_DEBUG_COVERAGE=1"
+            # LOCAL EXPERIMENT (GPU-OWNED-PLAN 11 D5): DepthSurfaceView leases verified (=2: every lease's
+            # prediction checked against today's call, part by part) and on, with the epoch coverage that
+            # gives the committer's calls a collect memo key (without it no call is eligible); their own
+            # cases are in agc_depth_view_lease*.
+            "depth_leases|APS5_EXPERIMENT_DEPTH_LEASES=2,APS5_DEBUG_COVERAGE=1"
+            "depth_leases_on|APS5_EXPERIMENT_DEPTH_LEASES=1,APS5_DEBUG_COVERAGE=1")
     set(committerExperimentRuns
             "draw_pipeline_commits|draw_pipeline_commits|none"
             "draw_pipeline_commits_failure|draw_pipeline_commits|--failure"

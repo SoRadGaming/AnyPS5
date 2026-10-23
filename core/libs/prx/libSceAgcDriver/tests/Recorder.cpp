@@ -13099,6 +13099,688 @@ bool depthLeaseCounterTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (b)): =2's classification of a
+// verified DepthSurfaceView call (CheckDepthViewPrediction), without a device. Every part failing with
+// no evidence aborts; the same with evidence read at its own point is raced only when that evidence can
+// change the part (the store-back's per predicted route, the identity's by the surfaces serials, retired
+// and a cleared HTILE entry, a sync's clock move only with the plane stamped); evidence read only at
+// another part's point never excuses it; refresh values equal verify, above race and below abort, with
+// the read proof checked per route (pending: the memo-hit generation; not pending: the prediction's;
+// none for no HTILE or not accessible) and the stencil memory exactly 0 without a stencil plane. The
+// names and the [proofs] part (counts since its last call) follow.
+void depthViewLeaseClassifyTests() {
+    DepthViewFacts agreed;
+    agreed.route = DepthViewRoute::Pending;
+    agreed.stencil = true;
+    agreed.h = 0;
+    agreed.current0 = 50;
+    agreed.memoCurrent0 = 50;
+    agreed.verdict = HtileVerdictKind::PendingCovered;
+    agreed.htileReadFound = true;
+    agreed.htileRead = 50;
+    agreed.unitsLow = 50;
+    agreed.unitsHigh = 50;
+    agreed.depthMemory = 50;
+    agreed.stencilMemory = 50;
+    const auto expect = [](const DepthViewFacts& facts, DepthViewPart part, bool raced, const std::string& what) {
+        const auto check = CheckDepthViewPrediction(facts);
+        Require(check.part == part && check.raced == raced, "D5 classification: " + what + ": " + DepthViewPartName(check.part) + (check.raced ? " raced" : " not raced") + " (" + check.reason + "), where " + DepthViewPartName(part) + (raced ? " raced" : " not raced") + " was expected");
+    };
+    expect(agreed, DepthViewPart::None, false, "everything agreed (pending)");
+    // Each route agreed with today's matching verdict.
+    {
+        auto notPending = agreed;
+        notPending.route = DepthViewRoute::NotPending;
+        notPending.verdict = HtileVerdictKind::NotPendingProved;
+        notPending.h = 40;
+        notPending.htileRead = 40;
+        expect(notPending, DepthViewPart::None, false, "everything agreed (not pending: the read proof is the prediction's)");
+        notPending.htileRead = 50;
+        expect(notPending, DepthViewPart::Refresh, true, "a not-pending read proof above the prediction's");
+        notPending.htileRead = 39;
+        expect(notPending, DepthViewPart::Refresh, false, "a not-pending read proof below the prediction's");
+        notPending.htileReadFound = false;
+        expect(notPending, DepthViewPart::Refresh, false, "a not-pending read proof missing");
+        for (const auto route : {DepthViewRoute::NoHtile, DepthViewRoute::NotAccessible}) {
+            auto facts = agreed;
+            facts.route = route;
+            facts.verdict = route == DepthViewRoute::NoHtile ? HtileVerdictKind::NoHtile : HtileVerdictKind::NotAccessible;
+            facts.htileReadFound = false;
+            facts.htileRead = 0;
+            expect(facts, DepthViewPart::None, false, std::string("everything agreed (") + DepthViewRouteName(route) + ", no read proof checked)");
+        }
+        auto noStencil = agreed;
+        noStencil.stencil = false;
+        noStencil.stencilMemory = 0;
+        expect(noStencil, DepthViewPart::None, false, "everything agreed without a stencil plane");
+        noStencil.stencilMemory = 50;
+        expect(noStencil, DepthViewPart::Refresh, false, "a stencil memory without a stencil plane");
+    }
+    // The store-back part.
+    const auto storeBackEvidence = [](DepthViewFacts facts, int which) {
+        switch (which) {
+            case 0: facts.storeBack.memoMoved = true; break;
+            case 1: facts.storeBack.accessibleDiffers = true; break;
+            case 2: facts.storeBack.foundDiffers = true; break;
+            default: facts.storeBack.collectedAbove = true; break;
+        }
+        return facts;
+    };
+    const auto pointEvidence = [](DepthViewEvidence evidence, int which) {
+        switch (which) {
+            case 0: evidence.memoMoved = true; break;
+            case 1: evidence.surfacesMoved = true; break;
+            case 2: evidence.retired = true; break;
+            case 3: evidence.oldestMoved = true; break;
+            case 4: evidence.clearedHtile = true; break;
+            default: evidence.clockMoved = true; break;
+        }
+        return evidence;
+    };
+    {
+        auto storedBack = agreed;
+        storedBack.verdict = HtileVerdictKind::StoredBack;
+        storedBack.htileCleared = 1;
+        expect(storedBack, DepthViewPart::StoreBack, false, "an HTILE clear stored back, no evidence");
+        // Only the evidence that can change the predicted route's verdict excuses it (the r73 review):
+        // not pending, all four; pending and not accessible, Accessible only (memo key 0, Accessible 1,
+        // read proof 2, collect above 3); no HTILE, none.
+        for (const auto route : {DepthViewRoute::Pending, DepthViewRoute::NotPending, DepthViewRoute::NotAccessible, DepthViewRoute::NoHtile}) {
+            auto facts = storedBack;
+            facts.route = route;
+            if (route == DepthViewRoute::NotPending) {
+                facts.h = 40;
+                facts.htileRead = 40;
+            } else if (route != DepthViewRoute::Pending) {
+                facts.htileReadFound = false;
+                facts.htileRead = 0;
+            }
+            expect(facts, DepthViewPart::StoreBack, false, std::string("an HTILE clear stored back (") + DepthViewRouteName(route) + "), no evidence");
+            for (int which = 0; which < 4; ++which) {
+                const bool excuses = route == DepthViewRoute::NotPending || (which == 1 && route != DepthViewRoute::NoHtile);
+                expect(storeBackEvidence(facts, which), DepthViewPart::StoreBack, excuses, std::string("an HTILE clear stored back (") + DepthViewRouteName(route) + "), with store-back evidence " + std::to_string(which));
+            }
+            auto all = facts;
+            all.storeBack.memoMoved = true;
+            all.storeBack.foundDiffers = true;
+            all.storeBack.collectedAbove = true;
+            expect(all, DepthViewPart::StoreBack, route == DepthViewRoute::NotPending, std::string("an HTILE clear stored back (") + DepthViewRouteName(route) + "), with every store-back evidence but Accessible");
+        }
+        auto later = storedBack;
+        later.identity.clockMoved = true;
+        later.sync.memoMoved = true;
+        later.depthMemory = 60;
+        expect(later, DepthViewPart::StoreBack, false, "an HTILE clear stored back, with evidence at later points only");
+        auto otherRoute = agreed;
+        otherRoute.route = DepthViewRoute::NotPending;
+        otherRoute.h = 40;
+        otherRoute.htileRead = 40;
+        otherRoute.verdict = HtileVerdictKind::NotPendingRead;
+        expect(otherRoute, DepthViewPart::StoreBack, false, "a not-pending read proof that failed today, no evidence");
+        otherRoute.storeBack.foundDiffers = true;
+        expect(otherRoute, DepthViewPart::StoreBack, true, "a not-pending read proof that failed today after it moved");
+        auto pendingNot = agreed;
+        pendingNot.verdict = HtileVerdictKind::PendingNotCovering;
+        expect(pendingNot, DepthViewPart::StoreBack, false, "a pending fill no longer covering, no evidence");
+        // The recorder's answer, which no other thread moves: a tracker or memo key move excuses nothing.
+        for (const int which : {0, 3}) expect(storeBackEvidence(pendingNot, which), DepthViewPart::StoreBack, false, "a pending fill no longer covering, with store-back evidence " + std::to_string(which));
+        expect(storeBackEvidence(pendingNot, 1), DepthViewPart::StoreBack, true, "a pending fill no longer covering, after the HTILE's Accessible answer moved");
+    }
+    // The identity part, by each way it fails.
+    for (int way = 0; way < 4; ++way) {
+        auto facts = agreed;
+        if (way == 0) facts.cleared = true;
+        else if (way == 1) facts.created = true;
+        else if (way == 2) facts.sameSurface = false;
+        else facts.retiredBefore = true;
+        const auto what = "identity failure " + std::to_string(way);
+        expect(facts, DepthViewPart::Identity, false, what + ", no evidence");
+        // Only the surfaces serials (1), retired (2) and a cleared HTILE entry (4) can change the
+        // identity's facts (the r73 review); the memo key (0), the units (3) and the clock (5) cannot.
+        for (int which = 0; which < 6; ++which) {
+            auto raced = facts;
+            raced.identity = pointEvidence(raced.identity, which);
+            expect(raced, DepthViewPart::Identity, which == 1 || which == 2 || which == 4, what + ", with identity evidence " + std::to_string(which));
+        }
+        auto unrelated = facts;
+        unrelated.identity.memoMoved = true;
+        unrelated.identity.oldestMoved = true;
+        unrelated.identity.clockMoved = true;
+        expect(unrelated, DepthViewPart::Identity, false, what + ", with the memo key, units and clock moved only");
+        auto earlier = storeBackEvidence(facts, 0);
+        expect(earlier, DepthViewPart::Identity, false, what + ", with store-back evidence only");
+        auto later = facts;
+        later.sync.clockMoved = true;
+        later.depthMemory = 60;
+        expect(later, DepthViewPart::Identity, false, what + ", with evidence at later points only");
+    }
+    // The sync part.
+    {
+        auto synced = agreed;
+        synced.synced = true;
+        expect(synced, DepthViewPart::Sync, false, "a sync, no evidence");
+        // The memo key (0), the surfaces serials (1) and the units (3) excuse it; retired (2) and a
+        // cleared HTILE entry (4) change no unit; the clock (5) only with the plane itself stamped since
+        // the prediction (the r73 review).
+        for (int which = 0; which < 6; ++which) {
+            auto raced = synced;
+            raced.sync = pointEvidence(raced.sync, which);
+            expect(raced, DepthViewPart::Sync, which == 0 || which == 1 || which == 3, "a sync, with sync evidence " + std::to_string(which));
+            raced.planeStamped = true;
+            expect(raced, DepthViewPart::Sync, which != 2 && which != 4, "a sync with the plane stamped, with sync evidence " + std::to_string(which));
+        }
+        auto stamped = synced;
+        stamped.planeStamped = true;
+        expect(stamped, DepthViewPart::Sync, false, "a sync with the plane stamped but no clock move by the sync point or WrittenUnits' decision");
+        auto written = synced;
+        written.unitsLow = 51;
+        written.unitsHigh = 51;
+        expect(written, DepthViewPart::Sync, false, "a sync whose WrittenUnits read a generation above the prediction's, the plane not stamped");
+        written.planeStamped = true;
+        expect(written, DepthViewPart::Sync, true, "a sync whose WrittenUnits read a generation above the prediction's, the plane stamped");
+        auto earlier = synced;
+        earlier.identity.clockMoved = true;
+        earlier.storeBack.collectedAbove = true;
+        expect(earlier, DepthViewPart::Sync, false, "a sync, with evidence at earlier points only");
+        auto later = synced;
+        later.depthMemory = 60;
+        later.stencilMemory = 60;
+        expect(later, DepthViewPart::Sync, false, "a sync, with refresh values above only");
+    }
+    // The refresh part.
+    {
+        const auto value = [&](int which, std::uint64_t to) {
+            auto facts = agreed;
+            switch (which) {
+                case 0: facts.htileRead = to; break;
+                case 1: facts.unitsLow = to; facts.unitsHigh = to; break;
+                case 2: facts.depthMemory = to; break;
+                default: facts.stencilMemory = to; break;
+            }
+            return facts;
+        };
+        for (int which = 0; which < 4; ++which) {
+            expect(value(which, 51), DepthViewPart::Refresh, true, "refresh value " + std::to_string(which) + " above its prediction");
+            expect(value(which, 49), DepthViewPart::Refresh, false, "refresh value " + std::to_string(which) + " below its prediction");
+        }
+        auto mixed = value(0, 51);
+        mixed.depthMemory = 49;
+        expect(mixed, DepthViewPart::Refresh, false, "one refresh value above and one below");
+        auto unequal = agreed;
+        unequal.unitsHigh = 51;
+        expect(unequal, DepthViewPart::Refresh, false, "units unequal");
+        auto missing = agreed;
+        missing.htileReadFound = false;
+        expect(missing, DepthViewPart::Refresh, false, "the pending read proof missing");
+        auto earlier = value(2, 49);
+        earlier.sync.clockMoved = true;
+        earlier.identity.memoMoved = true;
+        expect(earlier, DepthViewPart::Refresh, false, "a refresh value below its prediction, with evidence at earlier points");
+    }
+    Require(std::string(DepthViewMissName(DepthViewMiss::HostWritesPending)) == "host writes pending" && std::string(DepthViewRefusalName(DepthViewRefusal::NotCovered)) == "not covered" && std::string(HtileVerdictName(HtileVerdictKind::PendingCovered)) == "pending covered" && std::string(DepthViewPartName(DepthViewPart::Refresh)) == "refresh", "D5 names: a reason is misnamed");
+    static_cast<void>(DepthViewLeaseReport());
+    const auto report = DepthViewLeaseReport();
+    for (const char* part : {"; D5 (APS5_EXPERIMENT_DEPTH_LEASES=", "eligible 0 of 0", "hits 0 (pending 0, not pending 0, no HTILE 0, not accessible 0)", "full-path verdicts: no HTILE 0,", "stored back 0; created 0, renewed 0, refused: created 0,", "not covered 0; misses: no lease 0,", "plane: unproven 0, stamped 0, HTILE: unproven 0, stamped 0, host writes pending 0", "; table evictions 0; =2: predicted hits 0, verified 0, raced 0 (store-back 0, identity 0, sync 0, refresh 0)"}) {
+        Require(report.find(part) != std::string::npos, std::string("D5 report: '") + part + "' is not in: " + report);
+    }
+    std::cout << "depth view lease classification tests passed\n";
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (c)): DepthSurfaceView leases over
+// real calls on a watched block, the mode from the environment. Every target is mirrorable (D32, swizzle
+// mode Z64KBX): A (an HTILE, not pending), A2 (A's surface with another HTILE), P (an HTILE a pending
+// fill covers), S (D32S8, no HTILE) and S2 (S's depth plane with another stencil plane), N (an HTILE
+// that is not accessible), U (a plane not 64 KiB aligned: one unit), M (several units), and W, G and H
+// for the cases that sync. Each case runs at 0, 1 and 2, and after each call the state is today's:
+// every unit equal and, with no sync, equal to TrackerGeneration(), as the depth memory is (the stencil
+// memory too with a stencil plane, else 0), the pending route's read proof too, the not-pending one
+// unchanged since its generation, every unit stale and the plane in the stale list, no pending clear.
+// (A call's collects are made memo hits first, so they move no generation: the state is then exact in
+// one thread.) At 1 and 2: a target's first call creates its surface (refused: created), the next makes
+// the lease, and the next hits (=1) or is verified (=2), on each of the four routes; each event of the
+// plan's table then gives its stated outcome, and the call after it hits again (a cleared HTILE taken
+// and ClearDepthSurfaces leave no lease for one call: their refusal). A step across which the memo key
+// moved by itself is tried again, as D5-0's are. The cases that sync come last, each on its own target:
+// on a device that compares host imports below 1 MiB instead of watching them, the sync's mirror upload
+// unwatches its plane, whose later calls then cannot hit (said once). At 0 nothing is counted (and
+// D5-0 counts while profiling); at 1 and 2, D5-0 counts nothing. Without a collect memo key (no
+// APS5_DEBUG_COVERAGE=1) every call is ineligible. False only when the device watches no memory.
+bool depthViewLeaseTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 24 * block;
+    void* memory = AllocateWatched(bytes, block);
+    if (memory == nullptr) {
+        std::cout << "no write watching: the depth view leases not tested\n";
+        return false;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    // A context with a detiler: a sync makes the depth plane's mirror (StorageTexture::Create). Declared
+    // before the surfaces' clear below, so it outlives them.
+    const auto& base = device.GetContext();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    // ClearDepthSurfaces destroys the surfaces' images at once: the batch that recorded work over them
+    // must finish first, on a failed expectation too.
+    struct Clear {
+        Recorder& recorder;
+        VkDevice device;
+        ~Clear() {
+            try {
+                recorder.Sync();
+            } catch (...) {
+            }
+            ClearDepthSurfaces(device);
+        }
+    } clear{recorder, context.device};
+    const int mode = DepthViewLeases();
+    const bool profiling = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    std::memset(data, 0, bytes);
+    constexpr VkExtent2D extent{64, 64};
+    constexpr VkExtent2D large{256, 256};
+    const auto htileBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    const auto at = [&](std::size_t index) { return address + index * block; };
+    // HTILE words with no clear code (HtileFillClears reads the low nibble).
+    for (const std::size_t index : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{16}}) std::memset(data + index * block, 0xff, block / 2);
+    const auto make = [](std::uint64_t address, std::uint64_t stencil, VkExtent2D size, VkFormat format, std::uint64_t htile) {
+        DepthTarget target{address, stencil, size, format, 1.0f, 0};
+        target.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+        target.htileAddress = htile;
+        return target;
+    };
+    const auto a = make(at(0), 0, extent, VK_FORMAT_D32_SFLOAT, at(1));
+    const auto a2 = make(at(0), 0, extent, VK_FORMAT_D32_SFLOAT, at(2));
+    const auto p = make(at(3), 0, extent, VK_FORMAT_D32_SFLOAT, at(4));
+    const auto s = make(at(5), at(6), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 0);
+    const auto s2 = make(at(5), at(7), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 0);
+    // An HTILE in the first 64 KiB of the address space, which is never mapped.
+    const auto n = make(at(8), 0, extent, VK_FORMAT_D32_SFLOAT, 0x1000);
+    const auto u = make(at(9) + 4096, 0, extent, VK_FORMAT_D32_SFLOAT, 0);
+    const auto m = make(at(12), 0, large, VK_FORMAT_D32_SFLOAT, at(16));
+    const auto w = make(at(17), 0, extent, VK_FORMAT_D32_SFLOAT, 0);
+    const auto g = make(at(18), 0, extent, VK_FORMAT_D32_SFLOAT, 0);
+    const auto h = make(at(19), 0, extent, VK_FORMAT_D32_SFLOAT, 0);
+    const auto b = make(at(20), 0, extent, VK_FORMAT_D32_SFLOAT, 0);
+    const auto elsewhere = at(21);
+    const auto planeBytes = [](const DepthTarget& target) {
+        GuestTextureResource resource{};
+        resource.baseAddress = target.address;
+        resource.width = target.extent.width;
+        resource.height = target.extent.height;
+        resource.mipCount = 1;
+        resource.allocatedMipCount = 1;
+        resource.tileMode = TextureTileMode::kZ64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 22;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        return static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    };
+    Require(planeBytes(a) <= block && planeBytes(u) <= block && planeBytes(m) > block && planeBytes(m) <= 4 * block && HtileMetadataBytes(large) <= block / 2, "D5 fixture: a plane or HTILE outgrows its blocks");
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    // Every range a call collects, collected first: the call's collects are then memo hits.
+    const auto collect = [&](const DepthTarget& target) {
+        CollectWrites(target.address, planeBytes(target));
+        CollectWrites(target.address, static_cast<std::size_t>(DepthSliceBytes(target.extent, 4u)));
+        if (target.stencilAddress != 0) CollectWrites(target.stencilAddress, static_cast<std::size_t>(DepthSliceBytes(target.extent, 1u)));
+        if (target.htileAddress >= address) CollectWrites(target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)));
+    };
+    enum class Seen { Off, Ineligible, Answered, Missed };
+    struct Outcome {
+        Seen seen = Seen::Off;
+        DepthViewMiss miss = DepthViewMiss::Count;
+        DepthViewLeaseCounts before;
+        DepthViewLeaseCounts after;
+    };
+    const auto describe = [&](const Outcome& outcome) -> std::string {
+        switch (outcome.seen) {
+            case Seen::Off: return "nothing counted";
+            case Seen::Ineligible: return "ineligible";
+            case Seen::Answered: return mode == 1 ? "a hit" : "a verified prediction";
+            default: return std::string("a miss (") + DepthViewMissName(outcome.miss) + ")";
+        }
+    };
+    const auto eligible = DepthViewIndex(DepthViewIneligible::Eligible);
+    // One call, classified by the counts it moved.
+    const auto call = [&](const DepthTarget& target, bool collectFirst) {
+        if (collectFirst) collect(target);
+        Outcome outcome;
+        outcome.before = DepthViewLeaseTotals();
+        Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "D5: the depth surface has no view");
+        outcome.after = DepthViewLeaseTotals();
+        const auto& before = outcome.before;
+        const auto& after = outcome.after;
+        if (mode == 0) {
+            Require(after.calls == before.calls && after.hits == before.hits && after.created == before.created, "D5: a call was counted with the switch unset");
+            return outcome;
+        }
+        Require(after.calls == before.calls + 1, "D5: a call was not counted once");
+        if (after.ineligible[eligible] == before.ineligible[eligible]) {
+            outcome.seen = Seen::Ineligible;
+            return outcome;
+        }
+        std::size_t misses = 0;
+        for (std::size_t i = 0; i < DepthViewIndex(DepthViewMiss::Count); ++i) {
+            if (after.misses[i] == before.misses[i]) continue;
+            Require(after.misses[i] == before.misses[i] + 1 && misses++ == 0, "D5: a call missed more than once");
+            outcome.miss = static_cast<DepthViewMiss>(i);
+        }
+        for (std::size_t i = 0; i < 4; ++i) Require(after.raced[i] == before.raced[i], "D5 =2: a prediction raced in a single-threaded test");
+        Require(after.predicted - before.predicted == after.verified - before.verified, "D5 =2: a predicted hit was not verified");
+        if (mode == 1) Require(after.predicted == before.predicted && after.verified == before.verified, "D5 =1: a call predicted");
+        if (mode == 2) Require(after.hits == before.hits && after.renewed == before.renewed, "D5 =2: a lease answered a call");
+        const bool answered = mode == 1 ? after.hits == before.hits + 1 && after.renewed == before.renewed + 1 : after.verified == before.verified + 1;
+        Require(answered != (misses == 1), "D5: an eligible call was neither answered nor missed once");
+        outcome.seen = answered ? Seen::Answered : Seen::Missed;
+        return outcome;
+    };
+    // Today's state after a call (all modes). With `synced`, only what a sync leaves the same.
+    const auto checkState = [&](const DepthTarget& target, DepthViewRoute route, bool synced, const std::string& what) {
+        const auto state = DepthViewLeaseProbe(context, target);
+        Require(state.found && !state.units.empty() && std::all_of(state.units.begin(), state.units.end(), [&](std::uint64_t unit) { return unit == state.units[0]; }), "D5 state: " + what + ": no surface, or its units differ");
+        Require(state.staleCount == state.units.size() && state.staleUnits == state.units.size() && state.stalePlaneListed && state.pendingClear == 0 && !state.retired, "D5 state: " + what + ": a unit not stale, the plane not listed, a pending clear left or the surface retired");
+        if (synced) return;
+        const auto generation = TrackerGeneration();
+        Require(state.units[0] == generation && state.depthMemory == generation && state.stencilMemory == (target.stencilAddress != 0 ? generation : 0), "D5 state: " + what + ": the units (" + std::to_string(state.units[0]) + "), depth memory (" + std::to_string(state.depthMemory) + ") or stencil memory (" + std::to_string(state.stencilMemory) + ") are not the tracker generation " + std::to_string(generation));
+        if (route == DepthViewRoute::Pending) Require(state.htileRead && state.htileReadValue == generation, "D5 state: " + what + ": the pending route's read proof is not the tracker generation");
+        if (route == DepthViewRoute::NotPending) Require(state.htileRead && state.htileReadValue != 0 && UnchangedSince(target.htileAddress, htileBytes, state.htileReadValue), "D5 state: " + what + ": the not-pending route's read proof is missing or stamped");
+    };
+    struct Expected {
+        bool answered;
+        DepthViewMiss miss;
+    };
+    const Expected hit{true, DepthViewMiss::Count};
+    const auto missing = [](DepthViewMiss miss) { return Expected{false, miss}; };
+    const auto keyMiss = [](DepthViewMiss miss) { return miss == DepthViewMiss::Epoch || miss == DepthViewMiss::Allocations || miss == DepthViewMiss::Unwatch; };
+    const auto matches = [](const Outcome& outcome, const Expected& expected) { return expected.answered ? outcome.seen == Seen::Answered : outcome.seen == Seen::Missed && outcome.miss == expected.miss; };
+    const auto none = [] {};
+    // One call of `target` after `action`, expected to give `expected` at 1 and 2. A call that missed by
+    // a memo key move the step did not ask for is renewed and tried again, action included.
+    const auto step = [&](const DepthTarget& target, DepthViewRoute route, auto&& action, Expected expected, const std::string& what, bool synced = false) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            action();
+            const auto outcome = call(target, true);
+            checkState(target, route, synced, what);
+            if (mode == 0) return;
+            if (matches(outcome, expected)) return;
+            Require(outcome.seen == Seen::Missed && keyMiss(outcome.miss) && (expected.answered || !keyMiss(expected.miss)), "D5: " + what + ": " + describe(outcome) + " where " + (expected.answered ? std::string("an answer") : std::string("a miss (") + DepthViewMissName(expected.miss) + ")") + " was expected");
+            static_cast<void>(call(target, true));
+            checkState(target, route, synced, what + " (renewed)");
+        }
+        throw std::runtime_error("D5: " + what + ": the collect memo key kept moving by itself");
+    };
+    // Calls until one is answered (at 0: one call).
+    const auto establish = [&](const DepthTarget& target, DepthViewRoute route, const std::string& what) {
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const auto outcome = call(target, true);
+            checkState(target, route, false, what);
+            if (mode == 0 || outcome.seen == Seen::Answered) return;
+        }
+        Require(false, "D5: " + what + ": no call was answered");
+    };
+
+    settle();
+    BumpCollectEpoch();
+    const bool keyed = CurrentCollectMemoKey().Valid();
+    const auto start = DepthViewLeaseTotals();
+    const auto startCounter = DepthLeaseTotals();
+    if (!keyed) {
+        for (const auto* target : {&a, &p, &n, &u}) {
+            const auto outcome = call(*target, false);
+            if (mode != 0) Require(outcome.seen == Seen::Ineligible, "D5: a call without a collect memo key was eligible");
+        }
+        const auto now = DepthViewLeaseTotals();
+        if (mode != 0) Require(now.ineligible[DepthViewIndex(DepthViewIneligible::NoMemoKey)] == start.ineligible[DepthViewIndex(DepthViewIneligible::NoMemoKey)] + 4 && now.hits == start.hits && now.created == start.created, "D5: calls without a collect memo key were not ineligible for that reason");
+        settle();
+        std::cout << "depth view lease tests passed (" << (mode == 0 ? "switch unset, " : "") << "no collect memo key: every call ineligible)\n";
+        return true;
+    }
+
+    // Each target's first call creates its surface, the next makes its lease (with the HTILE routes:
+    // pending, not pending, not accessible, none), and the next is answered.
+    recorder.NotePendingWordFill(p.htileAddress, htileBytes, 0xffffffffu);
+    bool stencil = true;
+    struct Target {
+        const DepthTarget* target;
+        DepthViewRoute route;
+        const char* name;
+    };
+    std::vector<Target> targets{{&a, DepthViewRoute::NotPending, "A"}, {&p, DepthViewRoute::Pending, "P"}, {&s, DepthViewRoute::NoHtile, "S"}, {&s2, DepthViewRoute::NoHtile, "S2"}, {&n, DepthViewRoute::NotAccessible, "N"}, {&u, DepthViewRoute::NoHtile, "U"}, {&m, DepthViewRoute::NotPending, "M"}, {&w, DepthViewRoute::NoHtile, "W"}, {&g, DepthViewRoute::NoHtile, "G"}, {&h, DepthViewRoute::NoHtile, "H"}};
+    for (auto it = targets.begin(); it != targets.end();) {
+        Outcome outcome;
+        try {
+            outcome = call(*it->target, true);
+        } catch (const std::exception& error) {
+            // A D32S8 surface the device cannot make (the stencil cases are then not tested).
+            Require(it->target == &s || it->target == &s2, std::string("D5: the first call of ") + it->name + " threw: " + error.what());
+            std::cout << "D5: the D32S8 surface could not be made here (" << error.what() << "): the stencil cases not tested\n";
+            stencil = false;
+            it = targets.erase(it);
+            continue;
+        }
+        checkState(*it->target, it->route, false, std::string("the first call of ") + it->name);
+        if (mode != 0) Require(outcome.seen == Seen::Missed && outcome.miss == DepthViewMiss::NoLease && outcome.after.refusals[DepthViewIndex(DepthViewRefusal::Created)] == outcome.before.refusals[DepthViewIndex(DepthViewRefusal::Created)] + 1, std::string("D5: the first call of ") + it->name + " (" + describe(outcome) + ") was not refused as a creation");
+        ++it;
+    }
+    if (!stencil) targets.erase(std::remove_if(targets.begin(), targets.end(), [&](const Target& target) { return target.target == &s || target.target == &s2; }), targets.end());
+    for (const auto& target : targets) {
+        const auto before = DepthViewLeaseTotals();
+        establish(*target.target, target.route, std::string("the lease of ") + target.name);
+        if (mode != 0) Require(DepthViewLeaseTotals().created > before.created, std::string("D5: no lease was made for ") + target.name);
+    }
+    if (mode != 0) {
+        const auto now = DepthViewLeaseTotals();
+        for (const auto route : {DepthViewRoute::NoHtile, DepthViewRoute::NotAccessible, DepthViewRoute::NotPending, DepthViewRoute::Pending}) {
+            const auto index = DepthViewIndex(route);
+            Require(mode == 1 ? now.hitRoutes[index] > start.hitRoutes[index] : now.verified > start.verified, std::string("D5: no call on the ") + DepthViewRouteName(route) + " route was answered");
+        }
+        Require(now.verdicts[DepthViewIndex(HtileVerdictKind::PendingCovered)] > start.verdicts[DepthViewIndex(HtileVerdictKind::PendingCovered)] && now.verdicts[DepthViewIndex(HtileVerdictKind::NotAccessible)] > start.verdicts[DepthViewIndex(HtileVerdictKind::NotAccessible)], "D5: the full paths' verdicts were not counted");
+    }
+    // A2 resolves to A's surface (sameSurface does not compare the HTILE): no surface is created.
+    {
+        const auto first = call(a2, true);
+        checkState(a2, DepthViewRoute::NotPending, false, "the first call of A2");
+        if (mode != 0) Require(first.seen == Seen::Missed && first.miss == DepthViewMiss::NoLease && first.after.created == first.before.created + 1, "D5: the first call of A2 (on A's surface) did not make its lease");
+        step(a2, DepthViewRoute::NotPending, none, hit, "the second call of A2");
+    }
+
+    // A store over the stencil plane: nothing a hit skips reads it.
+    if (stencil) {
+        establish(s, DepthViewRoute::NoHtile, "S before a stencil store");
+        step(s, DepthViewRoute::NoHtile, [&] { MarkWritten(s.stencilAddress + 4096, 64); }, hit, "a store over the stencil plane");
+    }
+    // An HTILE clear over P's pending HTILE: the live fast clear records it.
+    {
+        establish(p, DepthViewRoute::Pending, "P before an HTILE clear");
+        NoteHtileDepthClear(p.htileAddress, htileBytes);
+        Require((DepthViewLeaseProbe(context, p).pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, "D5: an HTILE clear over P left no pending clear");
+        step(p, DepthViewRoute::Pending, none, hit, "an HTILE clear over the pending route's HTILE");
+    }
+    // A's HTILE: a store, then a GPU fill noted (A turns pending), then the reap (P's fill too).
+    establish(a, DepthViewRoute::NotPending, "A before an HTILE store");
+    step(a, DepthViewRoute::NotPending, [&] { MarkWritten(a.htileAddress, 4); }, missing(DepthViewMiss::HtileStamped), "a store over the not-pending HTILE");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the HTILE store");
+    step(a, DepthViewRoute::Pending, [&] { recorder.NotePendingWordFill(a.htileAddress, htileBytes, 0xffffffffu); }, missing(DepthViewMiss::HtileNote), "a GPU fill noted over the not-pending HTILE");
+    step(a, DepthViewRoute::Pending, none, hit, "the call after the noted fill (pending)");
+    step(a, DepthViewRoute::NotPending, settle, missing(DepthViewMiss::Reaped), "the batch of the pending fill finished");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the reap");
+    step(p, DepthViewRoute::NotPending, none, missing(DepthViewMiss::Reaped), "P's pending fill finished");
+    step(p, DepthViewRoute::NotPending, none, hit, "P's call after the reap");
+    // A reap on the not-pending route revokes nothing (a reap that stamps one of A's ranges is said).
+    {
+        establish(a, DepthViewRoute::NotPending, "A before a reap");
+        settle();
+        const auto outcome = call(a, true);
+        checkState(a, DepthViewRoute::NotPending, false, "the call after a reap (not pending)");
+        if (mode != 0 && outcome.seen != Seen::Answered) {
+            Require(outcome.seen == Seen::Missed && (outcome.miss == DepthViewMiss::PlaneStamped || outcome.miss == DepthViewMiss::HtileStamped || keyMiss(outcome.miss)), "D5: a reap on the not-pending route: " + describe(outcome));
+            std::cout << "D5: the reap stamped or moved the memo key over A (" << describe(outcome) << ")\n";
+        }
+    }
+    // HTILE clears and fills over A and A2.
+    establish(a, DepthViewRoute::NotPending, "A before an HTILE clear");
+    step(a, DepthViewRoute::NotPending, [&] { NoteHtileDepthClear(a.htileAddress, htileBytes); }, missing(DepthViewMiss::HtileReadProofMoved), "an HTILE clear over the not-pending HTILE (its surface's)");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the HTILE clear");
+    establish(a2, DepthViewRoute::NotPending, "A2 before an HTILE clear");
+    step(a2, DepthViewRoute::NotPending, [&] { NoteHtileDepthClear(a2.htileAddress, htileBytes); }, missing(DepthViewMiss::ClearedHtile), "an HTILE clear no resident surface covers");
+    step(a2, DepthViewRoute::NotPending, none, missing(DepthViewMiss::NoLease), "the call after the cleared HTILE was taken (refused)");
+    step(a2, DepthViewRoute::NotPending, none, hit, "the call after the lease was made again");
+    establish(a, DepthViewRoute::NotPending, "A before an HTILE fill");
+    step(a, DepthViewRoute::NotPending, [&] { NoteDepthMetadataFill(a.htileAddress, htileBytes, 0xffffffffu); }, missing(DepthViewMiss::HtileReadProofMoved), "a metadata fill over the not-pending HTILE");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the HTILE fill");
+    step(a, DepthViewRoute::NotPending, [&] {
+        NoteDepthMetadataFill(a.address, static_cast<std::size_t>(DepthSliceBytes(extent, 4u)), 0x3f800000u);
+        Require((DepthViewLeaseProbe(context, a).pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, "D5: a plane fill over A left no pending clear");
+    }, hit, "a metadata fill over the depth plane (the live fast clear applies it)");
+    // Another target binding S's depth plane: the live takePlanes copies it back.
+    if (stencil) {
+        establish(s, DepthViewRoute::NoHtile, "S before S2 binds its plane");
+        step(s, DepthViewRoute::NoHtile, [&] {
+            static_cast<void>(call(s2, true));
+            checkState(s2, DepthViewRoute::NoHtile, false, "S2 binding S's plane");
+        }, hit, "another target binding the same depth plane");
+    }
+    // M's units: half of them stored at an older generation with no store over the plane since (a hit,
+    // as today does not sync), then with a store in another unit since (a miss: the plane row is
+    // stricter than today, which syncs nothing either).
+    {
+        establish(m, DepthViewRoute::NotPending, "M before a NoteStored");
+        const auto older = TrackerGeneration();
+        MarkWritten(elsewhere, 16);
+        MarkWritten(elsewhere + 4096, 16);
+        establish(m, DepthViewRoute::NotPending, "M after stores elsewhere");
+        const auto units = DepthViewLeaseProbe(context, m).units.size();
+        Require(units >= 2, "D5 fixture: M has one unit");
+        step(m, DepthViewRoute::NotPending, [&] { Require(DepthSurfaceNoteStoredForTest(context, m, older, units / 2), "D5: M has no surface"); }, hit, "half of M's units stored at an older generation with no store since");
+        const auto olderAgain = TrackerGeneration();
+        step(m, DepthViewRoute::NotPending, [&] {
+            MarkWritten(m.address + (units - 1) * block + 100, 16);
+            Require(DepthSurfaceNoteStoredForTest(context, m, TrackerGeneration()), "D5: M has no surface");
+        }, hit, "a store in M's last unit, then every unit stored after it");
+        step(m, DepthViewRoute::NotPending, [&] { Require(DepthSurfaceNoteStoredForTest(context, m, olderAgain, units / 2), "D5: M has no surface"); }, missing(DepthViewMiss::PlaneStamped), "half of M's units stored before a store in its last unit");
+        Require(!DepthViewLeaseProbe(context, m).mirrored, "D5: today synced M, whose changed units are none");
+        step(m, DepthViewRoute::NotPending, none, hit, "M's call after the units were assigned again");
+    }
+    // A retire, an epoch bump and a new target's surface.
+    establish(a, DepthViewRoute::NotPending, "A before a retire");
+    step(a, DepthViewRoute::NotPending, [&] { RetireDepthSurfaces(context.device, a.address, block); }, missing(DepthViewMiss::Retired), "the surface retired");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the un-retire");
+    step(a, DepthViewRoute::NotPending, [] { BumpCollectEpoch(); }, missing(DepthViewMiss::Epoch), "an epoch bump");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the epoch bump");
+    step(a, DepthViewRoute::NotPending, [&] {
+        static_cast<void>(call(b, true));
+        checkState(b, DepthViewRoute::NoHtile, false, "a new target's first call");
+    }, missing(DepthViewMiss::Surfaces), "a new target's surface created");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the new surface");
+    establish(n, DepthViewRoute::NotAccessible, "N, the not-accessible route");
+
+    // The cases that sync, each on its own target. After its sync a target's next calls are answered
+    // again, unless the sync's upload left its plane compared rather than watched (no proof).
+    const auto afterSync = [&](const DepthTarget& target, const std::string& what) {
+        if (Watched(target.address, planeBytes(target))) {
+            establish(target, DepthViewRoute::NoHtile, what + ": the calls after the sync");
+            return;
+        }
+        std::cout << "D5: " << what << ": the sync's upload left the plane compared, not watched; its later calls are not answered\n";
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const auto outcome = call(target, true);
+            checkState(target, DepthViewRoute::NoHtile, true, what + ": a call after the sync");
+            if (mode != 0) Require(outcome.seen != Seen::Answered, "D5: " + what + ": a plane without a proof was answered");
+        }
+    };
+    {
+        establish(w, DepthViewRoute::NoHtile, "W before a store over its plane");
+        Require(!DepthViewLeaseProbe(context, w).mirrored, "D5 fixture: W synced before its store");
+        step(w, DepthViewRoute::NoHtile, [&] { MarkWritten(w.address + 4096, 64); }, missing(DepthViewMiss::PlaneStamped), "a store over the depth plane", true);
+        Require(DepthViewLeaseProbe(context, w).mirrored, "D5: today did not sync W's stamped plane");
+        afterSync(w, "W");
+    }
+    {
+        establish(u, DepthViewRoute::NoHtile, "U before a store in front of its plane");
+        try {
+            step(u, DepthViewRoute::NoHtile, [&] { MarkWritten(at(9) + 100, 16); }, missing(DepthViewMiss::PlaneStamped), "a store in front of the unaligned plane in its first block", true);
+            Require(DepthViewLeaseProbe(context, u).mirrored, "D5: today did not sync U, whose first block was stamped");
+            afterSync(u, "U");
+        } catch (const std::exception& error) {
+            if (std::string_view(error.what()).starts_with("D5")) throw;
+            std::cout << "D5: the unaligned plane's mirror could not be made here (" << error.what() << "): its sync not tested\n";
+        }
+    }
+    {
+        // The refutation's gap (GPU-OWNED-PLAN 11.2 row 1): a store over G's plane after `older`, the
+        // units raised past it (as a plane store's NoteStored raises them), G answered, then the units
+        // set back to `older`: the lease reads the live oldest generation, so G misses and today syncs.
+        establish(g, DepthViewRoute::NoHtile, "G before the gap");
+        const auto older = TrackerGeneration();
+        step(g, DepthViewRoute::NoHtile, [&] {
+            MarkWritten(g.address + 4096, 64);
+            Require(DepthSurfaceNoteStoredForTest(context, g, TrackerGeneration()), "D5: G has no surface");
+        }, hit, "G's units raised past a store over its plane");
+        step(g, DepthViewRoute::NoHtile, none, hit, "G's call after its units were raised");
+        Require(!DepthViewLeaseProbe(context, g).mirrored, "D5: today synced G before its units went back");
+        step(g, DepthViewRoute::NoHtile, [&] { Require(DepthSurfaceNoteStoredForTest(context, g, older), "D5: G has no surface"); }, missing(DepthViewMiss::PlaneStamped), "G's units set back below the store (the refutation's gap)", true);
+        Require(DepthViewLeaseProbe(context, g).mirrored, "D5: today's re-sync did not run after G's units went back");
+        afterSync(g, "G");
+    }
+    {
+        // A host write over H's plane that ended unstamped (queued for the next tracker lock holder, as
+        // under APS5_EXPERIMENT_HOST_WRITE_STAMPS=1; the hook installed here): =1's draining lock stamps
+        // it, a stamped plane; =2's prediction takes no drain, a miss of its own; today syncs.
+        establish(h, DepthViewRoute::NoHtile, "H before a host write");
+        struct HostWriteHook {
+            HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&note); }
+            ~HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr); }
+            HostWriteHook(const HostWriteHook&) = delete;
+            HostWriteHook& operator=(const HostWriteHook&) = delete;
+            static void note(std::uintptr_t address, std::size_t bytes) { AgcDriver::GuestMemory::NoteHostWrite(address, bytes); }
+        } hook;
+        collect(h);
+        {
+            auto* bytesOver = reinterpret_cast<std::uint8_t*>(h.address + 4096);
+            const GuestArena::HostWrite write(bytesOver, 16);
+            Require(write.Open(), "D5: the host write did not open");
+            std::memset(bytesOver, 0x66, 16);
+        }
+        const auto outcome = call(h, false);
+        checkState(h, DepthViewRoute::NoHtile, true, "a host write over the depth plane");
+        if (mode != 0) Require(matches(outcome, missing(mode == 1 ? DepthViewMiss::PlaneStamped : DepthViewMiss::HostWritesPending)), "D5: a host write over the depth plane: " + describe(outcome));
+        Require(DepthViewLeaseProbe(context, h).mirrored, "D5: today did not sync H after the host write");
+        afterSync(h, "H");
+    }
+    // ClearDepthSurfaces (the device teardown's, after the batch finished): every lease misses; the
+    // call that creates the surface again is refused, the next makes the lease.
+    step(a, DepthViewRoute::NotPending, [&] {
+        settle();
+        ClearDepthSurfaces(context.device);
+    }, missing(DepthViewMiss::Surfaces), "the surfaces cleared");
+    step(a, DepthViewRoute::NotPending, none, missing(DepthViewMiss::NoLease), "the call after the surface was created again (refused)");
+    step(a, DepthViewRoute::NotPending, none, hit, "the call after the lease was made again");
+
+    const auto end = DepthViewLeaseTotals();
+    const auto counter = DepthLeaseTotals();
+    if (mode == 0) Require(end.calls == start.calls && end.hits == start.hits && end.created == start.created && end.predicted == start.predicted, "D5: calls were counted with the switch unset");
+    if (mode == 0 && profiling) Require(counter.calls > startCounter.calls, "D5: D5-0 counted nothing while profiling with the switch unset");
+    if (mode != 0 && profiling) Require(counter.calls == startCounter.calls, "D5: D5-0 counted while the switch is set");
+    if (mode == 1) Require(end.hits > start.hits && end.renewed > start.renewed && end.predicted == start.predicted && end.verified == start.verified, "D5 =1: no hit, or a prediction");
+    if (mode == 2) Require(end.hits == start.hits && end.predicted > start.predicted && end.verified - start.verified == end.predicted - start.predicted, "D5 =2: a hit, no prediction, or a prediction not verified");
+    for (std::size_t i = 0; i < 4; ++i) Require(end.raced[i] == start.raced[i], "D5: a call raced in a single-threaded test");
+    settle();
+    std::cout << "depth view lease tests passed (APS5_EXPERIMENT_DEPTH_LEASES=" << mode << ")\n";
+    return true;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -13133,6 +13815,12 @@ int main(int argc, char** argv) {
         // classification and counts, without a device.
         if (argc == 2 && std::string_view(argv[1]) == "--depth-lease-classify-only") {
             depthLeaseClassifyTests();
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (b)): =2's classification of
+        // a verified DepthSurfaceView call, without a device.
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-view-lease-classify-only") {
+            depthViewLeaseClassifyTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
@@ -13286,6 +13974,16 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--depth-lease-only") {
             if (!depthLeaseCounterTests(device, recorder)) {
                 std::cout << "skipped, the device watches no memory for the depth lease counter\n";
+                return 77;
+            }
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (c)): DepthSurfaceView leases
+        // over real calls, the mode and the memo key as the environment sets them up; skipped (77) only
+        // without write watching.
+        if (argc == 2 && std::string_view(argv[1]) == "--depth-view-lease-only") {
+            if (!depthViewLeaseTests(device, recorder)) {
+                std::cout << "skipped, the device watches no memory for the depth view leases\n";
                 return 77;
             }
             return 0;
@@ -13581,6 +14279,8 @@ int main(int argc, char** argv) {
         depthSurfaceProofTests(device, recorder);
         depthLeaseClassifyTests();
         static_cast<void>(depthLeaseCounterTests(device, recorder));
+        depthViewLeaseClassifyTests();
+        static_cast<void>(depthViewLeaseTests(device, recorder));
         multisampleGuestAccessTests(device, recorder);
         tiledResolveTests(device, recorder);
         fmaskDecompressMsaaTests(device, recorder);

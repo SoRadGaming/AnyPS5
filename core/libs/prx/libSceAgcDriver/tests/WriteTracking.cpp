@@ -1892,7 +1892,12 @@ void CheckHostWriteLockOrder() {
 // 9.5 D5-0): with a report, the answer is the same and each row's is UnchangedSince's or
 // StoredOver's (unproven where the row has no proof: unwatched, generation 0 or empty); without the
 // drain the queued host write is reported pending (with its row held), and with it not (its row
-// stamped).
+// stamped). LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (a)): a not-written
+// row is !WrittenSince on the same random rows (unproven where WrittenSince's guards fail), also after
+// the other rows in one lock; a store in front of an unaligned row in its first block stamps the
+// not-written row but not the unchanged one (sub-block); `memoCurrent` is the next memo-hit collect's
+// answer; TrackerGenerationNoDrain is the generation, left below a queued host write's drain, which a
+// report's lock without the drain reports pending.
 void CheckStampsHold() {
     constexpr std::size_t bytes = 4 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
@@ -1942,6 +1947,23 @@ void CheckStampsHold() {
             Require(answers[i] == expected, "StampsHold's report of an unchanged row disagrees with UnchangedSince");
         }
         Require(answers[unchanged.size()] == (notStoredOver ? StampRow::Held : StampRow::Stamped), "StampsHold's report of a not-stored-over row disagrees with StoredOver");
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (a)): a not-written row
+        // answers !WrittenSince (unproven where WrittenSince's guards fail), alone and after the other
+        // rows in one lock, with the report's answers in their order; `current` and `memoCurrent` are
+        // the tracker generation.
+        const std::span<const UnchangedQuery> notWritten(rows.data() + 1, 1);
+        const auto& written = notWritten[0];
+        const auto writtenExpected = written.generation == 0 || written.bytes == 0 || !Watched(written.address, written.bytes) ? StampRow::Unproven : WrittenSince(written.address, written.bytes, written.generation) ? StampRow::Stamped : StampRow::Held;
+        const bool notWrittenHeld = writtenExpected == StampRow::Held;
+        Require(StampsHold({}, {}, notWritten, true, nullptr, nullptr, nullptr) == notWrittenHeld, "StampsHold's not-written row disagrees with WrittenSince");
+        std::array<StampRow, 5> all{};
+        StampsHoldReport allReport{all};
+        std::uint64_t current = 0;
+        std::uint64_t memoCurrent = 0;
+        Require(StampsHold(unchanged, stored, notWritten, round % 2 == 0, &current, &memoCurrent, &allReport) == (unchangedAll && notStoredOver && notWrittenHeld) && !allReport.hostWritesOver && !allReport.hostWritesPending, "StampsHold with not-written rows answers otherwise than its rows, or reports host writes");
+        Require(all[unchanged.size() + 1] == writtenExpected, "StampsHold's report of a not-written row disagrees with WrittenSince");
+        for (std::size_t i = 0; i < unchanged.size(); ++i) Require(all[i] == answers[i], "StampsHold's report of an unchanged row moved with a not-written row after it");
+        Require(current == memoCurrent && current == TrackerGeneration(), "StampsHold's current or memo-current generation is not the tracker's");
     }
     std::array<std::uint8_t, 64> unwatched{};
     const auto outside = reinterpret_cast<std::uint64_t>(unwatched.data());
@@ -1996,6 +2018,55 @@ void CheckStampsHold() {
         HostWriteBytes(memory + Block + 3 * 4096 - 1, 2, 0x66);
         Require(StampsHold(rows, rows, false, nullptr, &report) && report.hostWritesOver, "a host write queued over a row's last page was not reported over it");
         Require(!StampsHold(rows, {}) && !StampsHold({}, rows), "the drain of a host write over a row's page left the row unchanged");
+    }
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 (a)).
+    {
+        // A driver store in the first 64 KiB block of an unaligned row, in front of it: the unchanged
+        // row holds (rangeUnchanged reads the store's piece, outside the row), the not-written row is
+        // stamped (block-coarse, as WrittenSince, which the DepthSurfaceView lease's plane row mirrors).
+        CollectWritesUncached(base, bytes);
+        const auto generation = TrackerGeneration();
+        MarkWritten(base + Block + 64, 16);
+        const std::array row{UnchangedQuery{base + Block + 4096, 2 * 4096, generation}};
+        std::array<StampRow, 2> answers{};
+        StampsHoldReport report{answers};
+        Require(UnchangedSince(row[0].address, row[0].bytes, generation) && WrittenSince(row[0].address, row[0].bytes, generation), "the sub-block fixture: the store before the row is not a sub-block piece of its first block");
+        Require(!StampsHold(row, {}, row, true, nullptr, nullptr, &report) && answers[0] == StampRow::Held && answers[1] == StampRow::Stamped, "a store in front of an unaligned row in its first block did not stamp the not-written row alone");
+        Require(StampsHold(row, {}, {}, true, nullptr, nullptr, nullptr), "a store in front of an unaligned row stamped its unchanged row");
+    }
+    {
+        // An empty or generation-0 not-written row proves nothing (WrittenSince answers false for it).
+        std::array<StampRow, 1> answer{};
+        StampsHoldReport report{answer};
+        const std::array zeroRow{UnchangedQuery{base, 64, 0}};
+        const std::array emptyRow{UnchangedQuery{base, 0, TrackerGeneration()}};
+        Require(!StampsHold({}, {}, zeroRow, true, nullptr, nullptr, &report) && answer[0] == StampRow::Unproven && !WrittenSince(base, 64, 0), "a generation-0 not-written row is not unproven");
+        Require(!StampsHold({}, {}, emptyRow, false, nullptr, nullptr, &report) && answer[0] == StampRow::Unproven, "an empty not-written row is not unproven");
+    }
+    if (std::getenv("APS5_NO_COLLECT_MEMO") == nullptr) {
+        // `memoCurrent` is what the next memoized collect answers: a collect walks the range once in a
+        // bumped epoch, and the next one is a memo hit (hitGeneration) answering the generation.
+        BumpCollectEpoch();
+        Require(CollectWrites(base, Block) != 0, "the memo-current fixture's collect returned no generation");
+        std::uint64_t current = 0;
+        std::uint64_t memoCurrent = 0;
+        Require(StampsHold({}, {}, {}, true, &current, &memoCurrent, nullptr), "StampsHold without rows did not hold");
+        Require(CollectWrites(base, Block) == memoCurrent && current == memoCurrent, "StampsHold's memo-current generation is not the next memo-hit collect's answer");
+    }
+    {
+        // TrackerGenerationNoDrain is the generation, read without stamping the queued host writes:
+        // with one queued it stays below the draining TrackerGeneration until a lock drains it, and
+        // a report's lock without the drain says one is pending.
+        Require(TrackerGenerationNoDrain() == TrackerGeneration(), "TrackerGenerationNoDrain is not the tracker generation with nothing queued");
+        const HostWriteHookScope hook(&NoteHostWriteHook);
+        const auto before = TrackerGeneration();
+        HostWriteBytes(memory + 3 * Block + 200, 16, 0x66);
+        Require(TrackerGenerationNoDrain() == before, "a queued host write moved TrackerGenerationNoDrain");
+        StampsHoldReport report{};
+        Require(StampsHold({}, {}, {}, false, nullptr, nullptr, &report) && report.hostWritesPending && TrackerGenerationNoDrain() == before, "a StampsHold without the drain did not report the queued host write pending, or drained it");
+        const auto drained = TrackerGeneration();
+        Require(drained > before && TrackerGenerationNoDrain() == drained, "TrackerGeneration did not drain the queued host write, or TrackerGenerationNoDrain did not follow it");
+        Require(StampsHold({}, {}, {}, false, nullptr, nullptr, &report) && !report.hostWritesPending, "a drained host write was still reported pending");
     }
 }
 

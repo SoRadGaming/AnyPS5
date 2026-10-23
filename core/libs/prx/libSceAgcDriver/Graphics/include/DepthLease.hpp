@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the DepthSurfaceView lease counter. No
 // behaviour change: it counts how many DepthSurfaceView calls a lease would have answered. A call is
@@ -128,6 +129,213 @@ private:
     bool active;
     bool previous = false;
 };
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11 D5): DepthSurfaceView leases. Read
+// once: unset or 0 is today exactly (no table, no hook, D5-0 counts as before while profiling); 1 uses
+// the leases; 2 verifies them: a side-effect-free prediction runs first, today's full path always runs
+// and its result is used, and any difference the prediction cannot explain aborts with
+// [depth-lease]. While the switch is set D5-0 counts nothing (its table and time would sit in the
+// measured phase) and [proofs] prints this line instead of its line. Needs APS5_DEBUG_COVERAGE=1:
+// without a collect memo key every call is ineligible. Do not combine with Q0 ticket or receipt verify
+// runs: a hit skips the collects tagged WalkCaller::Depth.
+//
+// A call is eligible when its target is not routed to a native depth owner (so single-sample), its
+// depth plane is mirrorable (D32, swizzle mode Z64KBX), the device's recorder is active and this thread
+// holds the GPU lock, and the thread has a collect memo key. Its lease lives in a per-thread table of
+// 16 sets x 4 ways keyed on the recorder, the device and every DepthTarget field, and holds no
+// generation of any kind: the memo key its creation proved the HTILE, plane, depth and stencil ranges
+// covered under; the surface with the surfaces and released serials it was found under; the HTILE
+// route of today's store-back (no HTILE; not accessible; not pending: no open or in-flight write over
+// it; pending: a pending fill over all of it whose word clears nothing), with the recorder's finished
+// serial and newest write note read at that decision; the plane's and the HTILE's sizes (pure). A hit
+// re-reads every input of the steps it skips live, under the locks those steps take (the GPU lock it
+// holds, the surfaces mutex, htileReads', one tracker lock), builds the plane's not-written row from
+// the surface's live oldest unit generation (so a NoteStored that lowered the units, as
+// FlushDepthPlanes' does after its store, is seen), and writes the values today's steps would write:
+// the HTILE's read proof (pending route), every unit and the depth and stencil memory, from the
+// generations that lock reads. Every per-draw ordering step (takePlanes, the fast clear, written and
+// drawnDepth, the mirror scan, the stale marks) runs live.
+struct Context;
+struct DepthTarget;
+
+int DepthViewLeases();
+
+enum class DepthViewRoute : std::uint8_t { NoHtile, NotAccessible, NotPending, Pending, Count };
+// Where today's HTILE store-back returned (storeBackClearedHtile's verdict): no HTILE; not accessible;
+// not pending and its read proof unchanged; not pending, read by the CPU with nothing cleared; pending,
+// a fill covering it all whose word clears nothing; pending otherwise (a fill not covering it all, or
+// the guest words read); pending with the pending fills switched off; an HTILE clear stored back, or a
+// CPU read that cleared.
+enum class HtileVerdictKind : std::uint8_t { NoHtile, NotAccessible, NotPendingProved, NotPendingRead, PendingCovered, PendingNotCovering, PendingFillsOff, StoredBack, Count };
+enum class DepthViewIneligible : std::uint8_t { Eligible, Native, NotMirrorable, Unlocked, NoMemoKey, Count };
+// A hit's (or prediction's) first failed check, in the order the check runs (GPU-OWNED-PLAN 11.6).
+enum class DepthViewMiss : std::uint8_t { NoLease, Evicted, Epoch, Allocations, Unwatch, Reaped, HtileNote, Accessibility, Surfaces, Retired, ClearedHtile, UnitsResized, NoPlaneProof, HtileReadProofMoved, PlaneUnproven, PlaneStamped, HtileUnproven, HtileStamped, HostWritesPending, Count };
+// Why a full path made no lease (GPU-OWNED-PLAN 11.8), the first that held.
+enum class DepthViewRefusal : std::uint8_t { Created, StoredBackOrClearedTaken, PendingNotCovering, PendingFillsOff, MemoKeyMoved, RecorderChanged, NotCovered, Count };
+// =2: the part of today's call that disagreed with the prediction first (None: verified).
+enum class DepthViewPart : std::uint8_t { None, StoreBack, Identity, Sync, Refresh, Count };
+
+template<typename T>
+constexpr std::size_t DepthViewIndex(T value) {
+    return static_cast<std::size_t>(value);
+}
+
+// Totals since the start, counted while the switch is set (the [proofs] line prints 10 s deltas).
+struct DepthViewLeaseCounts {
+    std::uint64_t calls = 0;
+    std::uint64_t ineligible[DepthViewIndex(DepthViewIneligible::Count)]{};
+    std::uint64_t hits = 0;
+    std::uint64_t hitRoutes[DepthViewIndex(DepthViewRoute::Count)]{};
+    std::uint64_t verdicts[DepthViewIndex(HtileVerdictKind::Count)]{};
+    std::uint64_t created = 0;
+    std::uint64_t renewed = 0;
+    std::uint64_t refusals[DepthViewIndex(DepthViewRefusal::Count)]{};
+    std::uint64_t misses[DepthViewIndex(DepthViewMiss::Count)]{};
+    std::uint64_t evictions = 0;
+    std::uint64_t predicted = 0;
+    std::uint64_t verified = 0;
+    // By the part that disagreed: store-back, identity, sync, refresh.
+    std::uint64_t raced[4]{};
+};
+DepthViewLeaseCounts DepthViewLeaseTotals();
+// The [proofs] line's part while the switch is set (reportProofs, every 10 s): counts since the last call.
+std::string DepthViewLeaseReport();
+const char* DepthViewRouteName(DepthViewRoute route);
+const char* HtileVerdictName(HtileVerdictKind kind);
+const char* DepthViewMissName(DepthViewMiss miss);
+const char* DepthViewRefusalName(DepthViewRefusal refusal);
+const char* DepthViewPartName(DepthViewPart part);
+
+// =2 (GPU-OWNED-PLAN 11.9). What landed after the prediction, read at a part's own point of today's
+// call, before that part's own actions. Recorder serials are never evidence: the GPU lock is held for
+// the whole call, so no other thread moves them, and the call's own moves are its own.
+// The store-back part's, read before DS's storeBackClearedHtile (the memo key) and at that function's
+// decision, before any store of its own (from its verdict): its Accessible answer differs from the
+// prediction's; its read-proof lookup (not pending) found another value than the prediction's; its
+// collect answered a generation above the prediction's memo-hit generation.
+struct DepthViewStoreBackEvidence {
+    bool memoMoved = false;
+    bool accessibleDiffers = false;
+    bool foundDiffers = false;
+    bool collectedAbove = false;
+    // Only the evidence that can change today's verdict on the predicted route excuses a store-back
+    // disagreement (the r73 review): not pending, all four (a walk under a moved key or another thread's
+    // stamp fails UnchangedSince, forgetHtileReads moves the lookup, the page protection moves
+    // Accessible); pending, and not accessible, only Accessible (the rest of the verdict is the
+    // recorder's, which no other thread moves while this one holds the GPU lock, and the pending fills
+    // switch, read once: a collect's value is stored, never tested); no HTILE, none (htileAddress is a
+    // key field).
+    bool Explains(DepthViewRoute route) const {
+        if (route == DepthViewRoute::NotPending) return memoMoved || accessibleDiffers || foundDiffers || collectedAbove;
+        if (route == DepthViewRoute::Pending || route == DepthViewRoute::NotAccessible) return accessibleDiffers;
+        return false;
+    }
+};
+// The identity point's (after the surfaces mutex is taken, before takeClearedHtile) and the sync
+// point's (before SyncFromMemory): the memo key moved; the surfaces or released serial moved (then
+// nothing of the predicted surface is read); the predicted surface retired, or its units resized or
+// their oldest generation moved; a cleared HTILE entry covers the target's HTILE; the tracker
+// generation (no drain) is above the prediction's. Each part is excused only by the evidence that can
+// change its own facts (the r73 review; CheckDepthViewPrediction): the identity's (a cleared HTILE
+// taken, the surface created, another or a retired surface found) change only through the surface
+// list, retire and active, and clearedHtiles, all frozen under the surfaces mutex from the identity
+// point on, so only the surfaces serials, retired and a cleared HTILE entry excuse it; the memo key,
+// the units and the clock are printed there, never an excuse.
+struct DepthViewEvidence {
+    bool memoMoved = false;
+    bool surfacesMoved = false;
+    bool retired = false;
+    bool oldestMoved = false;
+    bool clearedHtile = false;
+    bool clockMoved = false;
+    bool ExplainsIdentity() const { return surfacesMoved || retired || clearedHtile; }
+};
+// One verified call: the prediction, today's route and refresh values (read at the call's end, under
+// the surfaces mutex), and the evidence at each part's point.
+struct DepthViewFacts {
+    DepthViewRoute route = DepthViewRoute::NoHtile;
+    bool stencil = false;
+    // The not-pending route's read proof, and the generations the prediction's tracker lock read
+    // (TrackerGeneration's and a memo-hit collect's answers).
+    std::uint64_t h = 0;
+    std::uint64_t current0 = 0;
+    std::uint64_t memoCurrent0 = 0;
+    // Today's store-back: its verdict and return value.
+    HtileVerdictKind verdict = HtileVerdictKind::NoHtile;
+    std::uint32_t htileCleared = 0;
+    DepthViewStoreBackEvidence storeBack;
+    // Today's identity: a cleared HTILE taken, the surface created, the predicted surface found, and
+    // found retired.
+    bool cleared = false;
+    bool created = false;
+    bool sameSurface = true;
+    bool retiredBefore = false;
+    DepthViewEvidence identity;
+    // Today's sync (SyncFromMemory copied the mirror in).
+    bool synced = false;
+    DepthViewEvidence sync;
+    // Read at the call's end, on a synced call only (a disagreement; one tracker lock without the
+    // drain): the plane's not-written row from the prediction's oldest unit generation no longer holds,
+    // so a stamp landed on the plane since the prediction (stamps only rise, so one before today's
+    // WrittenSince is still there). A clock move excuses a sync only with it.
+    bool planeStamped = false;
+    // Today's refresh values: the HTILE's read proof, the lowest and highest unit generation (each
+    // unit holds what WrittenUnits read at its decision), the depth and stencil memory.
+    bool htileReadFound = false;
+    std::uint64_t htileRead = 0;
+    std::uint64_t unitsLow = 0;
+    std::uint64_t unitsHigh = 0;
+    std::uint64_t depthMemory = 0;
+    std::uint64_t stencilMemory = 0;
+};
+struct DepthViewCheck {
+    DepthViewPart part = DepthViewPart::None;
+    bool raced = false;
+    const char* reason = "verified";
+};
+// Pure. The parts in today's order; the first that disagrees decides: raced when the evidence read at
+// its own point names an update since the prediction that can change that part (store-back:
+// DepthViewStoreBackEvidence::Explains for the predicted route; identity: ExplainsIdentity), else an
+// abort (evidence read only at a later point never excuses it). Store-back agrees when the verdict is
+// the predicted route's (pending: pending covered; not pending: not pending proved) and nothing was
+// cleared; identity when no cleared HTILE was taken, nothing created, and the predicted surface was
+// found and not retired; sync when nothing synced, and a sync is raced when the sync point's memo key,
+// surfaces serials or units moved, or when the clock moved (at the sync point, or the units hold a
+// generation above the prediction's: WrittenUnits read it at its own decision) and the plane itself
+// was stamped since the prediction (planeStamped: a clock move elsewhere cannot make WrittenUnits
+// change a unit); refresh when every value equals its prediction (pending: the read proof is
+// the memo-hit generation; not pending: it is the prediction's; no HTILE or not accessible: not
+// checked; every unit the TrackerGeneration answer; depth memory the memo-hit generation; stencil
+// memory that too with a stencil plane, else exactly 0). A refresh value above its prediction is
+// raced (each value is the generation at its own read, and on an agreed route the call makes no
+// tracker update of its own); one below (or a read proof missing, units unequal, a stencil memory
+// without a stencil plane) aborts.
+DepthViewCheck CheckDepthViewPrediction(const DepthViewFacts& facts);
+
+// Test hooks (LOCAL EXPERIMENT). The state of the surface DepthSurfaceView resolves `target` to (the
+// first active surface of the device that sameSurface matches): its unit generations, the HTILE's
+// read proof, the depth and stencil memory, the stale units and whether the plane is in the stale
+// list, the pending clear, written, whether it has a mirror plane (SyncFromMemory made one) and
+// retired.
+struct DepthViewLeaseState {
+    bool found = false;
+    std::vector<std::uint64_t> units;
+    bool htileRead = false;
+    std::uint64_t htileReadValue = 0;
+    std::uint64_t depthMemory = 0;
+    std::uint64_t stencilMemory = 0;
+    std::size_t staleCount = 0;
+    std::size_t staleUnits = 0;
+    bool stalePlaneListed = false;
+    std::uint32_t pendingClear = 0;
+    std::uint64_t written = 0;
+    bool mirrored = false;
+    bool retired = false;
+};
+DepthViewLeaseState DepthViewLeaseProbe(const Context& context, const DepthTarget& target);
+// NoteStored(generation) over the first `units` units (all by default) of that surface, under the
+// surfaces mutex, as FlushDepthPlanes' does after a plane store. False when there is no surface.
+bool DepthSurfaceNoteStoredForTest(const Context& context, const DepthTarget& target, std::uint64_t generation, std::size_t units = static_cast<std::size_t>(-1));
 
 }
 
