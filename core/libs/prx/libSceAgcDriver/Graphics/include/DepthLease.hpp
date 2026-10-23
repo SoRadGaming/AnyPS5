@@ -16,11 +16,17 @@
 // of that target would hit when, since then:
 // - the target resolves to the same surface (identity), under the same memo key;
 // - DepthSurfacesSerial and the un-retire serial (a surface found retired by DepthSurfaceView) held;
-// - planeBinds, the clearedHtiles insert serial and mirrorEpoch held;
+// - planeBinds, the clearedHtiles insert serial and mirrorEpoch held, and no clearedHtiles entry
+//   covering the target's HTILE was left at that end (takeClearedHtile takes one entry per call, so
+//   a second one set before the target's surface existed is taken by its next call, with no insert
+//   in between);
 // - no batch finished (a reap, sync or wait: Recorder::FinishedSerial);
+// - every range has a proof: the depth and stencil planes a nonzero generation from NoteMemory, the
+//   HTILE one from its read proof (htileReads), each still write-watched (a range unwatched, by an
+//   import the tracker compares instead of watching, or an HTILE with no read proof because it is
+//   not accessible, misses as unproven, not as stamped);
 // - nothing stamped the depth or stencil plane since the generations NoteMemory took, nor the HTILE
-//   since the generation its read proof (htileReads) held (GuestMemory::UnchangedSinceAll; an HTILE
-//   with no read proof, which is not accessible, misses as stamped);
+//   since the generation its read proof held (GuestMemory::UnchangedSinceAll);
 // - no write over the HTILE was noted after the newest note at that end (with no batch finished, so
 //   Recorder::NewestWriteNote over the HTILE is unchanged: Recorder::WrittenAfterNote).
 // Otherwise it misses, by the first of those that moved (a memo key move by its cause: the epoch,
@@ -29,9 +35,11 @@
 // call still did work a lease would skip (an HTILE clear stored back, a cleared HTILE taken, the depth
 // mirror synced) is counted too. The checks before the call's own work read state only: one tracker
 // lock (which, under APS5_EXPERIMENT_HOST_WRITE_STAMPS=1, stamps the host writes queued meanwhile, as
-// the call's first collect would a moment later) and the recorder under the GPU lock; at the end one
-// htileReads lookup. Counted on the [proofs] line, with the counter's own time, which the [draws]
-// "prepare" phase carries.
+// the call's first collect would a moment later; a failed stamp test takes more, to name the range)
+// and the recorder under the GPU lock; at the end one htileReads lookup and a walk of clearedHtiles
+// (normally empty). Counted on the [proofs] line, with the counter's own time, summed apart by the
+// [draws] phase that carries it: "prepare" for Draw's call, "readTarget" for DrawWithRecipe's
+// (DepthLeaseRecipeScope).
 namespace AgcDriver::Graphics {
 
 // The state an eligible call leaves (its end) and the next call of the target reads at its start.
@@ -48,10 +56,13 @@ struct DepthLeaseMark {
     std::uint64_t finished = 0;
     std::uint64_t writeNotes = 0;
     std::uint64_t writeGeneration = 0;
+    // At an end only: a clearedHtiles entry still covers the target's HTILE, so its next call takes
+    // it (that call misses as ClearedHtile).
+    bool clearedHtileLeft = false;
 };
 
 // Would-hit, then the misses in the order they are tested.
-enum class DepthLease : std::uint8_t { WouldHit, NoEntry, Evicted, Identity, Epoch, Allocations, Unwatch, Surfaces, Unretired, PlaneBinds, ClearedHtile, MirrorEpoch, Reaped, StampedDepth, StampedStencil, StampedHtile, HtileNote, Count };
+enum class DepthLease : std::uint8_t { WouldHit, NoEntry, Evicted, Identity, Epoch, Allocations, Unwatch, Surfaces, Unretired, PlaneBinds, ClearedHtile, MirrorEpoch, Reaped, Unproven, StampedDepth, StampedStencil, StampedHtile, HtileNote, Count };
 
 struct DepthLeaseVerdict {
     DepthLease outcome = DepthLease::WouldHit;
@@ -59,9 +70,9 @@ struct DepthLeaseVerdict {
 };
 
 // The first condition that moved from `previous` (an end) to `now` (a start, with the identity of the
-// call's own lookup). `stamped` (StampedDepth, StampedStencil, StampedHtile, or WouldHit for none) and
-// `htileWritten` are read only once the memo key and the finished serial held, where the caller
-// evaluates them.
+// call's own lookup). `stamped` (Unproven, StampedDepth, StampedStencil, StampedHtile, or WouldHit for
+// none; the caller names a range with no proof before a stamp) and `htileWritten` are read only once
+// the memo key and the finished serial held, where the caller evaluates them.
 DepthLeaseVerdict ClassifyDepthLease(const DepthLeaseMark& previous, const DepthLeaseMark& now, DepthLease stamped, bool htileWritten);
 
 // What a call counted as a would-hit still did that a lease would skip (CountDepthLease's `work`).
@@ -81,12 +92,36 @@ struct DepthLeaseCounts {
     std::uint64_t missesWriteGeneration = 0;
     std::uint64_t hitWork[3]{};
     std::uint64_t evictions = 0;
+    // The counter's own time outside DepthLeaseRecipeScope (Draw's call, in the [draws] prepare
+    // phase) and inside it (DrawWithRecipe's, in readTarget).
     std::uint64_t counterNs = 0;
+    std::uint64_t recipeCounterNs = 0;
 };
 DepthLeaseCounts DepthLeaseTotals();
 const char* DepthLeaseName(DepthLease lease);
 // The [proofs] line's part (reportProofs, every 10 s): counts since the last call.
 std::string DepthLeaseReport();
+
+// DrawWithRecipe's DepthSurfaceView call runs inside this scope, active while profiling, so the
+// counter's time there is summed apart (recipeCounterNs): DrawWithRecipe's timer books that call to
+// the [draws] readTarget phase, Draw's to prepare. Inactive, it does nothing. Sets the thread's flag
+// and returns the one before.
+bool DepthLeaseSetInRecipe(bool inside);
+class DepthLeaseRecipeScope {
+public:
+    explicit DepthLeaseRecipeScope(bool enabled) : active(enabled) {
+        if (active) previous = DepthLeaseSetInRecipe(true);
+    }
+    ~DepthLeaseRecipeScope() {
+        if (active) DepthLeaseSetInRecipe(previous);
+    }
+    DepthLeaseRecipeScope(const DepthLeaseRecipeScope&) = delete;
+    DepthLeaseRecipeScope& operator=(const DepthLeaseRecipeScope&) = delete;
+
+private:
+    bool active;
+    bool previous = false;
+};
 
 }
 

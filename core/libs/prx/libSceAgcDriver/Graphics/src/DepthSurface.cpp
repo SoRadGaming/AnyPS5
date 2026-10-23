@@ -1830,11 +1830,20 @@ struct DepthLeaseCounters {
     std::array<std::atomic<std::uint64_t>, 3> hitWork{};
     std::atomic<std::uint64_t> evictions{0};
     std::atomic<std::uint64_t> counterNs{0};
+    std::atomic<std::uint64_t> recipeCounterNs{0};
 };
 constinit DepthLeaseCounters depthLeaseCounters;
 
 void countDepthLease(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
     counter.fetch_add(amount, std::memory_order_relaxed);
+}
+
+// Set by DepthLeaseRecipeScope around DrawWithRecipe's call (trivially destructible): the counter's
+// time there goes to recipeCounterNs, since that timer books the call to readTarget, not prepare.
+thread_local bool depthLeaseInRecipe = false;
+
+void countDepthLeaseNs(std::uint64_t ns) {
+    countDepthLease(depthLeaseInRecipe ? depthLeaseCounters.recipeCounterNs : depthLeaseCounters.counterNs, ns);
 }
 
 // The key holds every DepthTarget field (clearDepth by its bits). A member added by a merge, wherever
@@ -1912,8 +1921,9 @@ std::uint64_t depthLeaseNs(std::chrono::steady_clock::time_point start) {
 }
 
 // Reads only: the memo key, the recorder under the GPU lock (eligibility requires it held) and, while
-// the memo key and the finished serial held, one tracker lock for the stamps (UnchangedSince again
-// per plane only to name a stamped one) and the HTILE's newer writes.
+// the memo key and the finished serial held, one tracker lock for the stamps (none when a range has
+// no generation; after a failed test, Watched and then UnchangedSince per range only to name the
+// range: unproven before stamped) and the HTILE's newer writes.
 void depthLeaseStart(DepthLeaseUse& use, const Context& context, const DepthTarget& target, bool native) {
     const auto start = std::chrono::steady_clock::now();
     use.recorder = RecorderFor(context);
@@ -1942,16 +1952,29 @@ void depthLeaseStart(DepthLeaseUse& use, const Context& context, const DepthTarg
     if (use.found && use.now.memo == use.previous.memo && use.now.finished == use.previous.finished) {
         std::array<GuestMemory::UnchangedQuery, 3> queries{};
         std::size_t count = 0;
+        bool unproven = false;
         for (const auto& range : use.ranges) {
-            if (range.bytes != 0) queries[count++] = range;
+            if (range.bytes == 0) continue;
+            queries[count++] = range;
+            if (range.generation == 0) unproven = true;
         }
-        if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), count))) {
-            use.stamped = DepthLease::StampedHtile;
-            for (std::size_t plane = 0; plane < 2; ++plane) {
-                const auto& range = use.ranges[plane];
-                if (range.bytes == 0 || GuestMemory::UnchangedSince(range.address, range.bytes, range.generation)) continue;
-                use.stamped = plane == 0 ? DepthLease::StampedDepth : DepthLease::StampedStencil;
-                break;
+        const std::span proved(queries.data(), count);
+        // UnchangedSinceAll also fails on a range with no proof (generation 0, or no longer covered by
+        // the tracker, as after an import unwatched it), which no stamp moved: such a range misses as
+        // unproven, named before a stamp.
+        if (unproven) {
+            use.stamped = DepthLease::Unproven;
+        } else if (!GuestMemory::UnchangedSinceAll(proved)) {
+            if (std::ranges::any_of(proved, [](const GuestMemory::UnchangedQuery& range) { return !GuestMemory::Watched(range.address, range.bytes); })) {
+                use.stamped = DepthLease::Unproven;
+            } else {
+                use.stamped = DepthLease::StampedHtile;
+                for (std::size_t plane = 0; plane < 2; ++plane) {
+                    const auto& range = use.ranges[plane];
+                    if (range.bytes == 0 || GuestMemory::UnchangedSince(range.address, range.bytes, range.generation)) continue;
+                    use.stamped = plane == 0 ? DepthLease::StampedDepth : DepthLease::StampedStencil;
+                    break;
+                }
             }
         } else if (use.recorder != nullptr && use.ranges[2].bytes != 0) {
             use.htileWritten = use.recorder->WrittenAfterNote(use.ranges[2].address, use.ranges[2].bytes, use.previous.writeNotes);
@@ -1985,7 +2008,7 @@ void depthLeaseEnd(DepthLeaseUse& use, const Context& context, const DepthTarget
     countDepthLease(counters.calls);
     countDepthLease(counters.ineligible[use.ineligible]);
     if (use.ineligible != DepthLeaseEligible) {
-        countDepthLease(counters.counterNs, use.ns + depthLeaseNs(start));
+        countDepthLeaseNs(use.ns + depthLeaseNs(start));
         return;
     }
     if (!use.found) {
@@ -2006,6 +2029,12 @@ void depthLeaseEnd(DepthLeaseUse& use, const Context& context, const DepthTarget
     mark.finished = use.recorder != nullptr ? use.recorder->FinishedSerial() : 0;
     mark.writeNotes = use.recorder != nullptr ? use.recorder->WriteNotes() : 0;
     mark.writeGeneration = Recorder::WriteGeneration();
+    // takeClearedHtile took at most one covering entry; another left (inserted before this end, so the
+    // insert serial will not move for it) is taken by the next call. The map is normally empty.
+    if (target.htileAddress != 0) {
+        const auto& cleared = clearedHtiles();
+        mark.clearedHtileLeft = std::any_of(cleared.begin(), cleared.end(), [&](const auto& entry) { return HtileFillCovers(target.htileAddress, target.extent, entry.first, entry.second); });
+    }
     const auto noted = surface.NotedMemory();
     std::array<GuestMemory::UnchangedQuery, 3> ranges{noted[0], noted[1], GuestMemory::UnchangedQuery{0, 0, 0}};
     if (target.htileAddress != 0) {
@@ -2040,8 +2069,14 @@ void depthLeaseEnd(DepthLeaseUse& use, const Context& context, const DepthTarget
     entry->mark = mark;
     entry->ranges = ranges;
     entry->used = ++table.tick;
-    countDepthLease(counters.counterNs, use.ns + depthLeaseNs(start));
+    countDepthLeaseNs(use.ns + depthLeaseNs(start));
 }
+}
+
+bool DepthLeaseSetInRecipe(bool inside) {
+    const bool previous = depthLeaseInRecipe;
+    depthLeaseInRecipe = inside;
+    return previous;
 }
 
 DepthLeaseVerdict ClassifyDepthLease(const DepthLeaseMark& previous, const DepthLeaseMark& now, DepthLease stamped, bool htileWritten) {
@@ -2055,7 +2090,7 @@ DepthLeaseVerdict ClassifyDepthLease(const DepthLeaseMark& previous, const Depth
     else if (now.surfaces != previous.surfaces) outcome = DepthLease::Surfaces;
     else if (now.unretired != previous.unretired) outcome = DepthLease::Unretired;
     else if (now.planeBinds != previous.planeBinds) outcome = DepthLease::PlaneBinds;
-    else if (now.clearedHtiles != previous.clearedHtiles) outcome = DepthLease::ClearedHtile;
+    else if (now.clearedHtiles != previous.clearedHtiles || previous.clearedHtileLeft) outcome = DepthLease::ClearedHtile;
     else if (now.mirrorEpoch != previous.mirrorEpoch) outcome = DepthLease::MirrorEpoch;
     else if (now.finished != previous.finished) outcome = DepthLease::Reaped;
     else if (stamped != DepthLease::WouldHit) outcome = stamped;
@@ -2088,11 +2123,12 @@ DepthLeaseCounts DepthLeaseTotals() {
     for (std::size_t i = 0; i < 3; ++i) totals.hitWork[i] = load(counters.hitWork[i]);
     totals.evictions = load(counters.evictions);
     totals.counterNs = load(counters.counterNs);
+    totals.recipeCounterNs = load(counters.recipeCounterNs);
     return totals;
 }
 
 const char* DepthLeaseName(DepthLease lease) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DepthLease::Count)> names{"would-hit", "no entry", "evicted by a set conflict", "identity", "memo key moved: epoch", "allocations", "unwatch", "surfaces serial", "un-retired", "plane binds", "cleared HTILE set", "mirror epoch", "reaped", "stamped: depth", "stencil", "HTILE", "HTILE note"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DepthLease::Count)> names{"would-hit", "no entry", "evicted by a set conflict", "identity", "memo key moved: epoch", "allocations", "unwatch", "surfaces serial", "un-retired", "plane binds", "cleared HTILE set or left", "mirror epoch", "reaped", "no proof (unwatched or generation 0)", "stamped: depth", "stencil", "HTILE", "HTILE note"};
     const auto index = static_cast<std::size_t>(lease);
     return index < names.size() ? names[index] : "?";
 }
@@ -2111,7 +2147,8 @@ std::string DepthLeaseReport() {
         std::snprintf(text, sizeof(text), "%s %s %llu", i == 1 ? "" : ",", DepthLeaseName(static_cast<DepthLease>(i)), delta(now.outcomes[i], reported.outcomes[i]));
         line += text;
     }
-    std::snprintf(text, sizeof(text), "; writeGeneration moved in %llu of the classified misses; table evictions %llu; counter time %.1f ms (in the [draws] prepare phase)", delta(now.missesWriteGeneration, reported.missesWriteGeneration), delta(now.evictions, reported.evictions), static_cast<double>(now.counterNs - reported.counterNs) / 1e6);
+    std::snprintf(text, sizeof(text), "; writeGeneration moved in %llu of the classified misses; table evictions %llu; counter time %.1f ms in the [draws] prepare phase (Draw) and %.1f ms in readTarget (DrawWithRecipe)", delta(now.missesWriteGeneration, reported.missesWriteGeneration), delta(now.evictions, reported.evictions), static_cast<double>(now.counterNs - reported.counterNs) / 1e6,
+                  static_cast<double>(now.recipeCounterNs - reported.recipeCounterNs) / 1e6);
     line += text;
     reported = now;
     return line;
