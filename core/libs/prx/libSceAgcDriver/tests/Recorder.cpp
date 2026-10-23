@@ -7874,6 +7874,11 @@ bool targetLeaseDrawTests(const Device& device, Recorder& recorder) {
             std::cout << "lease draws: a depth plane over the target could not be drawn or stored here (" << error.what() << ")\n";
         }
         if (!tested) std::cout << "lease draws: the depth plane case not tested\n";
+        // ClearDepthSurfaces destroys the surfaces' images at once (it is the device teardown's, run
+        // with nothing in flight): the work recorded over the surface (its creation, the slot loop's
+        // plane store) must finish first, or the batch goes to the queue over a destroyed image and
+        // loses the device.
+        recorder.Sync();
         ClearDepthSurfaces(context.device);
         recorder.Sync();
     }
