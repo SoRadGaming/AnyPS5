@@ -1648,6 +1648,11 @@ public:
         if (indexed != version) rebuild();
         return !textures.empty() && Overlaps(ranges, address, bytes);
     }
+    // LOCAL DEBUG (StorageTexture::NothingPendingOver): MayOverlap without the rebuild, so a reader
+    // leaves the index and the snapshot SurelyClear reads as they were; a stale index answers "may".
+    bool MayOverlapIfIndexed(std::uint64_t address, std::size_t bytes) const {
+        return !textures.empty() && (indexed != version || Overlaps(ranges, address, bytes));
+    }
     bool SurelyClear(std::uint64_t address, std::size_t bytes) const {
         const auto current = published.load(std::memory_order_acquire);
         return current != nullptr && current->version == changes.load(std::memory_order_acquire) && !Overlaps(current->ranges, address, bytes);
@@ -5115,10 +5120,17 @@ std::uint64_t StorageTexture::NothingPendingOver(std::uint64_t address, std::siz
         if (over != nullptr) *over = kind;
     };
     const auto serial = PendingSerial();
+    // S = 0 is row P's "no proof" (its skip points take only a non-zero S, REVALIDATE-PLAN 5.2).
+    if (serial == 0) {
+        answer(PendingOver::NoSerial);
+        return 0;
+    }
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        if (pending.textures.MayOverlap(address, bytes)) {
+        // Read-only: a stale index is not rebuilt here (MayOverlap would publish a new snapshot, and
+        // later SurelyClear readers would skip the registry mutex where today they take it).
+        if (pending.textures.MayOverlapIfIndexed(address, bytes)) {
             for (const auto* texture : pending.textures) {
                 if (!texture->overlaps(address, bytes)) continue;
                 answer(PendingOver::Pending);

@@ -82,7 +82,7 @@ std::uint64_t PendingAdditions();
 struct InputLeaseCounts {
     std::uint64_t indexCalls = 0, vertexCalls = 0, inPlace = 0, reused = 0, copied = 0, padding = 0;
     std::uint64_t present = 0, inserted = 0, evicted = 0, withoutGpuMutex = 0;
-    std::uint64_t pMemo = 0, pQuery = 0, pPending = 0, pFlushing = 0, pShadow = 0, pMoved = 0;
+    std::uint64_t pMemo = 0, pQuery = 0, pPending = 0, pFlushing = 0, pShadow = 0, pMoved = 0, pNoSerial = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(PendingAdditionSite::Count)> unlocked{};
     std::uint64_t cWould = 0, cNoKey = 0, cOwner = 0, cEpoch = 0, cUnwatch = 0, cMapping = 0, cNotCovered = 0, cWrong = 0;
     std::uint64_t mWould = 0, mNoLease = 0, mMoved = 0, mWrong = 0;

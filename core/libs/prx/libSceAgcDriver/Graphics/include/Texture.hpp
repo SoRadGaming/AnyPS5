@@ -245,9 +245,11 @@ public:
     // read first, then no image in the registry or flushing overlaps it (stricter than FlushPending:
     // no pending-unit pretest, no Refreshing or `except` exemption), then no live unit shadow does
     // (AnyShadowedOverlaps, after the registry mutex is released), then S again. 0 (no proof) when
-    // something overlaps, S moved meanwhile, or S is still 0; `over`, when given, receives which.
-    // No state changes.
-    enum class PendingOver : std::uint8_t { Nothing, Pending, Flushing, Shadow, Moved };
+    // S is still 0 (NoSerial, nothing scanned), something overlaps (Pending, Flushing, Shadow) or S
+    // moved meanwhile (Moved); `over`, when given, receives which (Nothing with a proof). No state
+    // changes: it takes the registry and shadow mutexes and reads the pending index only while that
+    // is current (a stale one is not rebuilt, so no snapshot is published for SurelyClear).
+    enum class PendingOver : std::uint8_t { Nothing, Pending, Flushing, Shadow, Moved, NoSerial };
     static std::uint64_t NothingPendingOver(std::uint64_t address, std::size_t bytes, PendingOver* over = nullptr);
     // One registry scan for several ranges (the fast Revalidate): each query's `overlaps` receives
     // whether an image other than `except` has results pending, or is being stored right now, over

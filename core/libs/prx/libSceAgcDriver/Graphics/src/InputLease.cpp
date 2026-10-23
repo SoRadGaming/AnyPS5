@@ -19,7 +19,7 @@ constexpr std::size_t AdditionSites = static_cast<std::size_t>(PendingAdditionSi
 struct Counters {
     std::atomic<std::uint64_t> indexCalls{0}, vertexCalls{0}, inPlace{0}, reused{0}, copied{0}, padding{0};
     std::atomic<std::uint64_t> present{0}, inserted{0}, evicted{0}, withoutGpuMutex{0};
-    std::atomic<std::uint64_t> pMemo{0}, pQuery{0}, pPending{0}, pFlushing{0}, pShadow{0}, pMoved{0};
+    std::atomic<std::uint64_t> pMemo{0}, pQuery{0}, pPending{0}, pFlushing{0}, pShadow{0}, pMoved{0}, pNoSerial{0};
     std::array<std::atomic<std::uint64_t>, AdditionSites> unlocked{};
     std::atomic<std::uint64_t> cWould{0}, cNoKey{0}, cOwner{0}, cEpoch{0}, cUnwatch{0}, cMapping{0}, cNotCovered{0}, cWrong{0};
     std::atomic<std::uint64_t> mWould{0}, mNoLease{0}, mMoved{0}, mWrong{0};
@@ -61,6 +61,7 @@ InputLeaseCounts readCounts(Counters& c, Read read) {
     out.pFlushing = read(c.pFlushing);
     out.pShadow = read(c.pShadow);
     out.pMoved = read(c.pMoved);
+    out.pNoSerial = read(c.pNoSerial);
     for (std::size_t site = 0; site < AdditionSites; ++site) out.unlocked[site] = read(c.unlocked[site]);
     out.cWould = read(c.cWould);
     out.cNoKey = read(c.cNoKey);
@@ -107,15 +108,15 @@ void reportInputLeases() {
     const auto serialBumps = serial - c.lastSerial.exchange(serial, std::memory_order_relaxed);
     const auto additions = c.additions.load(std::memory_order_relaxed);
     const auto additionBumps = additions - c.lastAdditions.exchange(additions, std::memory_order_relaxed);
-    const auto pTotal = n.pMemo + n.pQuery + n.pPending + n.pFlushing + n.pShadow + n.pMoved;
+    const auto pTotal = n.pMemo + n.pQuery + n.pPending + n.pFlushing + n.pShadow + n.pMoved + n.pNoSerial;
     const auto cTotal = n.cWould + n.cNoKey + n.cOwner + n.cEpoch + n.cUnwatch + n.cMapping + n.cNotCovered;
     const auto mTotal = n.mWould + n.mNoLease + n.mMoved;
     const double projection = 1.5 * ratio(n.pMemo, pTotal) + 0.85 * ratio(n.pQuery, pTotal) - 0.5 * ratio(n.pPending + n.pFlushing + n.pShadow, pTotal) + 0.4 * ratio(n.cWould, cTotal) + 0.8 * ratio(n.mWould, mTotal) + 0.31 - 0.2;
     using U = unsigned long long;
-    AgcDriver::ProfilePrint_nid_no_patch("[input-lease] (10 s): calls index %llu vertex %llu (in place %llu): reused %llu, copied %llu, padding refusals %llu; probes: present %llu, inserted %llu, evicted %llu, without the GpuMutex %llu; P: memo would-hold %llu, query nothing-over %llu, overlap pending %llu flushing %llu shadow %llu, query refused (serial moved) %llu, PendingSerial bumps %llu, PendingAdditions bumps %llu, U mark %llu lent %llu reconcile %llu shadow %llu; C: would-hold %llu, misses: no key %llu, owner %llu, epoch %llu, unwatch %llu, mapping %llu, not covered %llu; W %llu; M: would-hold %llu, misses: no lease %llu, set serial moved %llu; wrong %llu; held together %llu; projection %.2f points\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[input-lease] (10 s): calls index %llu vertex %llu (in place %llu): reused %llu, copied %llu, padding refusals %llu; probes: present %llu, inserted %llu, evicted %llu, without the GpuMutex %llu; P: memo would-hold %llu, query nothing-over %llu, overlap pending %llu flushing %llu shadow %llu, query refused: serial moved %llu, serial 0 %llu, PendingSerial bumps %llu, PendingAdditions bumps %llu, U mark %llu lent %llu reconcile %llu shadow %llu; C: would-hold %llu, misses: no key %llu, owner %llu, epoch %llu, unwatch %llu, mapping %llu, not covered %llu; W %llu; M: would-hold %llu, misses: no lease %llu, set serial moved %llu; wrong %llu; held together %llu; projection %.2f points\n",
         static_cast<U>(n.indexCalls), static_cast<U>(n.vertexCalls), static_cast<U>(n.inPlace), static_cast<U>(n.reused), static_cast<U>(n.copied), static_cast<U>(n.padding),
         static_cast<U>(n.present), static_cast<U>(n.inserted), static_cast<U>(n.evicted), static_cast<U>(n.withoutGpuMutex),
-        static_cast<U>(n.pMemo), static_cast<U>(n.pQuery), static_cast<U>(n.pPending), static_cast<U>(n.pFlushing), static_cast<U>(n.pShadow), static_cast<U>(n.pMoved), static_cast<U>(serialBumps), static_cast<U>(additionBumps),
+        static_cast<U>(n.pMemo), static_cast<U>(n.pQuery), static_cast<U>(n.pPending), static_cast<U>(n.pFlushing), static_cast<U>(n.pShadow), static_cast<U>(n.pMoved), static_cast<U>(n.pNoSerial), static_cast<U>(serialBumps), static_cast<U>(additionBumps),
         static_cast<U>(n.unlocked[0]), static_cast<U>(n.unlocked[1]), static_cast<U>(n.unlocked[2]), static_cast<U>(n.unlocked[3]),
         static_cast<U>(n.cWould), static_cast<U>(n.cNoKey), static_cast<U>(n.cOwner), static_cast<U>(n.cEpoch), static_cast<U>(n.cUnwatch), static_cast<U>(n.cMapping), static_cast<U>(n.cNotCovered), static_cast<U>(n.cWrong),
         static_cast<U>(n.mWould), static_cast<U>(n.mNoLease), static_cast<U>(n.mMoved), static_cast<U>(n.mWrong), static_cast<U>(n.held), projection);
@@ -248,6 +249,8 @@ InputLeaseShadow::InputLeaseShadow(Recorder* recorder, std::uint64_t address, st
         case StorageTexture::PendingOver::Flushing: add(c.pFlushing); break;
         case StorageTexture::PendingOver::Shadow: add(c.pShadow); break;
         case StorageTexture::PendingOver::Moved: add(c.pMoved); break;
+        // PendingSerial still 0 (no storage image went pending yet): no proof, and no memo to keep.
+        case StorageTexture::PendingOver::NoSerial: add(c.pNoSerial); break;
     }
 }
 

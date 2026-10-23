@@ -4730,8 +4730,9 @@ void drawSnapshotEvictionTests(const Device& device) {
 // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 and 9, I0): the draw-input lease counters over
 // real CopyDrawInput calls, as the environment sets them up (counting with a collect memo key,
 // counting without one, off). Every row checks the same observable results (reuse, buffers, derived
-// values); the counting rows also check each row's prediction: (a) a repeat holds P (memo), C and M
-// together; (c) an epoch bump makes C miss (epoch), the call walks and refills; (b) a CPU store seen at
+// values) and that NothingPendingOver gives no proof at PendingSerial 0 (NoSerial, counted apart from
+// query nothing-over) but one after a bump; the counting rows also check each row's prediction: (a) a
+// repeat holds P (memo), C and M together; (c) an epoch bump makes C miss (epoch), the call walks and refills; (b) a CPU store seen at
 // the next epoch makes UnchangedSince fail, a copy is made and kept, and M misses (set serial moved)
 // next time; (d) an unwatch makes C miss (unwatch), an allocation change makes C miss (mapping) and
 // erases the entry through sameRegistry; (j) a padding refusal; (h) a vertex lower_bound served by a
@@ -4762,9 +4763,6 @@ bool drawInputLeaseCounterTests(const Device& device, Recorder& recorder) {
     for (std::uint32_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) words[i] = i * 5 + 1;
     const auto address = reinterpret_cast<std::uint64_t>(memory);
     constexpr std::size_t size = 256;
-    // Row P's memo needs a PendingSerial other than 0, which a fresh test process may still have.
-    StorageTexture::BumpPendingSerial();
-    BumpCollectEpoch();
     auto before = InputLeaseCountsNow();
     // Each step's counts since the last step (counting rows only); W and M wrong stay 0 in every row.
     const auto expect = [&](std::initializer_list<std::pair<std::uint64_t C::*, std::uint64_t>> counts, const char* what) {
@@ -4775,6 +4773,26 @@ bool drawInputLeaseCounterTests(const Device& device, Recorder& recorder) {
         Require(now.cWrong == before.cWrong && now.mWrong == before.mWrong, what);
         before = now;
     };
+    // PendingSerial 0, which a fresh test process still has (no storage image went pending yet), is no
+    // proof for row P: the query reports NoSerial and the probe counts it apart from nothing-over.
+    if (StorageTexture::PendingSerial() == 0) {
+        auto over = StorageTexture::PendingOver::Nothing;
+        Require(StorageTexture::NothingPendingOver(address, size, &over) == 0 && over == StorageTexture::PendingOver::NoSerial, "NothingPendingOver gave a proof at PendingSerial 0");
+        {
+            InputLeaseShadow shadow(&recorder, address + 2 * block, size, Use::Index32);
+        }
+        expect({{&C::indexCalls, 1}, {&C::inserted, 1}, {&C::pNoSerial, 1}, {&C::pQuery, 0}, {&C::pMemo, 0}}, "row P counted PendingSerial 0 as a proof");
+    } else {
+        std::cout << "PendingSerial is not 0 at the start: row P's serial-0 case not tested\n";
+    }
+    // Row P's memo needs a PendingSerial other than 0; with nothing over the range, the query proves it.
+    StorageTexture::BumpPendingSerial();
+    BumpCollectEpoch();
+    {
+        auto over = StorageTexture::PendingOver::NoSerial;
+        const auto serial = StorageTexture::PendingSerial();
+        Require(StorageTexture::NothingPendingOver(address, size, &over) == serial && over == StorageTexture::PendingOver::Nothing, "NothingPendingOver gave no proof with nothing pending");
+    }
     const auto index = [&](std::size_t bufferBytes = 0) { return CopyDrawInput(context, &recorder, address, size, 4, Use::Index32, bufferBytes); };
     const auto equalsGuest = [&](const DrawInputCopy& copy) { return std::memcmp(copy.buffer->Bytes().data(), memory, size) == 0; };
     // (a)
