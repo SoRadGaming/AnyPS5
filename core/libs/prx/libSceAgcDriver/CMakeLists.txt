@@ -731,12 +731,17 @@ if(BUILD_TESTING)
     # collect coverage, with the epoch coverage on and the walks counted.
     add_test(NAME agc_write_tracking_stamps_hold COMMAND agc_write_tracking_tests --stamps-hold)
     set_tests_properties(agc_write_tracking_stamps_hold PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
+    # LOCAL EXPERIMENT (REVALIDATE-PLAN 4): the shared collect-lease API (coverage owner, the `covered`
+    # report, CoveredCollectGeneration), with the epoch coverage on and the walks counted (the full run
+    # checks `covered` stays false without).
+    add_test(NAME agc_write_tracking_collect_covering COMMAND agc_write_tracking_tests --collect-covering)
+    set_tests_properties(agc_write_tracking_collect_covering PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
     if(WIN32)
         add_test(NAME agc_write_tracking_metadata_commit COMMAND agc_write_tracking_tests --metadata-commit)
         set_tests_properties(agc_write_tracking_metadata_commit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         add_test(NAME agc_resident_direct_remap COMMAND agc_write_tracking_tests --resident-direct-remap)
         set_tests_properties(agc_resident_direct_remap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_stamps_hold agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_write_tracking agc_write_tracking_lazy_generation agc_write_tracking_host_write_count agc_write_tracking_collect_memo_key agc_write_tracking_stamps_hold agc_write_tracking_collect_covering agc_write_tracking_metadata_commit agc_resident_direct_remap PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
