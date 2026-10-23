@@ -2656,7 +2656,7 @@ namespace {
 // The drain stamps a write's own pages, page exact (its walk covers only those pages), so a write
 // over none of the rows' pages leaves every row's answer as this lock reads it. The queue's mutex
 // is taken under the tracker lock, as drainHostWrites takes it.
-bool hostWritesOverRows(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver) {
+bool hostWritesOverRows(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, std::span<const UnchangedQuery> notWritten) {
     if (!hostWritesPending()) return false;
     auto& queue = hostWriteQueue();
     const std::lock_guard lock(queue.mutex);
@@ -2666,7 +2666,8 @@ bool hostWritesOverRows(std::span<const UnchangedQuery> unchanged, std::span<con
         const auto last = (row.address + row.bytes - 1) / WritePageBytes;
         return std::any_of(queue.ranges.begin(), queue.ranges.end(), [&](const auto& range) { return range.first / WritePageBytes <= last && first <= (range.second - 1) / WritePageBytes; });
     };
-    return std::any_of(unchanged.begin(), unchanged.end(), over) || std::any_of(notStoredOver.begin(), notStoredOver.end(), over);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.10): the not-written rows too.
+    return std::any_of(unchanged.begin(), unchanged.end(), over) || std::any_of(notStoredOver.begin(), notStoredOver.end(), over) || std::any_of(notWritten.begin(), notWritten.end(), over);
 }
 }
 
@@ -2676,11 +2677,28 @@ bool hostWritesOverRows(std::span<const UnchangedQuery> unchanged, std::span<con
 // a report's lock without the drain (the DepthSurfaceView counter's, which only profiling runs) is
 // taken plainly: it adds nothing to [guestmem]'s tracker waits and acquisitions, which stay the
 // count of the driver's own locks (its hold may still make one of them wait).
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.10 D5): the form with not-written
+// rows below, which this one forwards to with none.
 bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain, std::uint64_t* current, StampsHoldReport* report) {
+    return StampsHold(unchanged, notStoredOver, {}, drain, current, nullptr, report);
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.10 D5): a not-written row is
+// WrittenSince's test (the same watched, generation, length and covers guards, then every 64 KiB block
+// of the row against its generation), negated, with "no proof" kept apart as Unproven; under the lock
+// `unchanged` reads the coarse stamps, an upper bound of the blocks' (only stamp() writes blocks, and
+// raises the coarse stamp with them). `memoCurrent` is hitGeneration's answer under this lock: with the
+// drain no host write is left queued, so it is the generation; without it the report says whether one
+// is (hostWritesPending), and a caller that needs the memo answer then has none (a prediction misses).
+// Mirror tripwire (GPU-OWNED-PLAN 9.6, 11.13): WrittenSince, UnchangedSince, rangeUnchanged,
+// unchanged, stamp, hitGeneration, TrackerGeneration, lockTracker.
+bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, std::span<const UnchangedQuery> notWritten, bool drain, std::uint64_t* current, std::uint64_t* memoCurrent, StampsHoldReport* report) {
     auto& tracker = Tracker();
     const auto lock = drain ? lockTracker(tracker) : report != nullptr ? std::unique_lock(tracker.mutex) : acquireTracker(tracker);
     tracker.initialize();
-    if (current != nullptr) *current = tracker.generation.load(std::memory_order_relaxed);
+    const auto generation = tracker.generation.load(std::memory_order_relaxed);
+    if (current != nullptr) *current = generation;
+    if (memoCurrent != nullptr) *memoCurrent = generation;
     const auto unchangedRow = [&](const UnchangedQuery& row) {
         if (row.generation == 0 || row.bytes == 0 || !tracker.covers(row.address, row.bytes)) return StampRow::Unproven;
         return tracker.rangeUnchanged(row.address, row.bytes, row.generation) ? StampRow::Held : StampRow::Stamped;
@@ -2692,6 +2710,10 @@ bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const Uncha
 #endif
         return tracker.storedOver(row.address, row.address + row.bytes, row.generation, false) ? StampRow::Stamped : StampRow::Held;
     };
+    const auto notWrittenRow = [&](const UnchangedQuery& row) {
+        if (row.generation == 0 || row.bytes == 0 || !tracker.covers(row.address, row.bytes)) return StampRow::Unproven;
+        return tracker.unchanged(tracker.blockOf(row.address), tracker.blockOf(row.address + row.bytes - 1), row.generation) ? StampRow::Held : StampRow::Stamped;
+    };
     if (report == nullptr) {
         if (!tracker.watched) return false;
         for (const auto& row : unchanged) {
@@ -2700,11 +2722,15 @@ bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const Uncha
         for (const auto& row : notStoredOver) {
             if (notStoredOverRow(row) != StampRow::Held) return false;
         }
+        for (const auto& row : notWritten) {
+            if (notWrittenRow(row) != StampRow::Held) return false;
+        }
         return true;
     }
-    require(report->rows.size() >= unchanged.size() + notStoredOver.size(), "StampsHold's report has fewer entries than rows");
+    require(report->rows.size() >= unchanged.size() + notStoredOver.size() + notWritten.size(), "StampsHold's report has fewer entries than rows");
     // What the draining form would have stamped first over a row (none when it drains).
-    report->hostWritesOver = !drain && hostWritesOverRows(unchanged, notStoredOver);
+    report->hostWritesOver = !drain && hostWritesOverRows(unchanged, notStoredOver, notWritten);
+    report->hostWritesPending = !drain && hostWritesPending();
     bool held = tracker.watched;
     std::size_t at = 0;
     for (const auto& row : unchanged) {
@@ -2714,6 +2740,11 @@ bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const Uncha
     }
     for (const auto& row : notStoredOver) {
         const auto answer = tracker.watched ? notStoredOverRow(row) : StampRow::Unproven;
+        report->rows[at++] = answer;
+        held = held && answer == StampRow::Held;
+    }
+    for (const auto& row : notWritten) {
+        const auto answer = tracker.watched ? notWrittenRow(row) : StampRow::Unproven;
         report->rows[at++] = answer;
         held = held && answer == StampRow::Held;
     }
@@ -3039,6 +3070,12 @@ std::uint64_t TrackerGeneration() {
     // stores made after it with a stamp not newer than the value.
     const auto lock = lockTracker(tracker);
     return tracker.generation;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.9): see GuestMemory.hpp. No lock and
+// no drain: a walk running meanwhile may already have bumped it (any bump is an update since).
+std::uint64_t TrackerGenerationNoDrain() {
+    return Tracker().generation.load(std::memory_order_acquire);
 }
 
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes) {
