@@ -92,6 +92,17 @@ struct TargetLeasePrediction {
     bool cmaskFound = false;
     std::size_t cmaskBytes = 0;
     std::uint64_t cmaskGeneration = 0;
+    // Today's lookup as it returned (TargetLeaseLookedUp), before the materializations, which a hit
+    // runs live where it does not skip them: the proved and walked counts and the image's refresh
+    // proof (StorageTexture::LeaseProofState's fields).
+    bool lookedUp = false;
+    std::uint64_t provedAfter = 0;
+    std::uint64_t walkedAfter = 0;
+    std::uint64_t proofGeneration = 0;
+    std::uint64_t proofPendingSerial = 0;
+    std::uint64_t imageGeneration = 0;
+    bool proofUnitChecked = false;
+    bool layersAt = false;
 };
 
 // One slot loop lookup: the slot loop fills the first part, TargetLeaseBefore the second, the two
@@ -126,6 +137,9 @@ void TargetLeaseBefore(TargetLeaseUse& use);
 // LOCAL EXPERIMENT (D4-B): =1, the lease's answer to the lookup (null: a miss, the full path runs); =2,
 // the prediction (always null). Null at once with the switch unset or an ineligible lookup.
 std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use);
+// =2: today's lookup returned `resident` (it notes what a prediction is checked against; nothing
+// without one).
+void TargetLeaseLookedUp(TargetLeaseUse& use, StorageTexture* resident);
 // `resident`: the image the lookup returned (null: none).
 void TargetLeaseAfter(TargetLeaseUse& use, StorageTexture* resident);
 // The [proofs] line's lease part (reportProofs, every 10 s): counts since the last call.

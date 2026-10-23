@@ -321,7 +321,9 @@ void countRefusal(LeaseRefusal refusal) {
 
 // =2: today's full path against the prediction (9.4.3 (a)-(f); (c) also without profiling, where
 // ThreadCollectedBytes counts nothing: the coverage the hit's skipped collects rely on held before
-// the lookup). A failure whose rows now fail the draining stamp check, or whose pending serial moved,
+// the lookup). The lookup's own part ((b), (c), (e)) is read as it returned (TargetLeaseLookedUp):
+// a materialization the hit does not skip runs live in both and may refresh or rescan; (f) checks
+// the proofs of the skipped ones. A failure whose rows now fail the draining stamp check, or whose pending serial moved,
 // or K1's advance at a later reading of the tracker clock, landed after the prediction: raced (the
 // first 8 printed). So does one after a change the prediction could not see coming that moves
 // neither: today's lookup runs the kept-bytes bound after the prediction (=2 skips it), whose submit,
@@ -330,32 +332,27 @@ void countRefusal(LeaseRefusal refusal) {
 void verifyPrediction(TargetLeaseUse& use, StorageTexture* resident) {
     const auto& prediction = use.prediction;
     const auto& color = *use.color;
-    const auto provedNow = StorageTexture::RefreshesProved();
     const auto walkedNow = GuestMemory::ThreadCollectedBytes();
     const char* failed = nullptr;
     bool clockMoved = false;
-    StorageTexture::LeaseProofState state;
-    if (resident != prediction.texture) failed = "(a) the lookup returned another image";
-    else if (provedNow != use.proved + 1) failed = "(b) the lookup's refresh was not proved once";
+    if (resident != prediction.texture || !prediction.lookedUp) failed = "(a) the lookup returned another image";
+    else if (prediction.provedAfter != use.proved + 1) failed = "(b) the lookup's refresh was not proved once";
     else if (!use.covered) failed = "(c) the lease's ranges were not all covered under its memo key before the lookup";
-    else if (walkedNow != use.walked) failed = "(c) the lookup's collects walked";
+    else if ((prediction.skipRegisterClear ? walkedNow : prediction.walkedAfter) != use.walked) failed = "(c) the collects the hit skips walked";
     else if (prediction.skipRegisterClear && use.registerClearWorked) failed = "(d) the register clear a hit skips did work";
     else if (prediction.skipCmaskProof && use.cmaskClearWorked) failed = "(d) the CMASK clear a hit proves done did work";
-    else {
-        state = resident->LeaseState();
-        if (state.pendingSerial != prediction.pendingSerial) failed = "(e) the refresh proof's pending serial differs";
-        else if (state.unitChecked != prediction.unitChecked) failed = "(e) the refresh proof's unit check differs";
-        else if (prediction.pinned && (!state.layersAt || state.proofGeneration != state.generation || state.generation != prediction.current)) {
-            failed = "(e) K1's generation advance differs";
-            clockMoved = state.layersAt && state.proofGeneration == state.generation && state.generation > prediction.current;
-        } else {
-            const auto& keys = resident->TargetKeyProof();
-            const auto& before = prediction.targetKeys;
-            if (keys.address != before.address || keys.count != before.count || keys.keys != before.keys || keys.generation != before.generation) failed = "(f) the target-key proof changed";
-            else if (color.cmaskAddress != 0) {
-                const auto cmask = CmaskProofFor(color.cmaskAddress);
-                if (cmask.found != prediction.cmaskFound || cmask.bytes != prediction.cmaskBytes || cmask.generation != prediction.cmaskGeneration) failed = "(f) the CMASK proof changed";
-            }
+    else if (prediction.proofPendingSerial != prediction.pendingSerial) failed = "(e) the refresh proof's pending serial differs";
+    else if (prediction.proofUnitChecked != prediction.unitChecked) failed = "(e) the refresh proof's unit check differs";
+    else if (prediction.pinned && (!prediction.layersAt || prediction.proofGeneration != prediction.imageGeneration || prediction.imageGeneration != prediction.current)) {
+        failed = "(e) K1's generation advance differs";
+        clockMoved = prediction.layersAt && prediction.proofGeneration == prediction.imageGeneration && prediction.imageGeneration > prediction.current;
+    } else {
+        const auto& keys = resident->TargetKeyProof();
+        const auto& before = prediction.targetKeys;
+        if (prediction.skipRegisterClear && (keys.address != before.address || keys.count != before.count || keys.keys != before.keys || keys.generation != before.generation)) failed = "(f) the target-key proof changed";
+        else if (prediction.skipCmaskProof) {
+            const auto cmask = CmaskProofFor(color.cmaskAddress);
+            if (cmask.found != prediction.cmaskFound || cmask.bytes != prediction.cmaskBytes || cmask.generation != prediction.cmaskGeneration) failed = "(f) the CMASK proof changed";
         }
     }
     if (failed == nullptr) {
@@ -377,8 +374,8 @@ void verifyPrediction(TargetLeaseUse& use, StorageTexture* resident) {
         color.slot, static_cast<unsigned long long>(color.address), use.colorBytes, static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), color.cmaskBytes,
         static_cast<unsigned long long>(prediction.unchanged[0].generation), static_cast<unsigned long long>(color.dccAddress != 0 ? prediction.unchanged[1].generation : 0), static_cast<unsigned long long>(prediction.unchangedRows > (color.dccAddress != 0 ? 2u : 1u) ? prediction.unchanged[prediction.unchangedRows - 1].generation : 0), static_cast<unsigned long long>(prediction.cmask.generation),
         prediction.unitChecked ? 1 : 0, prediction.pinned ? 1 : 0, static_cast<unsigned long long>(prediction.pendingSerial), static_cast<unsigned long long>(prediction.current), prediction.skipRegisterClear ? 1 : 0, prediction.skipCmaskProof ? 1 : 0,
-        failed, resident == prediction.texture ? "the predicted one" : resident == nullptr ? "none" : "another", static_cast<long long>(provedNow - use.proved), static_cast<unsigned long long>(walkedNow - use.walked), use.registerClearWorked ? 1 : 0, use.cmaskClearWorked ? 1 : 0,
-        static_cast<unsigned long long>(state.proofGeneration), static_cast<unsigned long long>(state.generation), static_cast<unsigned long long>(state.pendingSerial), state.unitChecked ? 1 : 0, state.layersAt ? 1 : 0, static_cast<unsigned long long>(serialNow));
+        failed, resident == prediction.texture ? "the predicted one" : resident == nullptr ? "none" : "another", static_cast<long long>(prediction.provedAfter - use.proved), static_cast<unsigned long long>(walkedNow - use.walked), use.registerClearWorked ? 1 : 0, use.cmaskClearWorked ? 1 : 0,
+        static_cast<unsigned long long>(prediction.proofGeneration), static_cast<unsigned long long>(prediction.imageGeneration), static_cast<unsigned long long>(prediction.proofPendingSerial), prediction.proofUnitChecked ? 1 : 0, prediction.layersAt ? 1 : 0, static_cast<unsigned long long>(serialNow));
     std::fflush(stderr);
     std::abort();
 }
@@ -397,8 +394,10 @@ void createLease(TargetLeaseUse& use, StorageTexture* resident) {
     // thread moved the count), no clear work, and every range of the lease covered before the path
     // (it walked none of them: D4-0's "walked", without its profiling, so the lease's behaviour does
     // not depend on APS5_PROFILE_DRAW).
-    if (resident == nullptr || StorageTexture::RefreshesProved() != use.proved + 1) return refuse(RefuseNotProved);
+    // (Clear work first: a register clear's own refresh may move the proved count too.)
+    if (resident == nullptr) return refuse(RefuseNotProved);
     if (use.registerClearWorked || use.cmaskClearWorked) return refuse(RefuseClearWork);
+    if (StorageTexture::RefreshesProved() != use.proved + 1) return refuse(RefuseNotProved);
     if (!use.covered) return refuse(RefuseWalked);
     // Fix 3 of 9.2: the memo key read before the path and the levels serial read before
     // StorageLeaseKey's StorageSurface are both compared after it.
@@ -550,6 +549,20 @@ std::shared_ptr<StorageTexture> TargetLeaseHit(TargetLeaseUse& use) {
     // Whether the full path about to run can walk none of the lease's ranges (its creation's test).
     use.covered = leaseRangesCovered(color, use.colorBytes);
     return nullptr;
+}
+
+void TargetLeaseLookedUp(TargetLeaseUse& use, StorageTexture* resident) {
+    auto& prediction = use.prediction;
+    if (!prediction.hit || resident == nullptr) return;
+    const auto state = resident->LeaseState();
+    prediction.lookedUp = true;
+    prediction.provedAfter = StorageTexture::RefreshesProved();
+    prediction.walkedAfter = GuestMemory::ThreadCollectedBytes();
+    prediction.proofGeneration = state.proofGeneration;
+    prediction.proofPendingSerial = state.pendingSerial;
+    prediction.imageGeneration = state.generation;
+    prediction.proofUnitChecked = state.unitChecked;
+    prediction.layersAt = state.layersAt;
 }
 
 void TargetLeaseAfter(TargetLeaseUse& use, StorageTexture* resident) {

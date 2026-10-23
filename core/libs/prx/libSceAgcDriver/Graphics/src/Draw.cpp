@@ -1987,7 +1987,10 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             const StorageTexture::TargetLookupScope targetLookup(profile);
             try {
                 if (lease != nullptr) resident = TargetLeaseHit(*lease);
-                if (resident == nullptr) resident = lookup();
+                if (resident == nullptr) {
+                    resident = lookup();
+                    if (lease != nullptr) TargetLeaseLookedUp(*lease, resident.get());
+                }
             } catch (...) {
                 if (profile) noteTargetRefreshes(outcome, true);
                 throw;
