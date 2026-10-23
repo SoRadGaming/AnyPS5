@@ -3854,6 +3854,15 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
     noteWriteOn(*open, address, bytes.size(), true);
 }
 
+void Recorder::ArmLabelSubmit() {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): NoteLabel's trigger. Nothing to
+    // send without an open batch (the work already went out with its batch).
+    if (open == nullptr || activeRecorder != this) return;
+    if (pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+        pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    }
+}
+
 std::optional<Recorder::LabelHit> Recorder::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
     // Under the GPU mutex; the table mutex is taken too so this one path serves both lock regimes.
     std::lock_guard tableLock(labelTableMutex);

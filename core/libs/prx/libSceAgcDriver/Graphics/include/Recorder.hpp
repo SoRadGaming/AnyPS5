@@ -533,6 +533,13 @@ public:
     // as the label's own so it does not count as an overwrite of the entry.
     static constexpr std::size_t LabelTableBytes = 64;
     void NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): the submit trigger NoteLabel
+    // arms, alone: PendingLabelSince is set when unset (an open batch of the active recorder only), so
+    // the open batch goes out at the queue worker's next non-label packet, after APS5_LABEL_FLUSH_US,
+    // or at the submission's end, as a label's batch does. For recorded work the driver does not
+    // count (CountRecordedWork) that today's path stored as a label or ran on the CPU at once: a GDS
+    // copy recorded by DMA_DATA. Under the GPU mutex.
+    void ArmLabelSubmit();
     // Late rule: an entry whose stamp is not newer than the wait's submission is still the value
     // memory will hold, unless a CPU store touched the dword since it was recorded (the table
     // cannot see CPU stores; the title recycles label slots by CPU writes) or a later recorded

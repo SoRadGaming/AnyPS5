@@ -2368,6 +2368,8 @@ target_link_libraries(agc_driver_gpu_map_on_fiber_tests PRIVATE libSceFiber)
 
 target_link_libraries(agc_driver_rect_list_corner_tests PRIVATE shader_recompiler_agc_driver)
 target_link_libraries(agc_driver_queue_zero_late_interrupt_tests PRIVATE libkernel)
+# LOCAL EXPERIMENT (DRAIN-PLAN D2): the liveness case waits for an end-of-pipe interrupt on an event queue.
+target_link_libraries(agc_driver_gds_in_stream_tests PRIVATE libkernel)
 
 target_link_libraries(agc_driver_storage_file_write_tests PRIVATE libkernel)
 
@@ -2745,15 +2747,20 @@ if(BUILD_TESTING)
     # barriers a hazard tracker would emit or skip and checks nothing, and it does not model the trailing
     # barriers CopyBuffer's and the store runs' merges rely on; ordering is checked by the cases' values,
     # =1's cpu-gds-access-unnoted and a run under the validation layer), and the two refusals the switch
-    # must resolve to 0: no targeted GDS sync, and APS5_PIPELINE_DMA. The test reads the mode it expects
-    # from the environment. behind_completions runs its --behind-completions mode (WriteLabelOnGpu's
-    # refusal of the completion path on a device of its own; it sets APS5_LABEL_GATE_ALL itself and reads
-    # no switch).
+    # must resolve to 0: no targeted GDS sync, and APS5_PIPELINE_DMA. The readback half (R: readbacks and
+    # GDS -> GDS copies as GPU copies, APS5_EXPERIMENT_GDS_READBACK_COPIES, which adds no label history)
+    # runs on and value-checked in its own rows, and alone (without the stream, so it must resolve off);
+    # every other row leaves readbacks on today's path. The test reads the mode it expects from the
+    # environment. behind_completions runs its --behind-completions mode (WriteLabelOnGpu's refusal of
+    # the completion path on a device of its own; it sets APS5_LABEL_GATE_ALL itself and reads no switch).
     set_tests_properties(agc_driver_gds_in_stream PROPERTIES TIMEOUT 120)
     set(gdsStreamTests)
     foreach(gdsStreamCase IN ITEMS
             "on|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1"
             "verify|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=2"
+            "readback_copies|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1,APS5_EXPERIMENT_GDS_READBACK_COPIES=1"
+            "readback_copies_verify|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=2,APS5_EXPERIMENT_GDS_READBACK_COPIES=1"
+            "readback_copies_alone|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_READBACK_COPIES=1"
             "stream_stats|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1,APS5_DEBUG_STREAM_STATS=1,APS5_DEBUG_GDS_STATS=1"
             "barrier_validate|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1,APS5_BARRIER_VALIDATE=1"
             "targeted_only|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1"
@@ -3462,8 +3469,9 @@ if(BUILD_TESTING)
             "hidden_write_drain_on|APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=1"
             # LOCAL EXPERIMENT (DRAIN-PLAN D2): GDS transfers recorded in the stream, value-checked (=2)
             # and on (=1), each with the targeted GDS sync it requires (its path is the fallback); the
-            # pipelined_dma runs set APS5_PIPELINE_DMA, which the switch refuses (they run it off). Its
-            # own cases are in agc_driver_gds_in_stream*.
+            # pipelined_dma runs set APS5_PIPELINE_DMA, which the switch refuses (they run it off). The
+            # readback half (APS5_EXPERIMENT_GDS_READBACK_COPIES) stays off here. Its own cases are in
+            # agc_driver_gds_in_stream*.
             "gds_in_stream|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=2"
             "gds_in_stream_on|APS5_EXPERIMENT_GDS_TARGETED_SYNC=1,APS5_EXPERIMENT_GDS_IN_STREAM=1")
     set(committerExperimentRuns

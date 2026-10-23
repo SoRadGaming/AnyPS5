@@ -31,6 +31,7 @@ std::array<Counter, Ops> recorded{};
 std::array<Counter, 4> copyPaths{};
 Counter notes{};
 Counter idleCopies{};
+Counter readbacksOff{};
 std::array<Counter, Fallbacks> fallbacks{};
 Counter targetedSyncs{};
 Counter accessChecks{};
@@ -122,8 +123,21 @@ int mode() {
         std::fprintf(stderr, "[gds-stream] APS5_EXPERIMENT_GDS_IN_STREAM=%d is refused with APS5_PIPELINE_DMA (its queue-0 DMA items can store into the GDS on the CPU ahead of queued draws): off\n", requested);
         return 0;
     }
-    std::fprintf(stderr, "[gds-stream] APS5_EXPERIMENT_GDS_IN_STREAM=%d: DMA_DATA transfers that touch the GDS are recorded in the stream%s\n", requested, requested == 2 ? ", each value-checked" : "");
+    // R's switch read here only for the line (ReadbackCopies reads it again, at its first use).
+    const char* readbacks = std::getenv("APS5_EXPERIMENT_GDS_READBACK_COPIES");
+    const bool withReadbacks = readbacks != nullptr && readbacks[0] != '\0' && std::strcmp(readbacks, "0") != 0;
+    std::fprintf(stderr, "[gds-stream] APS5_EXPERIMENT_GDS_IN_STREAM=%d: DMA_DATA transfers that touch the GDS are recorded in the stream, halves %s%s\n", requested, withReadbacks ? "S+copy-in+R (APS5_EXPERIMENT_GDS_READBACK_COPIES: readbacks recorded as GPU copies add no label history)" : "S+copy-in (readbacks and GDS -> GDS copies take today's path; APS5_EXPERIMENT_GDS_READBACK_COPIES=1 adds them)", requested == 2 ? ", each value-checked" : "");
     return requested;
+}
+
+bool readbackCopies() {
+    const char* text = std::getenv("APS5_EXPERIMENT_GDS_READBACK_COPIES");
+    if (text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0) return false;
+    if (!On()) {
+        std::fprintf(stderr, "[gds-stream] APS5_EXPERIMENT_GDS_READBACK_COPIES needs APS5_EXPERIMENT_GDS_IN_STREAM (on, with its requirements): off\n");
+        return false;
+    }
+    return true;
 }
 
 const char* OpName(Op op) {
@@ -150,6 +164,9 @@ void NoteRecorded(Graphics::Recorder& recorder, Op op, int copyPath) {
     // Judge fix 1: the whole GDS, as every GPU user of it notes it (G/ShaderResources.cpp's Gds role),
     // into the open batch that holds the operation, under the hold that recorded it.
     recorder.NotePendingWrite(Pm4::GdsAddress(), Pm4::GdsBytes);
+    // Review fix 1 (submit liveness): the trigger a label store arms, so the batch goes out as today's
+    // label store's would (the note above opened the batch if the record had submitted it).
+    recorder.ArmLabelSubmit();
     Add(notes);
     if (opRecorder.exchange(&recorder, std::memory_order_relaxed) != &recorder) settledThrough.store(0, std::memory_order_relaxed);
     // The note opened the batch if the operation's record had submitted it: the serial is then the
@@ -170,6 +187,11 @@ void CountFallback(Fallback reason) {
 
 void CountIdleCopy() {
     Add(idleCopies);
+    counted();
+}
+
+void CountReadbackOff() {
+    Add(readbacksOff);
     counted();
 }
 
@@ -242,6 +264,7 @@ Totals CurrentTotals() {
     for (std::size_t path = 0; path < copyPaths.size(); ++path) totals.copyPaths[path] = copyPaths[path].load(std::memory_order_relaxed);
     totals.notes = notes.load(std::memory_order_relaxed);
     totals.idleCopies = idleCopies.load(std::memory_order_relaxed);
+    totals.readbacksOff = readbacksOff.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Fallbacks; ++reason) totals.fallbacks[reason] = fallbacks[reason].load(std::memory_order_relaxed);
     totals.targetedSyncs = targetedSyncs.load(std::memory_order_relaxed);
     totals.accessChecks = accessChecks.load(std::memory_order_relaxed);
@@ -259,9 +282,11 @@ void ReportWindow(const char* window, bool print) {
     reported = now;
     if (!print) return;
     std::string line;
-    append(line, "[gds-stream] window=%s mode=%d recorded", window, Mode());
+    append(line, "[gds-stream] window=%s mode=%d halves %s recorded", window, Mode(), ReadbackCopies() ? "S+copy-in+R" : "S+copy-in");
     for (std::size_t op = 0; op < Ops; ++op) append(line, "%s %s %llu", op == 0 ? "" : ",", OpNames[op], count(now.recorded[op] - last.recorded[op]));
-    append(line, "; copy paths 1/3 %llu/%llu; whole-GDS notes %llu; idle copies (read on the CPU without a wait) %llu; fallbacks to today's path:", count(now.copyPaths[1] - last.copyPaths[1]), count(now.copyPaths[3] - last.copyPaths[3]), count(now.notes - last.notes), count(now.idleCopies - last.idleCopies));
+    append(line, "; copy paths 1/3 %llu/%llu; whole-GDS notes %llu; idle copies (read on the CPU without a wait) %llu", count(now.copyPaths[1] - last.copyPaths[1]), count(now.copyPaths[3] - last.copyPaths[3]), count(now.notes - last.notes), count(now.idleCopies - last.idleCopies));
+    if (!ReadbackCopies()) append(line, "; readbacks on today's path (R off) %llu", count(now.readbacksOff - last.readbacksOff));
+    line += "; fallbacks to today's path:";
     bool first = true;
     for (std::size_t reason = 0; reason < Fallbacks; ++reason) {
         const auto n = now.fallbacks[reason] - last.fallbacks[reason];

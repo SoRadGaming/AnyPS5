@@ -122,11 +122,18 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2; see GdsStream.hpp): a DMA_DATA
         // that touches the GDS decodes as a copy with the GDS mapped into guest memory
         // (Pm4::DecodeGdsCopy), which copyBehindPendingSource records when its source has unfinished
-        // writers (R); a store into the GDS resolves (ResolveStore's GDS case) and is recorded only as
-        // WriteLabelOnGpu reason 0 (S). The switch is read at the first such packet. A GDS copy the
-        // decode refused, or whose pending source the GPU path refused, takes today's path whole
+        // writers (copy-in; R); a store into the GDS resolves (ResolveStore's GDS case) and is recorded
+        // only as WriteLabelOnGpu reason 0 (S). The switch is read at the first such packet. A GDS copy
+        // the decode refused, or whose pending source the GPU path refused, takes today's path whole
         // (gdsCopyRefused: no GDS store either, so a store into the GDS takes the targeted path).
-        const bool gdsStream = opcode == 0x50 && Pm4::DmaTouchesGds(packet) && GdsStream::On();
+        // A DMA_DATA with a GDS source (R: a readback into memory, or a GDS -> GDS copy) joins only
+        // under APS5_EXPERIMENT_GDS_READBACK_COPIES (a readback recorded as a GPU copy adds no label
+        // history, GdsStream.hpp); without it gdsStream is false for it and it takes today's path
+        // exactly (gdsPacket keeps only =1's invariant check at its targeted sync).
+        const bool gdsPacket = opcode == 0x50 && Pm4::DmaTouchesGds(packet) && GdsStream::On();
+        const bool gdsReadback = gdsPacket && Pm4::DmaSource(packet) == Pm4::DmaSelectGds;
+        const bool gdsStream = gdsPacket && (!gdsReadback || GdsStream::ReadbackCopies());
+        if (gdsReadback && !gdsStream) GdsStream::CountReadbackOff();
         auto gdsRefusal = Pm4::GdsCopyRefusal::None;
         const auto copy = opcode == 0x50 ? (gdsStream ? Pm4::DecodeGdsCopy(packet, &gdsRefusal) : Pm4::DecodeMemoryCopy(packet)) : std::nullopt;
         bool gdsCopyRefused = false;
@@ -182,7 +189,9 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (outcome.path != 1 && outcome.path != 3) throw std::runtime_error("AGC driver: a DMA_DATA copy of up to 64 KiB that GpuCopyPossible accepted took copy path " + std::to_string(outcome.path));
             if (gdsStream) {
                 // LOCAL EXPERIMENT (D2): the whole GDS noted as a pending write of the copy's batch
-                // (judge fix 1: the copy notes a GDS source only as a read), under this hold.
+                // (judge fix 1: the copy notes a GDS source only as a read), under this hold, and the
+                // label submit trigger armed for it (review fix 1: a DMA_DATA never counts as recorded
+                // work, so without it the batch stayed open past the submission's end).
                 auto* recorder = Graphics::Recorder::Active();
                 if (recorder == nullptr) throw std::runtime_error("AGC driver: a DMA_DATA copy that touches the GDS was recorded without an active recorder");
                 const auto op = Pm4::DmaSource(packet) != Pm4::DmaSelectGds ? GdsStream::Op::CopyIn : Pm4::DmaDestination(packet) == Pm4::DmaSelectGds ? GdsStream::Op::GdsCopy : GdsStream::Op::Readback;
@@ -328,8 +337,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     if (Drain::GdsCounting()) Drain::NoteGdsTarget(recorder->OpenWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? Drain::GdsTarget::Open : recorder->PendingWriteOverlaps(Pm4::GdsAddress(), Pm4::GdsBytes) ? Drain::GdsTarget::InFlight : Drain::GdsTarget::Idle);
                     // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): this sync orders
                     // a CPU access to the GDS (the store after it): =1's invariant, checked under
-                    // this hold before it waits.
-                    if (gdsStream) GdsStream::CheckTargetedSync(*recorder);
+                    // this hold before it waits (a GDS -> GDS copy left on today's path too).
+                    if (gdsPacket) GdsStream::CheckTargetedSync(*recorder);
                     recorder->SyncThrough(Pm4::GdsAddress(), Pm4::GdsBytes, true);
                 }
                 const auto source = Pm4::DmaSource(packet);

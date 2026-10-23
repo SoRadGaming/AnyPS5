@@ -1,13 +1,15 @@
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): DMA_DATA transfers that touch the
 // GDS recorded in the stream (GdsStream.hpp). The decode first (no device), then, through the driver on
 // compute queue 0x40 (queue 0x48 and queue 0 wait), with the append kernel and the GDS counter packets
-// of GdsAppendConsume.cpp (SetCounters: DMA_DATA 0x40100000, ReadCounters: 0x20000000):
+// of GdsAppendConsume.cpp (SetCounters: DMA_DATA 0x40100000, ReadCounters: 0x20000000). R (readbacks and
+// GDS -> GDS copies as GPU copies) runs only under APS5_EXPERIMENT_GDS_READBACK_COPIES; without it every
+// readback takes today's path, counted as readbacks-off:
 //   readback      an append dispatch, the counters stored between it and a second one, a readback:
-//                 =1/=2 record the readback (CopyBuffer path 1 or 3), =1 the four stores (no targeted
-//                 sync); =2 records the first store, whose value check syncs the recorder idle, so each
-//                 later one is recorded and checked or refused with reason 1 (the targeted path, as
-//                 today); the second dispatch sees the stored values;
-//   write-after   a readback recorded behind a slow non-GDS dispatch in a batch newer than every GDS
+//                 =1/=2 with R record the readback (CopyBuffer path 1 or 3), =1 the four stores (no
+//                 targeted sync); =2 records the first store, whose value check syncs the recorder
+//                 idle, so each later one is recorded and checked or refused with reason 1 (the targeted
+//                 path, as today); the second dispatch sees the stored values;
+//   write-after   a readback recorded (R) behind a slow non-GDS dispatch in a batch newer than every GDS
 //                 user, then a fallback CPU store into the GDS (3 bytes: not a GPU store): the store
 //                 waits for the readback's batch (judge fix 1), so the readback holds the counter;
 //   wait          WAIT_REG_MEM on a readback destination from queue 0 and from queue 0x48: completes
@@ -19,10 +21,19 @@
 //                 and the store refusals' names (reasons 1-5) in the decode part (Validate rejects such
 //                 packets first); reason 3 is the readback case's on a device without a host import of
 //                 the GDS, reason 4 is ResolveStore's (store-shape) before WriteLabelOnGpu sees it;
+//   liveness      review fix 1: a producer submission whose only unsubmitted work is a GDS copy, after
+//                 one that left the copy's source busy in a submitted batch, sends its batch at its end
+//                 (a readback alone, a copy-in alone), and [readback, RELEASE_MEM end-of-pipe interrupt]
+//                 delivers the interrupt with the destination stored and no other submit;
+//   aba           review finding 2, a known difference kept with R (documented, not fixed): an EQUAL
+//                 wait received before two readbacks into one destination waits for the first value.
+//                 Satisfied without R (required), where today's label history holds both values; with
+//                 R expected to differ (printed), and a waiter still blocked after 3 s is released;
 //   switch off    nothing counted, nothing armed.
 // Every run checks the values, and cpu-gds-access-unnoted stays 0. A device without a host import of the
 // GDS records nothing: the run says so and checks the fallbacks instead. The mode expected comes from the
-// environment (=1/=2 need APS5_EXPERIMENT_GDS_TARGETED_SYNC and are refused with APS5_PIPELINE_DMA).
+// environment (=1/=2 need APS5_EXPERIMENT_GDS_TARGETED_SYNC and are refused with APS5_PIPELINE_DMA; R
+// needs the stream on).
 // --behind-completions (its own process) tests reason 5 on the device instead: WriteLabelOnGpu with
 // `behindCompletions` false while recorded work has a completion action (APS5_LABEL_GATE_ALL=1, which
 // that mode sets: through the driver a copied writer over the GDS needs a buffer that spans the GDS
@@ -36,12 +47,14 @@
 // printed its "host imports at shutdown" line, then hung until ctest killed it). A watchdog fails a run
 // that is not done in 60 s (a wait with no limit of its own); the end syncs the recorder idle before
 // the driver's shutdown, so the teardown waits on nothing left in an open batch.
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GdsStream.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -50,6 +63,7 @@
 #include <windows.h>
 #endif
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +78,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
+extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
 
 namespace {
 
@@ -145,6 +162,10 @@ struct Block {
     alignas(256) std::array<std::uint32_t, Counters> copiedIn{};
     alignas(256) std::array<std::uint32_t, Counters> spinOutput{};
     alignas(256) std::array<std::uint32_t, Counters> spinDescriptor{};
+    alignas(256) std::array<std::uint32_t, Counters> lively{};
+    alignas(256) std::array<std::uint32_t, Counters> endOfPipe{};
+    // aba: the destination, the waiter's done word, the producer's done word.
+    alignas(256) std::array<std::uint32_t, 4> aba{};
 };
 
 Block& Memory() {
@@ -231,6 +252,17 @@ void WaitEqual(Words& words, const void* target, std::uint32_t value) {
     words.insert(words.end(), {0xc0053c00u, 0x13u, Low(address), High(address), value, 0xffffffffu, 0x19u});
 }
 
+// WRITE_DATA of one word (a label).
+void WriteWord(Words& words, const void* target, std::uint32_t value) {
+    const auto address = Address(target);
+    words.insert(words.end(), {0xc0033700u, 0x00100200u, Low(address), High(address), value});
+}
+
+// RELEASE_MEM that stores nothing and raises the end-of-pipe interrupt.
+void EndOfPipeInterrupt(Words& words) {
+    words.insert(words.end(), {0xc0064900u, 0x514u, 2u << 24u, 0, 0, 0, 0, 0});
+}
+
 void Submit(std::deque<Words>& kept, Words words, std::uint32_t queue) {
     auto& stored = kept.emplace_back(std::move(words));
     Packet packet{stored.data(), static_cast<std::uint32_t>(stored.size()), 0, {}};
@@ -260,6 +292,37 @@ std::array<std::uint32_t, Counters> ReadGdsCounters() {
     return Read<Counters>(Pm4::GdsAddress() + CounterOffset);
 }
 
+// Memory as it is, without the flush hook (no sync, nothing submitted).
+std::uint32_t Raw(std::uint32_t& word) {
+    return std::atomic_ref<std::uint32_t>(word).load(std::memory_order_acquire);
+}
+
+template <std::size_t Count>
+std::array<std::uint32_t, Count> Raw(std::array<std::uint32_t, Count>& words) {
+    std::array<std::uint32_t, Count> values{};
+    for (std::size_t index = 0; index < Count; ++index) values[index] = Raw(words[index]);
+    return values;
+}
+
+// Polls `done` (raw) until it holds or `limit` passes.
+template <typename Done>
+bool PollFor(const Done& done, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() >= deadline) return done();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+// Whether the open batch writes the range (under the GPU lock): the batch that holds it has not gone out.
+bool OpenBatchWrites(std::uint64_t address, std::size_t bytes) {
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+    const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    return recorder != nullptr && recorder->OpenWriteOverlaps(address, bytes);
+}
+
 std::string Text(std::span<const std::uint32_t> values) {
     std::string text;
     for (const auto value : values) text += (text.empty() ? "" : " ") + std::to_string(value);
@@ -276,6 +339,7 @@ GdsStream::Totals Delta(const GdsStream::Totals& before) {
     for (std::size_t path = 0; path < now.copyPaths.size(); ++path) now.copyPaths[path] -= before.copyPaths[path];
     now.notes -= before.notes;
     now.idleCopies -= before.idleCopies;
+    now.readbacksOff -= before.readbacksOff;
     for (std::size_t reason = 0; reason < GdsStream::Fallbacks; ++reason) now.fallbacks[reason] -= before.fallbacks[reason];
     now.targetedSyncs -= before.targetedSyncs;
     now.accessChecks -= before.accessChecks;
@@ -318,7 +382,7 @@ std::uint64_t FellAll(const GdsStream::Totals& totals) {
 std::string Describe(const GdsStream::Totals& totals) {
     std::string text = "recorded";
     for (std::size_t op = 0; op < GdsStream::Ops; ++op) text += std::string(" ") + GdsStream::OpName(static_cast<Op>(op)) + " " + std::to_string(totals.recorded[op]);
-    text += "; copy paths 1/3 " + std::to_string(totals.copyPaths[1]) + "/" + std::to_string(totals.copyPaths[3]) + "; notes " + std::to_string(totals.notes) + "; idle copies " + std::to_string(totals.idleCopies) + "; fallbacks";
+    text += "; copy paths 1/3 " + std::to_string(totals.copyPaths[1]) + "/" + std::to_string(totals.copyPaths[3]) + "; notes " + std::to_string(totals.notes) + "; idle copies " + std::to_string(totals.idleCopies) + "; readbacks-off " + std::to_string(totals.readbacksOff) + "; fallbacks";
     for (std::size_t reason = 0; reason < GdsStream::Fallbacks; ++reason) {
         if (totals.fallbacks[reason] != 0) text += std::string(" ") + GdsStream::FallbackName(static_cast<Fallback>(reason)) + " " + std::to_string(totals.fallbacks[reason]);
     }
@@ -326,21 +390,25 @@ std::string Describe(const GdsStream::Totals& totals) {
     return text;
 }
 
-// Shared by every case: the mode, and whether the device records GDS operations at all (the GDS
-// imported); learned by the first readback.
+// Shared by every case: the mode, whether R is on, and whether the device records GDS operations at all
+// (the GDS imported); learned by the first case (its readback with R, its stores without).
 struct Run {
     int mode = 0;
+    bool readbacks = false;
     bool gpuGds = false;
 };
 
 // What every recorded operation must leave in the counts: one whole-GDS note each; =2 verified each,
-// with nothing to explain (nothing races in these runs); the invariant at 0.
+// with nothing to explain (nothing races in these runs); the invariant at 0. Without R nothing with a
+// GDS source is recorded (and with R nothing is left on today's path for R being off).
 void RequireBookkeeping(const Run& run, const GdsStream::Totals& delta, const std::string& what) {
     Require(delta.unnoted == 0, what + ": cpu-gds-access-unnoted " + std::to_string(delta.unnoted));
     if (run.mode == 0) {
-        Require(RecordedAll(delta) == 0 && FellAll(delta) == 0 && delta.notes == 0 && delta.idleCopies == 0 && delta.targetedSyncs == 0 && delta.accessChecks == 0 && delta.verified == 0, what + ": counted with the switch off: " + Describe(delta));
+        Require(RecordedAll(delta) == 0 && FellAll(delta) == 0 && delta.notes == 0 && delta.idleCopies == 0 && delta.readbacksOff == 0 && delta.targetedSyncs == 0 && delta.accessChecks == 0 && delta.verified == 0, what + ": counted with the switch off: " + Describe(delta));
         return;
     }
+    if (run.readbacks) Require(delta.readbacksOff == 0, what + ": a readback was left on today's path with R on: " + Describe(delta));
+    else Require(Recorded(delta, Op::Readback) + Recorded(delta, Op::GdsCopy) + Recorded(delta, Op::StoreFromGds) == 0, what + ": a transfer with a GDS source was recorded with R off: " + Describe(delta));
     Require(delta.notes == RecordedAll(delta), what + ": " + std::to_string(delta.notes) + " whole-GDS notes for " + std::to_string(RecordedAll(delta)) + " recorded operations");
     Require(delta.copyPaths[1] + delta.copyPaths[3] == Recorded(delta, Op::Readback) + Recorded(delta, Op::GdsCopy) + Recorded(delta, Op::CopyIn), what + ": copy paths do not match the recorded copies: " + Describe(delta));
     if (run.mode == 2) Require(delta.verified == RecordedAll(delta) && delta.explained == 0, what + ": =2 verified " + std::to_string(delta.verified) + " (explained " + std::to_string(delta.explained) + ") of " + std::to_string(RecordedAll(delta)) + " recorded operations");
@@ -352,6 +420,12 @@ int ExpectedMode() {
     if (text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0) return 0;
     if (std::getenv("APS5_EXPERIMENT_GDS_TARGETED_SYNC") == nullptr || std::getenv("APS5_PIPELINE_DMA") != nullptr) return 0;
     return std::strcmp(text, "2") == 0 ? 2 : 1;
+}
+
+// R: requested and the stream on.
+bool ExpectedReadbacks(int mode) {
+    const char* text = std::getenv("APS5_EXPERIMENT_GDS_READBACK_COPIES");
+    return mode != 0 && text != nullptr && text[0] != '\0' && std::strcmp(text, "0") != 0;
 }
 
 // The decode (no device): Pm4::DecodeGdsCopy's mapping and refusals, ResolveStore's GDS case.
@@ -434,12 +508,19 @@ void ReadbackAndStores(Run& run) {
     std::printf("gds in stream: readback: %s\n", Describe(delta).c_str());
     RequireBookkeeping(run, delta, "readback");
     if (run.mode == 0) return;
-    run.gpuGds = Recorded(delta, Op::Readback) == 1;
+    if (run.readbacks) {
+        run.gpuGds = Recorded(delta, Op::Readback) == 1;
+    } else {
+        // R off: the readback is today's (ResolveStore's read through the flush hook, then a label
+        // store), counted and nothing else; the stores tell whether the device records GDS operations.
+        Require(delta.readbacksOff == 1 && delta.idleCopies == 0 && CopyRefusals(delta) == 0, "readback: with R off the readback did not take today's path alone, counted: " + Describe(delta));
+        run.gpuGds = Recorded(delta, Op::Store) != 0;
+    }
     if (!run.gpuGds) {
         // No host import of the GDS (or a completion over it): today's path, counted.
-        Require(CopyRefusals(delta) + delta.idleCopies == 1, "readback: neither recorded nor counted as a fallback: " + Describe(delta));
+        if (run.readbacks) Require(CopyRefusals(delta) + delta.idleCopies == 1, "readback: neither recorded nor counted as a fallback: " + Describe(delta));
         Require(Recorded(delta, Op::Store) + StoreRefusals(delta) == 4, "readback: the four stores were neither recorded nor counted: " + Describe(delta));
-        std::puts("gds in stream: the readback was not recorded on this device (no host import of the GDS?): the GPU half is not tested, the fallbacks are");
+        std::puts("gds in stream: no GDS operation was recorded on this device (no host import of the GDS?): the GPU half is not tested, the fallbacks are");
         return;
     }
     if (run.mode == 1) {
@@ -461,10 +542,11 @@ void ReadbackAndStores(Run& run) {
     std::printf("gds in stream: readback: =2 recorded %llu of the four stores, %llu refused on the recorder its value check left idle (reason 1)\n", static_cast<unsigned long long>(stores), static_cast<unsigned long long>(idle));
 }
 
-// Row 3: write-after-read. S1 ends with GDS users in a submitted batch; S2 records a readback behind a
-// slow non-GDS dispatch, so the readback's batch is newer than every GDS user, then a 3-byte store into
-// the GDS that the GPU path does not take (the targeted path: SyncThrough of the GDS, then the CPU
-// store). Without the whole-GDS note the store lands before the readback runs.
+// Row 3: write-after-read. S1 ends with GDS users in a submitted batch; S2 records a readback (R; without
+// it today's path reads the GDS after a wait) behind a slow non-GDS dispatch, so the readback's batch is
+// newer than every GDS user, then a 3-byte store into the GDS that the GPU path does not take (the
+// targeted path: SyncThrough of the GDS, then the CPU store). Without the whole-GDS note the store lands
+// before the readback runs.
 void WriteAfterRead(const Run& run) {
     auto& block = Memory();
     block.afterRead.fill(Untouched);
@@ -492,8 +574,9 @@ void WriteAfterRead(const Run& run) {
     // Every store into the GDS that fell back synced (S1's four too, on a device that records nothing).
     Require(Fell(delta, Fallback::StoreShape) == 1 && delta.targetedSyncs == StoreRefusals(delta) + 1, "write-after-read: the 3-byte store did not take the targeted path, counted: " + Describe(delta));
     if (run.gpuGds) {
-        Require(Recorded(delta, Op::Readback) == 1, "write-after-read: the readback was not recorded: " + Describe(delta));
-        Require(delta.accessChecks >= 1, "write-after-read: the targeted sync was not checked against the recorded readback");
+        if (run.readbacks) Require(Recorded(delta, Op::Readback) == 1, "write-after-read: the readback was not recorded: " + Describe(delta));
+        else Require(delta.readbacksOff == 1, "write-after-read: with R off the readback was not counted on today's path: " + Describe(delta));
+        Require(delta.accessChecks >= 1, "write-after-read: the targeted sync was not checked against the recorded operations");
     }
 }
 
@@ -521,7 +604,8 @@ void WaitOnReadback(const Run& run) {
     const auto delta = Delta(before);
     std::printf("gds in stream: wait on a readback destination: %s\n", Describe(delta).c_str());
     RequireBookkeeping(run, delta, "wait on a readback destination");
-    if (run.mode != 0 && run.gpuGds) Require(Recorded(delta, Op::Readback) == 1, "wait on a readback destination: the readback was not recorded: " + Describe(delta));
+    if (run.mode != 0 && run.readbacks && run.gpuGds) Require(Recorded(delta, Op::Readback) == 1, "wait on a readback destination: the readback was not recorded: " + Describe(delta));
+    if (run.mode != 0 && !run.readbacks) Require(delta.readbacksOff == 1, "wait on a readback destination: with R off the readback was not counted on today's path: " + Describe(delta));
 }
 
 // A memory -> GDS copy of a dispatch's pending output, then (its own submission, so each step is
@@ -559,7 +643,7 @@ void CopyIn(const Run& run) {
     delta = Delta(before);
     std::printf("gds in stream: copy-in readback: %s\n", Describe(delta).c_str());
     RequireBookkeeping(run, delta, "copy-in readback");
-    if (run.mode != 0) Require(Recorded(delta, Op::Readback) + CopyRefusals(delta) + delta.idleCopies == 1, "copy-in readback: neither recorded nor counted: " + Describe(delta));
+    if (run.mode != 0) Require(Recorded(delta, Op::Readback) + CopyRefusals(delta) + delta.idleCopies + delta.readbacksOff == 1, "copy-in readback: neither recorded nor counted: " + Describe(delta));
 }
 
 // Fallbacks: stores while the recorder is idle (reason 1) and a readback into memory without a host
@@ -607,7 +691,142 @@ void Fallbacks(const Run& run) {
     delta = Delta(before);
     std::printf("gds in stream: fallbacks, no import: %s\n", Describe(delta).c_str());
     RequireBookkeeping(run, delta, "fallbacks: no import");
-    if (run.mode != 0) Require(Recorded(delta, Op::Readback) == 0 && CopyRefusals(delta) + delta.idleCopies == 1, "fallbacks: the readback into unimported memory was recorded or not counted: " + Describe(delta));
+    if (run.mode != 0) Require(Recorded(delta, Op::Readback) == 0 && CopyRefusals(delta) + delta.idleCopies + delta.readbacksOff == 1, "fallbacks: the readback into unimported memory was recorded or not counted: " + Describe(delta));
+}
+
+// Review fix 1 (submit liveness). The driver never counts a DMA_DATA as recorded work and a copy notes no
+// label, so before the fix a submission whose only unsubmitted work was a recorded GDS copy left its batch
+// open at its end (an end-of-pipe interrupt or a wait behind it then waited for another thread's submit).
+// Each step's first submission leaves the copy's source busy in a batch it submits (the GDS users, or the
+// spin kernel's output, ahead of the slow spin kernel), so the second one's copy is recorded behind it
+// (with R for a readback); nothing else is pending:
+//   readback alone   [GDS -> D]: once the queue finished, D is no write of the open batch;
+//   copy-in alone    [memory -> GDS]: the same for the GDS;
+//   end of pipe      [GDS -> D, RELEASE_MEM end-of-pipe interrupt]: the interrupt is delivered and D holds
+//                    the counters while the test only polls the event queue and D's memory (raw): no other
+//                    submit.
+// Every path must pass: without R a readback is today's label store (NoteLabel arms the trigger), with
+// the switch off everything is today's path.
+void Liveness(const Run& run) {
+    auto& block = Memory();
+    std::deque<Words> kept;
+    const auto busyGds = [] {
+        Words words;
+        Append(words);
+        SetCounters(words, Starts);
+        Append(words);
+        Spin(words);
+        return words;
+    };
+
+    block.lively.fill(Untouched);
+    auto before = GdsStream::CurrentTotals();
+    Submit(kept, busyGds(), ProducerQueue);
+    Words words;
+    Readback(words, block.lively.data(), CounterOffset, Counters * 4);
+    Submit(kept, std::move(words), ProducerQueue);
+    Idle("liveness: readback alone");
+    Require(!OpenBatchWrites(Address(block.lively.data()), sizeof(block.lively)), "liveness: a readback alone stayed in the open batch after its submission ended");
+    RequireValues(Read<Counters>(Address(block.lively.data())), After, "liveness: the readback alone");
+    auto delta = Delta(before);
+    std::printf("gds in stream: liveness, readback alone: %s\n", Describe(delta).c_str());
+    RequireBookkeeping(run, delta, "liveness: readback alone");
+    if (run.mode != 0 && run.readbacks && run.gpuGds) Require(Recorded(delta, Op::Readback) == 1, "liveness: the readback alone was not recorded behind the busy GDS: " + Describe(delta));
+
+    block.spinOutput.fill(0);
+    before = GdsStream::CurrentTotals();
+    words = {};
+    Spin(words);
+    Submit(kept, std::move(words), ProducerQueue);
+    words = {};
+    const auto output = Address(block.spinOutput.data());
+    DmaData(words, 0x00100000u, Low(output), High(output), CopyInOffset, 0, 4);
+    Submit(kept, std::move(words), ProducerQueue);
+    Idle("liveness: copy-in alone");
+    Require(!OpenBatchWrites(Pm4::GdsAddress() + CopyInOffset, 4), "liveness: a copy-in alone stayed in the open batch after its submission ended");
+    const auto spun = Read<1>(output)[0];
+    Require(spun != 0 && Read<1>(Pm4::GdsAddress() + CopyInOffset)[0] == spun, "liveness: the GDS does not hold the word copied in alone");
+    delta = Delta(before);
+    std::printf("gds in stream: liveness, copy-in alone: %s\n", Describe(delta).c_str());
+    RequireBookkeeping(run, delta, "liveness: copy-in alone");
+    if (run.mode != 0 && Recorded(delta, Op::CopyIn) == 0) std::puts("gds in stream: liveness: the copy-in alone took another path (its source was not a pending write of an import)");
+
+    KernelEqueue eq = 0;
+    Require(sceKernelCreateEqueue(&eq, "gds in stream eop") == 0, "liveness: event queue creation failed");
+    auto owner = EqueuePin_nid_postfix(eq);
+    Require(owner != nullptr, "liveness: the event queue did not pin");
+    int tag = 0;
+    Require(sceAgcDriverAddEqEvent(eq, static_cast<int>(ProducerQueue), &tag) == 0, "liveness: the end-of-pipe event registration failed");
+    block.endOfPipe.fill(Untouched);
+    before = GdsStream::CurrentTotals();
+    Submit(kept, busyGds(), ProducerQueue);
+    words = {};
+    Readback(words, block.endOfPipe.data(), CounterOffset, Counters * 4);
+    EndOfPipeInterrupt(words);
+    Submit(kept, std::move(words), ProducerQueue);
+    std::array<KernelEvent, 1> events{};
+    int delivered = 0;
+    const bool interrupted = PollFor([&] { return delivered != 0 || (delivered = owner->GetTriggeredEvents(events.data(), 1)) != 0; }, std::chrono::seconds(10));
+    Require(interrupted && events[0].udata == &tag, "liveness: the end-of-pipe interrupt after a readback was not delivered in 10 s without another submit");
+    RequireValues(Raw(block.endOfPipe), After, "liveness: the readback's destination (raw) when its end-of-pipe interrupt was delivered");
+    Idle("liveness: end of pipe");
+    Require(sceAgcDriverDeleteEqEvent(eq, static_cast<int>(ProducerQueue)) == 0, "liveness: the end-of-pipe event deletion failed");
+    owner.reset();
+    Require(sceKernelDeleteEqueue(eq) == 0, "liveness: event queue deletion failed");
+    delta = Delta(before);
+    std::printf("gds in stream: liveness, end of pipe: %s\n", Describe(delta).c_str());
+    RequireBookkeeping(run, delta, "liveness: end of pipe");
+    if (run.mode != 0 && run.readbacks && run.gpuGds) Require(Recorded(delta, Op::Readback) == 1, "liveness: the readback before the end-of-pipe interrupt was not recorded behind the busy GDS: " + Describe(delta));
+}
+
+// Review finding 2 (label history): the known difference R keeps, documented here, not fixed. A
+// waiter on queue 0x48, received first, waits EQUAL for the first of two values the producer reads back
+// into one destination in one submission (the counter after the dispatches, then a value stored into the
+// GDS between the readbacks). Today's path (R off, or the switch off) stores each value read as a label
+// with its history entry, and waitMemory accepts any of the last 4 values stored since the wait was
+// received: satisfied, required. With R the readbacks are GPU copies with no history, and memory shows
+// the first value only between the two copies' batches: expected to differ (it may still be satisfied
+// by a poll in that window), so only printed. The waiter's done word is polled for 3 s; a waiter still
+// blocked then (R) is released once the producer finished, by storing the awaited value on the CPU, so
+// nothing hangs.
+void Aba(const Run& run) {
+    auto& block = Memory();
+    block.aba.fill(Untouched);
+    std::deque<Words> kept;
+    constexpr std::uint32_t Second = 0x5eed0abau;
+    auto& destination = block.aba[0];
+    auto& waited = block.aba[1];
+    auto& produced = block.aba[2];
+    const auto before = GdsStream::CurrentTotals();
+    Words waiter;
+    WaitEqual(waiter, &destination, After[0]);
+    WriteWord(waiter, &waited, 1);
+    Submit(kept, std::move(waiter), WaiterQueue);
+    Words producer;
+    Append(producer);
+    SetCounters(producer, Starts);
+    Append(producer);
+    Readback(producer, &destination, CounterOffset, 4);
+    DmaData(producer, 0x40100000u, Second, 0, CounterOffset, 0, 4);
+    Readback(producer, &destination, CounterOffset, 4);
+    WriteWord(producer, &produced, 1);
+    Submit(kept, std::move(producer), ProducerQueue);
+    const bool satisfied = PollFor([&] { return Raw(waited) == 1; }, std::chrono::seconds(3));
+    if (!run.readbacks) Require(satisfied, "aba: the EQUAL wait for the first of two values read back into one destination was not satisfied in 3 s on today's path (the label history holds both)");
+    std::printf("gds in stream: aba: the EQUAL wait for the first value was %s%s\n", satisfied ? "satisfied" : "not satisfied in 3 s", run.readbacks ? " (R: the documented difference, expected to differ, not checked)" : "");
+    if (!satisfied) {
+        Require(PollFor([&] { return Raw(produced) == 1; }, std::chrono::seconds(20)), "aba: the producer did not finish in 20 s");
+        Require(Read<1>(Address(&destination))[0] == Second, "aba: the destination does not hold the second value once the producer finished");
+        const auto release = After[0];
+        AgcDriver::GuestMemory::Write(Address(&destination), std::as_bytes(std::span(&release, 1)), 4);
+        Require(PollFor([&] { return Raw(waited) == 1; }, std::chrono::seconds(10)), "aba: the waiter released by a CPU store of its value did not finish in 10 s");
+    }
+    Idle("aba");
+    if (satisfied) Require(Read<1>(Address(&destination))[0] == Second, "aba: the destination does not hold the second value");
+    const auto delta = Delta(before);
+    std::printf("gds in stream: aba: %s\n", Describe(delta).c_str());
+    RequireBookkeeping(run, delta, "aba");
+    if (run.mode != 0 && !run.readbacks) Require(delta.readbacksOff == 2, "aba: with R off the two readbacks were not counted on today's path: " + Describe(delta));
 }
 
 // --behind-completions: reason 5 (judge fix), on a device of its own, with APS5_LABEL_GATE_ALL=1 (main sets
@@ -675,6 +894,7 @@ int main(int argc, char** argv) {
         if (behindCompletions) return BehindCompletions();
         Run run;
         run.mode = ExpectedMode();
+        run.readbacks = ExpectedReadbacks(run.mode);
         Decode();
         {
             const auto device = OpenVulkanTestDevice();
@@ -683,11 +903,14 @@ int main(int argc, char** argv) {
         // Read at the first DMA_DATA that touches the GDS: the first case reads it.
         ReadbackAndStores(run);
         Require(GdsStream::Mode() == run.mode, "the switch resolved to " + std::to_string(GdsStream::Mode()) + ", expected " + std::to_string(run.mode));
-        std::printf("gds in stream: mode %d, GDS operations recorded on this device: %s\n", run.mode, run.gpuGds ? "yes" : "no");
+        Require(GdsStream::ReadbackCopies() == run.readbacks, std::string("the readback switch resolved ") + (GdsStream::ReadbackCopies() ? "on" : "off") + ", expected " + (run.readbacks ? "on" : "off"));
+        std::printf("gds in stream: mode %d, R %s, GDS operations recorded on this device: %s\n", run.mode, run.readbacks ? "on" : "off", run.gpuGds ? "yes" : "no");
         WriteAfterRead(run);
         WaitOnReadback(run);
         CopyIn(run);
         Fallbacks(run);
+        Liveness(run);
+        Aba(run);
         const auto totals = GdsStream::CurrentTotals();
         std::printf("gds in stream: totals: %s\n", Describe(totals).c_str());
         Require(totals.unnoted == 0, "cpu-gds-access-unnoted " + std::to_string(totals.unnoted));
