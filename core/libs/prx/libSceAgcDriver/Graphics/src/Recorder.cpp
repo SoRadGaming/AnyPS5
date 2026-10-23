@@ -2248,7 +2248,15 @@ void Recorder::CountSamples() {
 
 std::uint64_t Recorder::SamplesTotal() {
     if (sampleCounterState <= 0) return samplesPassed.load(std::memory_order_acquire);
-    if (segmentMode() && !Idle()) Sync();
+    if (segmentMode() && !Idle()) {
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C7): the [zpass] line's segment syncs.
+        const auto syncStartNs = Stream::On() ? Stream::NowNs() : 0;
+        Sync();
+        if (syncStartNs != 0) {
+            Stream::Add(Stream::counters.segmentSyncs);
+            Stream::Add(Stream::counters.segmentSyncNs, Stream::NowNs() - syncStartNs);
+        }
+    }
     std::uint64_t total = 0;
     std::memcpy(&total, sampleCounter->Bytes().data(), sizeof(total));
     for (const auto& segment : pendingSamples) {

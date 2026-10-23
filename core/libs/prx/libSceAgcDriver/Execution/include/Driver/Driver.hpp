@@ -131,6 +131,9 @@ private:
     static bool dataHits();
     static bool verifyDataHits();
     static bool pipelineDispatch();
+    // Whether resolveGroupAhead captures dispatch groups ahead on `queue` (queue 0 only with
+    // APS5_GROUP_CAPTURE_ALL_QUEUES); DRAIN-PLAN C3/D4 asks it for queue 0.
+    static bool groupCaptureOnQueue(std::uint32_t queue);
     static std::size_t dispatchVariants();
     static bool insertCompare();
     static std::size_t dispatchCacheEntries();

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <cstdlib>
@@ -8,6 +9,9 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a label store over a GDS readback destination
+    // before anything read it overwrites it.
+    Drain::NoteTouch(Drain::Touch::Overwritten, address, bytes.size());
     if (!KeepsLabelStore(address, bytes.size())) return;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {

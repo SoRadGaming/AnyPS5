@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS=1, PARALLEL-COMMIT-PLAN S0): the counters of the [stream]
 // line that are kept outside DrawPipeline (the committer's idle attribution, the drain sites and the
@@ -28,6 +29,17 @@ inline constexpr std::array<const char*, Roles> RoleNames{"other", "committer", 
 // check off the switch is a load and a predictable branch, not a call into GuestMemory.
 inline bool On() {
     static const bool on = GuestMemory::StreamStats() != 0;
+    return on;
+}
+
+// LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): the GPU-wait clock below (ThreadGpuWait) also
+// runs under the GDS counters, whose per-packet CPU wait it gives without APS5_PROFILE_DRAW (the
+// spans Recorder::ThreadWaitedMs counts only under that switch). Read once.
+inline bool WaitClockOn() {
+    static const bool on = On() || [] {
+        const char* text = std::getenv("APS5_DEBUG_GDS_STATS");
+        return text != nullptr && text[0] != '\0' && text[0] != '0';
+    }();
     return on;
 }
 
@@ -140,6 +152,10 @@ struct Counters {
     // role's held ns over it, see GuestMemory's StreamWaitSplit; the lock is not FIFO).
     std::array<std::array<Counter, Roles>, Roles> gpuWaits{};
     std::array<std::array<Counter, Roles>, Roles> gpuWaitNs{};
+    // LOCAL DEBUG (DRAIN-PLAN C7): the syncs Recorder::SamplesTotal makes in segment mode (the
+    // CountSamples segment syncs of a ZPASS_DONE dump) and their time; the [zpass] line takes them.
+    Counter segmentSyncs{};
+    Counter segmentSyncNs{};
 };
 
 inline constinit Counters counters;
@@ -150,10 +166,11 @@ inline constinit Counters counters;
 struct ThreadGpuWaitTag {};
 using ThreadGpuWait = HostThreadSlot<std::uint64_t, ThreadGpuWaitTag>;
 
-// Times one GPU wait onto ThreadGpuWait; off, nothing beyond the switch's branch.
+// Times one GPU wait onto ThreadGpuWait (under either switch of WaitClockOn); off, nothing beyond
+// the switch's branch.
 class GpuWaitScope {
 public:
-    GpuWaitScope() : startNs(On() ? NowNs() : 0) {}
+    GpuWaitScope() : startNs(WaitClockOn() ? NowNs() : 0) {}
     ~GpuWaitScope() {
         if (startNs != 0) ThreadGpuWait::Set(ThreadGpuWait::Get() + (NowNs() - startNs));
     }

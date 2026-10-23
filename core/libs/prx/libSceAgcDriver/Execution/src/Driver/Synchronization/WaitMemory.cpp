@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -136,14 +137,23 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     } epochPoint;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
+    // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a GDS readback destination this wait reads
+    // (its first touch, by how the wait ends), and for queue 0 the blame of a wait that polls.
+    Drain::WaitRecord gdsRecord(queue, awaited, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
+        gdsRecord.how = Drain::WaitHow::Entry;
         return;
     }
-    if (heldAtSubmit) return;
+    if (heldAtSubmit) {
+        gdsRecord.how = Drain::WaitHow::Held;
+        return;
+    }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
+        gdsRecord.how = Drain::WaitHow::Stored;
+        gdsRecord.producer = writer;
         return;
     }
 
@@ -182,6 +192,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
+        gdsRecord.how = Drain::WaitHow::Table;
+        gdsRecord.producer = hit->queue;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
             if (!hit->late) epochPoint.bump = false;
@@ -323,6 +335,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     if (entryTryFailed && pollService(false)) return;
 
     noteWaitBlocked(queue, awaited, true);
+    gdsRecord.polled = true;
     struct BlockedWait {
         Driver& driver;
         std::uint32_t queue;
@@ -339,6 +352,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
+            gdsRecord.how = Drain::WaitHow::Stored;
+            gdsRecord.producer = writer;
             return;
         }
         ++polls;
@@ -405,6 +420,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    // LOCAL DEBUG (DRAIN-PLAN C1): satisfied by polling; the satisfying store's queue, from the label
+    // history when it holds one.
+    if (gdsRecord.Active()) {
+        gdsRecord.how = Drain::WaitHow::Polled;
+        if (std::uint32_t writer = ~0u; storedSince(packet, awaited, awaitedBytes, 0, &writer)) gdsRecord.producer = writer;
+    }
 }
 
 }

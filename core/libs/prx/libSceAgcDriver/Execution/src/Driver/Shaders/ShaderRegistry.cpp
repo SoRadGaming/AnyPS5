@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
@@ -78,10 +79,22 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
     if (GuestMemory::SpeculativeReader()) throw std::runtime_error("AGC driver: a raw shader program is not available to a speculative reader");
-    const auto drain = [](std::uint64_t first, std::size_t bytes) {
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C3, C6): a code read the gate's writes (or a
+    // hidden-write draw queued at the gate) would have to drain for ends the gate window (Capture); a
+    // hidden-write draw queued with no overlap drain is D1's hidden-write condition (once per read).
+    bool hiddenNoted = false;
+    const auto drain = [&hiddenNoted](std::uint64_t first, std::size_t bytes) {
+        if (Stream::On()) Drain::GateCapture(first, bytes);
         if (!DrawPipeline::Active()) return;
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(first, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (pipeline.Busy() && pipeline.Overlaps(first, bytes)) {
+            pipeline.Drain(DrawPipeline::DrainReason::Capture);
+            return;
+        }
+        if (Stream::On() && !hiddenNoted && pipeline.HiddenWritesQueued() != 0) {
+            hiddenNoted = true;
+            Drain::NoteGuard(Drain::Guard::HiddenShader, false);
+        }
     };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), 256);
     static std::mutex cacheMutex;

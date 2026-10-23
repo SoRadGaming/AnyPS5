@@ -425,6 +425,11 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    // LOCAL DEBUG (DRAIN-PLAN C5, the [recipe] dispatch line): the first condition of noteReusable that
+    // refused the object, in its order (None when it is reusable or its build has not ended).
+    enum class Unreusable : std::uint8_t { None, CopiedWrites, Lease, Bda, MultisampleSources, LoopGuard, RefreshedTexture, DataRefresh, NoDirectRegions, UnservedRegion, Count };
+    static constexpr std::array<const char*, static_cast<std::size_t>(Unreusable::Count)> UnreusableNames{"none", "copied-writes", "lease", "bda", "multisample-sources", "loop-guard", "refreshed-texture", "data-refresh", "no-direct-regions", "unserved-region"};
+    std::uint8_t UnreusableReason() const { return static_cast<std::uint8_t>(unreusable); }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
@@ -798,6 +803,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    Unreusable unreusable = Unreusable::None;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before

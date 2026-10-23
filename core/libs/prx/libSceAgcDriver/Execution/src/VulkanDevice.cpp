@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "BdaAbi.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -5674,6 +5675,15 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, resources->Describe().c_str());
     WatchMemory(programAddress);
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS or APS5_DEBUG_RECIPE_REFUSALS, DRAIN-PLAN C5): the build
+    // decision below for an armed Drain::RecipeNote (Dispatch.cpp): its first failing term in order,
+    // and whether the resource cache served a template (an overlay is a template hit whose moved
+    // buffers it serves).
+    if (Drain::RecipeCounting() && Drain::RecipeNoteArmed()) {
+        using Outcome = Drain::RecipeOutcome;
+        const auto outcome = recipeOut == nullptr ? Outcome::NoAttach : !DispatchRecipes() ? Outcome::RecipesOff : !cacheable ? Outcome::Uncacheable : overlay != nullptr ? Outcome::MovedOverlay : !resources->Reusable() ? Outcome::NotReusable : resources->NeedsCompletion() ? Outcome::NeedsCompletion : objects == nullptr ? Outcome::NoObjects : contentKey.empty() ? Outcome::NoContentKey : Outcome::Built;
+        Drain::NoteRecipeBuild(outcome, resources->UnreusableReason(), fromCache);
+    }
     // The recipe for the caller's dispatch-cache variant (design_cpu_final M4, rule R3): only an
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's

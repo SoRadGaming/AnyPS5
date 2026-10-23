@@ -25,6 +25,10 @@ constexpr std::uint32_t Image = 16u;
 }
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded, std::uint32_t* unboundedRoles = nullptr);
 bool ExactDrawWrites();
+// DRAIN-PLAN D1 (O5): whether a draw may write guest memory that DrawWriteRanges leaves out: a stage
+// with a BDA ABI, a Gds, BdaPagetable or FaultBuffer binding (DispatchWriteRanges' unbounded roles),
+// or a depth target with HTILE. A queued draw flagged so is counted by HiddenWritesQueued.
+bool DrawHiddenWrites(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_Q0_TICKET): the ranges Driver::noteDrawWriters notes for the
 // stages, in its order (a ticket's WriterRanges part, noted at the commit by noteDrawWriterRanges).
 // False, leaving `ranges` as it was, when a stage has no compiled program.

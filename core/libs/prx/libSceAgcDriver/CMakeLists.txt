@@ -286,6 +286,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WriteEvidence.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WrittenBuffers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/CommandValidation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/DrainStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketExecution.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketFlush.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketHistory.cpp
@@ -3201,6 +3202,9 @@ if(BUILD_TESTING)
             # HostImportFor PrepareScope assertions, alone and over queue 0's verified tickets
             # (whose preparation runs inside a PrepareScope).
             "stream_stats|APS5_DEBUG_STREAM_STATS=1"
+            # LOCAL DEBUG (DRAIN-PLAN section 6, D0): the drain counters C0-C7 with the GDS counters
+            # (their per-packet GpuMutex hold, readback rings and wait records) on.
+            "drain_counters|APS5_DEBUG_STREAM_STATS=1,APS5_DEBUG_GDS_STATS=1"
             "stream_q0_words|APS5_DEBUG_STREAM_STATS=1,APS5_EXPERIMENT_Q0_TICKET=2,APS5_EXPERIMENT_Q0_PREP_DEPTH=0:0,APS5_EXPERIMENT_Q0_TEMPLATE=2,APS5_EXPERIMENT_Q0_WORD_BUFFERS=2"
             # LOCAL EXPERIMENT (PARALLEL-COMMIT-PLAN C1): the committer's local cuts, verified (the
             # committed flag against std::uncaught_exceptions, including the failure run's throw;

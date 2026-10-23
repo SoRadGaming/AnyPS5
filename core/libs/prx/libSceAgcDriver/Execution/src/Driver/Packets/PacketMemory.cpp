@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
@@ -135,16 +136,20 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (outcome.path != 1 && outcome.path != 3) throw std::runtime_error("AGC driver: a DMA_DATA copy of up to 64 KiB that GpuCopyPossible accepted took copy path " + std::to_string(outcome.path));
             return true;
         };
+        // LOCAL DEBUG (DRAIN-PLAN C1, C2): a DMA_DATA's path, for its Drain::PacketRecord (the CPU
+        // paths are named there by whether the packet waited for the GPU).
         if (copyBehindPendingSource()) {
             ++copiesBehindPendingSources;
             wroteOnGpu = true;
             drained = false;
+            if (opcode == 0x50) Drain::NoteDmaPath(Drain::DmaPath::GpuCopy);
         } else if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
                 orderedAlready = true;
                 drained = false;
+                if (opcode == 0x50) Drain::NoteDmaPath(Drain::DmaPath::Nothing);
             } else {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
@@ -156,6 +161,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
+                if (opcode == 0x50) Drain::NoteDmaPath(reason == 0 ? Drain::DmaPath::GpuStore : Drain::DmaPath::Fallback, reason);
                 if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
@@ -181,6 +187,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     if (outcome.path == 1 || outcome.path == 3) {
                         wroteOnGpu = true;
                         drained = false;
+                        Drain::NoteDmaPath(Drain::DmaPath::GpuCopy);
                     } else if (outcome.path == 2 && !Graphics::RegisteredReadableCovers(copy->destination, copy->bytes) && !localDevice->StoresPendingOver(copy->destination, copy->bytes)) {
                         Graphics::StorageTexture::FlushPending(copy->source, copy->bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
                         if (auto* recorder = Graphics::Recorder::Active()) recorder->SyncThrough(copy->source, copy->bytes);
@@ -196,6 +203,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             const std::size_t bytes = packet[6] & 0x3ffffffu;
             if (bytes != 0 && destination % 16 == 0 && bytes % 16 == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(destination), bytes, true)) {
                 if (const auto localDevice = device.Load()) {
+                    // Named before the fill: on queue 0 its push ends the packet's drain episode.
+                    Drain::NoteDmaPath(Drain::DmaPath::GpuFill);
                     storeBufferFill(submission.queue, destination, bytes, {packet[2], packet[2], packet[2], packet[2]}, localDevice, false, false);
                     ++dmaFills;
                     wroteOnGpu = true;

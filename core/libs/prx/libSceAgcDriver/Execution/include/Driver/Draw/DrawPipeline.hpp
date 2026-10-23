@@ -69,12 +69,25 @@ public:
     // inline because the pipeline is closing (no item, so no helper job).
     // `reads` are the guest ranges the commit reads (a draw's vertex and index data, a DMA copy's
     // source) that a deferred store must not change while the item is queued (HeldReads).
-    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr);
+    // `hiddenWrites` (DRAIN-PLAN D1, from DrawHiddenWrites) says the commit may write guest memory
+    // that `writes` leaves out (BDA, fault-buffer or GDS stores, depth HTILE): HiddenWritesQueued.
+    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, ItemKind kind = ItemKind::Other, const Prepare* prepare = nullptr, bool hiddenWrites = false);
     // An item without held reads that names its kind (label enqueues, the pipelined CPU-path
     // indirect draw).
-    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare = nullptr) {
-        return Enqueue(std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), {}, kind, prepare);
+    std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare = nullptr, bool hiddenWrites = false) {
+        return Enqueue(std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), {}, kind, prepare, hiddenWrites);
     }
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN D1's tracking for C3 and C6): whether the draw
+    // enqueues compute their hidden-write flag (off: they pass none and nothing is counted), and the
+    // queued items flagged so, counted at the push and uncounted at the pop after their commit.
+    static bool HiddenWriteTracking() {
+        static const bool on = hiddenWriteTracking();
+        return on;
+    }
+    std::size_t HiddenWritesQueued() const { return hiddenOutstanding.load(std::memory_order_acquire); }
+    // The queued items' writes (their declared ranges and appended labels' bytes) appended to
+    // `writes`; returns how many items were queued. Takes the pipeline mutex.
+    std::size_t CopyWrites(std::vector<Range>& writes);
     // `site` names the caller for the [stream] drain sites (APS5_DEBUG_STREAM_STATS); unused otherwise.
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100, std::source_location site = std::source_location::current());
     // Stops the prep helpers first (PrepHelpers::Stop: their queued jobs' pins go to RetirePin), then
@@ -185,6 +198,10 @@ public:
     bool StreamCuttable() const { return streamCuttable.load(std::memory_order_relaxed); }
     void NoteDrainClass(std::uint64_t before, std::uint8_t dispatchClass, std::uint64_t shadowNs, StreamPoint drain);
     void NoteWouldDrain(DrainReason reason, std::uint32_t opcode);
+    // LOCAL DEBUG (DRAIN-PLAN C2, C7): names the open episode `serial` (a drain's, read with
+    // DrainEpisode) with a Drain::Tag*; its idle, serial phase and the wake after its push are then
+    // also filed there (Drain::FileTaggedEpisode). Nothing when that episode closed already.
+    void TagStreamEpisode(std::uint64_t serial, std::uint16_t tag);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
     void ReleaseRunningReads();
 
@@ -210,9 +227,12 @@ private:
         std::uint32_t pushDepth = 0;
         // The item's place in the stream (Enqueue's return; CommittingSeq).
         std::uint64_t seq = 0;
+        // Counted in hiddenOutstanding until its pop.
+        bool hidden = false;
     };
     struct CommitRun;
     DrawPipeline() = default;
+    static bool hiddenWriteTracking();
     void run();
     Item* commitFront(Item* front, CommitRun* run);
     void commitRun(Item* front);
@@ -228,6 +248,10 @@ private:
     void fileStreamWake(std::uint64_t foundNs, std::uint64_t idleStartNs);
     void copyQueuedWriters(std::vector<QueuedWriter>& writers) const;
     void reportStream(std::unique_lock<std::mutex>& lock);
+    // LOCAL DEBUG (DRAIN-PLAN C4): the site slot of a call site, reason and opcode in this window
+    // (the last slot takes the rest), and the producer-slow part of an idle span ending now.
+    std::size_t streamSiteSlot(const char* file, std::uint32_t line, std::uint32_t opcode, DrainReason reason);
+    void fileProducerSlow(std::uint64_t spanNs);
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -238,6 +262,7 @@ private:
     std::deque<Item> items;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
+    std::atomic<std::size_t> hiddenOutstanding{0};
     std::uint32_t idleWaiters = 0;
     std::uint32_t roomWaiters = 0;
     bool committerWaiting = false;
@@ -293,6 +318,10 @@ private:
         std::uint64_t waitNs = 0;
         std::uint64_t idleNs = 0;
         std::uint64_t serialNs = 0;
+        // LOCAL DEBUG (DRAIN-PLAN C4): producer-slow idle spans that ended within the first 8 pushes
+        // after an episode of this site closed, and their idle.
+        std::uint64_t refills = 0;
+        std::uint64_t refillNs = 0;
     };
     // An open episode keeps its drain's site and wait; all of it is counted when it closes, in the
     // window of its close.
@@ -320,6 +349,8 @@ private:
         std::uint64_t cutGpuWaitNs = 0;
         std::uint64_t shadowNs = 0;
         std::uint64_t cutShadowNs = 0;
+        // LOCAL DEBUG (DRAIN-PLAN C2, C7): TagStreamEpisode's tag (0: none).
+        std::uint16_t tag = 0;
     };
     // The committer's wake after the push that closed an episode in which it idled, filed when it
     // takes that item under the episode's site and the class slot its idle ended in.
@@ -329,6 +360,7 @@ private:
         std::size_t classSlot = 0;
         bool cut = false;
         std::uint64_t pushedAtNs = 0;
+        std::uint16_t tag = 0;
     };
     struct StreamCounts {
         std::array<std::uint64_t, 3> busyNs{};
@@ -356,6 +388,12 @@ private:
         std::array<std::uint64_t, LeadBuckets> leads{};
         std::array<std::uint64_t, LeadDepthBuckets> leadDepths{};
         std::array<std::uint64_t, LeadDepthBuckets> leadDepthNs{};
+        // LOCAL DEBUG (DRAIN-PLAN C0): draw items committed (draws per present tag the window).
+        std::uint64_t draws = 0;
+        // LOCAL DEBUG (DRAIN-PLAN C4): producer-slow idle outside the refill pushes (the sites keep
+        // theirs), and the spans it took.
+        std::uint64_t slowElsewhere = 0;
+        std::uint64_t slowElsewhereNs = 0;
     };
     StreamCounts streamCounts;
     StreamEpisode streamEpisode;
@@ -375,6 +413,17 @@ private:
     // When the committer's loop last went looking for work (0 while it commits); read by the push
     // that closes a drain episode.
     std::atomic<std::uint64_t> streamIdleSinceNs{0};
+    // LOCAL DEBUG (DRAIN-PLAN C4), under the mutex: the episode idle and wake filed during the
+    // committer's current idle span (the rest of the span is producer slow), and the pushes since
+    // the last episode closed (0: the closing push; past RefillPushes the refill is over) with that
+    // episode's site.
+    static constexpr std::uint32_t RefillPushes = 8;
+    std::uint64_t streamSpanDrainNs = 0;
+    std::uint32_t streamRefillPushes = RefillPushes + 1;
+    const char* streamRefillFile = nullptr;
+    std::uint32_t streamRefillLine = 0;
+    std::uint32_t streamRefillOpcode = 0;
+    DrainReason streamRefillReason = DrainReason::Packet;
 };
 
 }

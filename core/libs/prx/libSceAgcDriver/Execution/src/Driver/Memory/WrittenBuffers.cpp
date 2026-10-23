@@ -181,6 +181,18 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     return ranges;
 }
 
+bool DrawHiddenWrites(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+    if (graphics.depth && graphics.depth->htileAddress != 0) return true;
+    for (const auto& stage : stages) {
+        if (stage.program == nullptr) continue;
+        if (stage.program->bdaAbiVersion != 0) return true;
+        for (const auto& binding : stage.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) return true;
+        }
+    }
+    return false;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
     return DrawWriteRanges(graphics, stages, ExactDrawWrites());
 }

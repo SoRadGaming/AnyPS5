@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -72,6 +73,8 @@ std::string Driver::describeIndirectSource() {
 
 std::array<std::uint32_t, 5> Driver::readDispatchArguments(std::uint32_t queue, std::uint64_t arguments, std::uint32_t initiator) {
     recordQueuedLabelsBeforeRead(queue);
+    // LOCAL DEBUG (APS5_DEBUG_GDS_STATS, DRAIN-PLAN C1): a GDS readback destination's touch.
+    Drain::NoteTouch(Drain::Touch::DispatchArguments, arguments, 12);
     if (!resolvingAhead()) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Indirect);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DwordPatternFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/StreamStats.hpp"
@@ -204,6 +205,24 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C3, C6): the two notes below read guest
+        // memory and change state queued draws read at their commit, with no drain of their own: D1's
+        // guard conditions met with items queued (today's gap), and C3's window exits at them. Both
+        // matchers read only code and user data.
+        if (Stream::On() && indirectArguments == 0) {
+            const bool queued = DrawPipeline::Active() && DrawPipeline::Queue0().Busy();
+            if (queued || Drain::GateWindowOpen()) {
+                const auto code = std::span(snapshot.code).subspan(codeOffset);
+                if (Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads)) {
+                    if (queued) Drain::NoteGuard(Drain::Guard::Msaa, false);
+                    Drain::GateClose(Drain::GateExit::MsaaGuard);
+                }
+                if ((packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]})) {
+                    if (queued) Drain::NoteGuard(Drain::Guard::ValueFill, false);
+                    Drain::GateClose(Drain::GateExit::ValueFillGuard);
+                }
+            }
+        }
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
@@ -228,6 +247,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             shadowCandidate = !shadowRefused.has_value();
             if (shadowCandidate) shadowQueued = DrawPipeline::Queue0().SnapshotWriters(ThreadScratch<std::vector<DrawPipeline::QueuedWriter>, ShadowWritersTag>(), shadow.episode);
         }
+        // LOCAL DEBUG (DRAIN-PLAN C3): the non-fill dispatch's own drain ends the gate window.
+        if (Stream::On()) Drain::GateClose(Drain::GateExit::NonFill);
         if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         if (shadowRefused.has_value()) shadow.Classify(*shadowRefused);
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
@@ -448,6 +469,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseLookup);
     } else {
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C5): a queue-0 dispatch of a 0x16 packet (on
+        // the GPU path, or its CPU-read arguments), filed by the key parts that changed since that
+        // shader's previous one when it missed.
+        if (Stream::On() && submission.queue == 0 && !resolving && (indirectArguments != 0 || indirectSource().arguments != 0)) {
+            std::array<std::uint32_t, 5> keyRegisters{};
+            std::size_t at = 0;
+            for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+                const auto found = queue.shader.find(offset);
+                keyRegisters[at++] = found == queue.shader.end() ? ~0u : found->second;
+            }
+            Drain::NoteIndirectKey(address, userData, compute.partialThreads, keyRegisters, registeredShader.get(), packet[4] & 0x8000u, !cached);
+        }
     }
     timing.Mark("lookup_cache");
     // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS): the candidate's class, in A1's order: a miss drains,
@@ -671,10 +704,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     std::shared_ptr<RecipeHit> recipeHit;
+    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS or APS5_DEBUG_RECIPE_REFUSALS, DRAIN-PLAN C5): how a queue-0
+    // direct dispatch-cache hit's device call went, with the device's own recipe build decision
+    // (Drain::RecipeNote, armed around the calls below).
+    const bool recipeCounted = Drain::RecipeCounting() && submission.queue == 0 && indirectArguments == 0 && cached && !fromAhead;
+    const bool recipeAttached = recipeCounted && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr;
     if (cached && keepVariant != nullptr && !stampValidate()) {
         recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
+    const bool recipeTried = recipeHit != nullptr;
+    bool recipeRebuilt = false;
+    const Drain::RecipeNote recipeNote(recipeCounted);
 
     std::shared_ptr<const Recipe> builtRecipe;
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
@@ -742,6 +783,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 if (result == RecipeOutcome::Rebuild) {
 
                     recipeHit = nullptr;
+                    recipeRebuilt = true;
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, indirectArguments != 0);
                     continue;
                 }
@@ -772,6 +814,19 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         break;
     }
     phaseTiming.Phase(PhaseDevice);
+    if (recipeCounted) {
+        auto outcome = Drain::RecipeOutcome::Built;
+        std::uint8_t unreusable = 0;
+        bool fromCache = recipeTried;
+        auto built = Drain::RecipeOutcome::Built;
+        const bool noted = recipeNote.Taken(built, unreusable, fromCache);
+        if (stampValidate()) outcome = Drain::RecipeOutcome::StampValidate;
+        else if (recipeTried) outcome = recipeRebuilt ? Drain::RecipeOutcome::Rebuild : Drain::RecipeOutcome::RecipeHit;
+        else if (recipeAttached) outcome = Drain::RecipeOutcome::PrecheckRefused;
+        else if (attachTo == nullptr) outcome = Drain::RecipeOutcome::NoAttach;
+        else if (noted) outcome = built;
+        Drain::CountDispatchRecipe(outcome, unreusable, fromCache);
+    }
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     deviceMs += phaseTiming.Elapsed();
     phaseTiming.Phase(PhaseTail);
