@@ -2538,6 +2538,23 @@ void verifyDepthViewPrediction(DepthViewLease& view, const DepthTarget& target, 
     facts.storeBack.accessibleDiffers = verdict.accessibleRead && verdict.accessible != prediction.accessible;
     facts.storeBack.foundDiffers = prediction.route == DepthViewRoute::NotPending && verdict.lookedUp && (!verdict.found || verdict.foundValue != prediction.h);
     facts.storeBack.collectedAbove = verdict.collectedRead && verdict.collected > prediction.memoCurrent;
+    // Accessible, and no read proof looked up: a pending write was found over the HTILE.
+    facts.storeBackPending = verdict.collectedRead && !verdict.lookedUp;
+    // A store-back disagreement on the not-pending route that stored nothing: whether the HTILE itself
+    // was stamped since the prediction, the update besides the memo key and the lookup that fails
+    // today's UnchangedSince (the r73 review: the collect's answer, a memo hit's tracker generation,
+    // rises with a stamp anywhere). The prediction's unchanged HTILE row, from h, in one tracker lock
+    // without the drain (surfaces -> tracker, as for the plane below; a report's plain lock, not counted
+    // on [guestmem]); a stamp before today's UnchangedSince is still there, as stamps only rise. A row
+    // with no proof left counts as stamped. Not read when the store-back stored (htileCleared): its own
+    // store stamped the whole HTILE, so such a verdict is excused only by the memo key or the lookup.
+    if (prediction.route == DepthViewRoute::NotPending && verdict.kind != HtileVerdictKind::NotPendingProved && htileCleared == 0) {
+        const GuestMemory::UnchangedQuery htileRow{target.htileAddress, prediction.htileBytes, prediction.h};
+        auto row = GuestMemory::StampRow::Held;
+        GuestMemory::StampsHoldReport report{std::span(&row, 1)};
+        static_cast<void>(GuestMemory::StampsHold(std::span(&htileRow, 1), {}, {}, false, nullptr, nullptr, &report));
+        facts.storeBack.htileStamped = row != GuestMemory::StampRow::Held;
+    }
     facts.cleared = cleared;
     facts.created = created;
     facts.sameSurface = &surface == prediction.surface;
@@ -2585,10 +2602,10 @@ void verifyDepthViewPrediction(DepthViewLease& view, const DepthTarget& target, 
         return std::string(text);
     };
     char text[1536];
-    std::snprintf(text, sizeof(text), "target 0x%llx (stencil 0x%llx, HTILE 0x%llx): the lease predicted a hit (route %s, oldest %llu, h %llu, current %llu, memo-current %llu) but today's %s part disagrees: %s (today: store-back %s returned 0x%x, cleared HTILE taken %d, created %d, the predicted surface %d, retired %d, synced %d; HTILE read proof %s%llu, units %llu..%llu, depth memory %llu, stencil memory %llu; evidence: store-back memo key %d, Accessible %d, read proof %d, collect above %d; identity: %s; sync: %s, plane stamped %d)",
+    std::snprintf(text, sizeof(text), "target 0x%llx (stencil 0x%llx, HTILE 0x%llx): the lease predicted a hit (route %s, oldest %llu, h %llu, current %llu, memo-current %llu) but today's %s part disagrees: %s (today: store-back %s (pending %d) returned 0x%x, cleared HTILE taken %d, created %d, the predicted surface %d, retired %d, synced %d; HTILE read proof %s%llu, units %llu..%llu, depth memory %llu, stencil memory %llu; evidence: store-back memo key %d, Accessible %d, read proof %d, collect above %d, HTILE stamped %d; identity: %s; sync: %s, plane stamped %d)",
                   static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.htileAddress), DepthViewRouteName(prediction.route), static_cast<unsigned long long>(prediction.oldest), static_cast<unsigned long long>(prediction.h), static_cast<unsigned long long>(prediction.current), static_cast<unsigned long long>(prediction.memoCurrent),
-                  DepthViewPartName(check.part), check.reason, HtileVerdictName(verdict.kind), static_cast<unsigned>(htileCleared), cleared ? 1 : 0, created ? 1 : 0, facts.sameSurface ? 1 : 0, view.retiredBefore ? 1 : 0, view.synced ? 1 : 0, facts.htileReadFound ? "" : "absent, ", static_cast<unsigned long long>(facts.htileRead),
-                  static_cast<unsigned long long>(facts.unitsLow), static_cast<unsigned long long>(facts.unitsHigh), static_cast<unsigned long long>(facts.depthMemory), static_cast<unsigned long long>(facts.stencilMemory), facts.storeBack.memoMoved ? 1 : 0, facts.storeBack.accessibleDiffers ? 1 : 0, facts.storeBack.foundDiffers ? 1 : 0, facts.storeBack.collectedAbove ? 1 : 0,
+                  DepthViewPartName(check.part), check.reason, HtileVerdictName(verdict.kind), facts.storeBackPending ? 1 : 0, static_cast<unsigned>(htileCleared), cleared ? 1 : 0, created ? 1 : 0, facts.sameSurface ? 1 : 0, view.retiredBefore ? 1 : 0, view.synced ? 1 : 0, facts.htileReadFound ? "" : "absent, ", static_cast<unsigned long long>(facts.htileRead),
+                  static_cast<unsigned long long>(facts.unitsLow), static_cast<unsigned long long>(facts.unitsHigh), static_cast<unsigned long long>(facts.depthMemory), static_cast<unsigned long long>(facts.stencilMemory), facts.storeBack.memoMoved ? 1 : 0, facts.storeBack.accessibleDiffers ? 1 : 0, facts.storeBack.foundDiffers ? 1 : 0, facts.storeBack.collectedAbove ? 1 : 0, facts.storeBack.htileStamped ? 1 : 0,
                   evidence(facts.identity).c_str(), evidence(facts.sync).c_str(), facts.planeStamped ? 1 : 0);
     if (check.raced) {
         countView(counters.raced[DepthViewIndex(check.part) - 1]);
@@ -2860,7 +2877,7 @@ std::string DepthViewLeaseReport() {
 DepthViewCheck CheckDepthViewPrediction(const DepthViewFacts& facts) {
     const auto expected = facts.route == DepthViewRoute::NoHtile ? HtileVerdictKind::NoHtile : facts.route == DepthViewRoute::NotAccessible ? HtileVerdictKind::NotAccessible : facts.route == DepthViewRoute::NotPending ? HtileVerdictKind::NotPendingProved : HtileVerdictKind::PendingCovered;
     // Each part is excused only by the evidence that can change it (the r73 review; DepthLease.hpp).
-    if (facts.verdict != expected || facts.htileCleared != 0) return {DepthViewPart::StoreBack, facts.storeBack.Explains(facts.route), facts.htileCleared != 0 ? "today's store-back cleared the HTILE" : "today's store-back took another route"};
+    if (facts.verdict != expected || facts.htileCleared != 0) return {DepthViewPart::StoreBack, facts.storeBack.Explains(facts.route, facts.verdict, facts.storeBackPending), facts.htileCleared != 0 ? "today's store-back cleared the HTILE" : "today's store-back took another route"};
     if (facts.cleared || facts.created || !facts.sameSurface || facts.retiredBefore) {
         const char* reason = facts.cleared ? "today took a cleared HTILE" : facts.created ? "today created the surface" : !facts.sameSurface ? "today found another surface" : "today found the surface retired";
         return {DepthViewPart::Identity, facts.identity.ExplainsIdentity(), reason};

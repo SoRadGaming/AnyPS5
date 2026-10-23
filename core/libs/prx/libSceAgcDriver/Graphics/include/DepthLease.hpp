@@ -212,21 +212,36 @@ const char* DepthViewPartName(DepthViewPart part);
 // The store-back part's, read before DS's storeBackClearedHtile (the memo key) and at that function's
 // decision, before any store of its own (from its verdict): its Accessible answer differs from the
 // prediction's; its read-proof lookup (not pending) found another value than the prediction's; its
-// collect answered a generation above the prediction's memo-hit generation.
+// collect answered a generation above the prediction's memo-hit generation. And one read at the call's
+// end: the HTILE stamped since the prediction.
 struct DepthViewStoreBackEvidence {
     bool memoMoved = false;
     bool accessibleDiffers = false;
     bool foundDiffers = false;
+    // Printed, never an excuse (the r73 review): today's HTILE collect is a memo hit, which answers the
+    // tracker generation, so it is above the prediction's after a stamp anywhere, not only on the HTILE.
     bool collectedAbove = false;
+    // Read at the call's end, on a not-pending prediction whose store-back disagreed and stored nothing
+    // (one tracker lock without the drain): the prediction's unchanged HTILE row, from its read proof h,
+    // no longer holds, so a stamp landed on the HTILE since the prediction (stamps only rise, so one
+    // before today's UnchangedSince is still there). It stands for the collect's answer as the evidence
+    // of a stamp. Never read after a store-back that stored: its own store stamps the whole HTILE.
+    bool htileStamped = false;
     // Only the evidence that can change today's verdict on the predicted route excuses a store-back
-    // disagreement (the r73 review): not pending, all four (a walk under a moved key or another thread's
-    // stamp fails UnchangedSince, forgetHtileReads moves the lookup, the page protection moves
-    // Accessible); pending, and not accessible, only Accessible (the rest of the verdict is the
-    // recorder's, which no other thread moves while this one holds the GPU lock, and the pending fills
-    // switch, read once: a collect's value is stored, never tested); no HTILE, none (htileAddress is a
-    // key field).
-    bool Explains(DepthViewRoute route) const {
-        if (route == DepthViewRoute::NotPending) return memoMoved || accessibleDiffers || foundDiffers || collectedAbove;
+    // disagreement (the r73 review). Not pending, by today's verdict: a pending one (a StoredBack after
+    // a pending write found included) never, as the recorder's answer, which no other thread moves while
+    // this one holds the GPU lock; not accessible only Accessible (the page protection moved); a read
+    // proof that failed (not pending read, or a StoredBack after the lookup) only the memo key (a walk
+    // under a moved key), the lookup (forgetHtileReads moves it) or the HTILE stamped (another thread's
+    // stamp fails UnchangedSince); any other never. Pending, and not accessible, only Accessible (the
+    // rest of the verdict is the recorder's, and the pending fills switch, read once: a collect's value
+    // is stored, never tested); no HTILE, none (htileAddress is a key field).
+    bool Explains(DepthViewRoute route, HtileVerdictKind verdict, bool pending) const {
+        if (route == DepthViewRoute::NotPending) {
+            if (verdict == HtileVerdictKind::NotAccessible) return accessibleDiffers;
+            if (verdict == HtileVerdictKind::NotPendingRead || (verdict == HtileVerdictKind::StoredBack && !pending)) return memoMoved || foundDiffers || htileStamped;
+            return false;
+        }
         if (route == DepthViewRoute::Pending || route == DepthViewRoute::NotAccessible) return accessibleDiffers;
         return false;
     }
@@ -260,9 +275,11 @@ struct DepthViewFacts {
     std::uint64_t h = 0;
     std::uint64_t current0 = 0;
     std::uint64_t memoCurrent0 = 0;
-    // Today's store-back: its verdict and return value.
+    // Today's store-back: its verdict and return value, and whether it found a pending write over the
+    // HTILE (then it looked up no read proof).
     HtileVerdictKind verdict = HtileVerdictKind::NoHtile;
     std::uint32_t htileCleared = 0;
+    bool storeBackPending = false;
     DepthViewStoreBackEvidence storeBack;
     // Today's identity: a cleared HTILE taken, the surface created, the predicted surface found, and
     // found retired.
@@ -295,15 +312,16 @@ struct DepthViewCheck {
 };
 // Pure. The parts in today's order; the first that disagrees decides: raced when the evidence read at
 // its own point names an update since the prediction that can change that part (store-back:
-// DepthViewStoreBackEvidence::Explains for the predicted route; identity: ExplainsIdentity), else an
-// abort (evidence read only at a later point never excuses it). Store-back agrees when the verdict is
-// the predicted route's (pending: pending covered; not pending: not pending proved) and nothing was
-// cleared; identity when no cleared HTILE was taken, nothing created, and the predicted surface was
-// found and not retired; sync when nothing synced, and a sync is raced when the sync point's memo key,
-// surfaces serials or units moved, or when the clock moved (at the sync point, or the units hold a
-// generation above the prediction's: WrittenUnits read it at its own decision) and the plane itself
-// was stamped since the prediction (planeStamped: a clock move elsewhere cannot make WrittenUnits
-// change a unit); refresh when every value equals its prediction (pending: the read proof is
+// DepthViewStoreBackEvidence::Explains for the predicted route and today's verdict; identity:
+// ExplainsIdentity), else an abort (evidence read only at a later part's point never excuses it; the
+// HTILE and plane rows read at the call's end stand for their parts' decisions, as stamps only rise).
+// Store-back agrees when the verdict is the predicted route's (pending: pending covered; not pending:
+// not pending proved) and nothing was cleared; identity when no cleared HTILE was taken, nothing
+// created, and the predicted surface was found and not retired; sync when nothing synced, and a sync
+// is raced when the sync point's memo key, surfaces serials or units moved, or when the clock moved
+// (at the sync point, or the units hold a generation above the prediction's: WrittenUnits read it at
+// its own decision) and the plane itself was stamped since the prediction (planeStamped: a clock move
+// elsewhere cannot make WrittenUnits change a unit); refresh when every value equals its prediction (pending: the read proof is
 // the memo-hit generation; not pending: it is the prediction's; no HTILE or not accessible: not
 // checked; every unit the TrackerGeneration answer; depth memory the memo-hit generation; stencil
 // memory that too with a stencil plane, else exactly 0). A refresh value above its prediction is
