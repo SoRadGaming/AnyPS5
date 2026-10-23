@@ -2651,24 +2651,50 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the unchanged rows as
 // UnchangedSinceAll tests them, the not-stored-over rows as StoredOver's answer negated, in one lock.
-bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain, std::uint64_t* current) {
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): with a report, every row is answered.
+bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain, std::uint64_t* current, StampsHoldReport* report) {
     auto& tracker = Tracker();
     const auto lock = drain ? lockTracker(tracker) : acquireTracker(tracker);
     tracker.initialize();
     if (current != nullptr) *current = tracker.generation.load(std::memory_order_relaxed);
-    if (!tracker.watched) return false;
-    for (const auto& [address, bytes, generation] : unchanged) {
-        if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-        if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
-    }
-    for (const auto& [address, bytes, generation] : notStoredOver) {
-        if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+    const auto unchangedRow = [&](const UnchangedQuery& row) {
+        if (row.generation == 0 || row.bytes == 0 || !tracker.covers(row.address, row.bytes)) return StampRow::Unproven;
+        return tracker.rangeUnchanged(row.address, row.bytes, row.generation) ? StampRow::Held : StampRow::Stamped;
+    };
+    const auto notStoredOverRow = [&](const UnchangedQuery& row) {
+        if (row.generation == 0 || row.bytes == 0 || !tracker.covers(row.address, row.bytes)) return StampRow::Unproven;
 #ifdef _WIN32
-        if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return false;
+        if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(row.address, row.bytes)) return StampRow::Unproven;
 #endif
-        if (tracker.storedOver(address, address + bytes, generation, false)) return false;
+        return tracker.storedOver(row.address, row.address + row.bytes, row.generation, false) ? StampRow::Stamped : StampRow::Held;
+    };
+    if (report == nullptr) {
+        if (!tracker.watched) return false;
+        for (const auto& row : unchanged) {
+            if (unchangedRow(row) != StampRow::Held) return false;
+        }
+        for (const auto& row : notStoredOver) {
+            if (notStoredOverRow(row) != StampRow::Held) return false;
+        }
+        return true;
     }
-    return true;
+    require(report->rows.size() >= unchanged.size() + notStoredOver.size(), "StampsHold's report has fewer entries than rows");
+    // Under the lock no drain runs (only a tracker lock holder stamps the queue), so this is what the
+    // draining form would have stamped first.
+    report->hostWritesPending = !drain && hostWritesPending();
+    bool held = tracker.watched;
+    std::size_t at = 0;
+    for (const auto& row : unchanged) {
+        const auto answer = tracker.watched ? unchangedRow(row) : StampRow::Unproven;
+        report->rows[at++] = answer;
+        held = held && answer == StampRow::Held;
+    }
+    for (const auto& row : notStoredOver) {
+        const auto answer = tracker.watched ? notStoredOverRow(row) : StampRow::Unproven;
+        report->rows[at++] = answer;
+        held = held && answer == StampRow::Held;
+    }
+    return held;
 }
 
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {

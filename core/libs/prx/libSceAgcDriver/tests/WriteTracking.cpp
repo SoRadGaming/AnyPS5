@@ -1888,7 +1888,11 @@ void CheckHostWriteLockOrder() {
 // lock. Compared on random rows (shared edge blocks included) over driver stores at sub-block
 // precision and walked CPU stores, and on unwatched, generation-0 and empty rows (the host-region row
 // is CheckHostHole's); `current` is the tracker generation; without the drain a queued host write
-// stays unstamped, which the draining form then sees.
+// stays unstamped, which the draining form then sees. LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN
+// 9.5 D5-0): with a report, the answer is the same and each row's is UnchangedSince's or
+// StoredOver's (unproven where the row has no proof: unwatched, generation 0 or empty); without the
+// drain the queued host write is reported pending (with its row held), and with it not (its row
+// stamped).
 void CheckStampsHold() {
     constexpr std::size_t bytes = 4 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
@@ -1929,6 +1933,15 @@ void CheckStampsHold() {
         Require(StampsHold(unchanged, {}) == unchangedAll, "StampsHold's unchanged rows disagree with UnchangedSinceAll");
         Require(StampsHold({}, stored) == notStoredOver, "StampsHold's not-stored-over row disagrees with StoredOver");
         Require(StampsHold(unchanged, stored) == (unchangedAll && notStoredOver), "StampsHold's rows together disagree with UnchangedSinceAll and StoredOver");
+        std::array<StampRow, 4> answers{};
+        StampsHoldReport report{answers};
+        Require(StampsHold(unchanged, stored, round % 2 == 0, nullptr, &report) == (unchangedAll && notStoredOver) && !report.hostWritesPending, "StampsHold with a report answers otherwise than without, or reports host writes pending");
+        for (std::size_t i = 0; i < unchanged.size(); ++i) {
+            const auto& query = unchanged[i];
+            const auto expected = query.generation == 0 || query.bytes == 0 || !Watched(query.address, query.bytes) ? StampRow::Unproven : UnchangedSince(query.address, query.bytes, query.generation) ? StampRow::Held : StampRow::Stamped;
+            Require(answers[i] == expected, "StampsHold's report of an unchanged row disagrees with UnchangedSince");
+        }
+        Require(answers[unchanged.size()] == (notStoredOver ? StampRow::Held : StampRow::Stamped), "StampsHold's report of a not-stored-over row disagrees with StoredOver");
     }
     std::array<std::uint8_t, 64> unwatched{};
     const auto outside = reinterpret_cast<std::uint64_t>(unwatched.data());
@@ -1936,11 +1949,21 @@ void CheckStampsHold() {
         const std::array rows{UnchangedQuery{outside, unwatched.size(), TrackerGeneration()}};
         Require(!StampsHold(rows, {}) && !UnchangedSinceAll(rows), "an unwatched row holds in StampsHold");
         Require(!StampsHold({}, rows) && StoredOver(outside, unwatched.size(), rows[0].generation), "an unwatched row reads as not stored over in StampsHold");
+        std::array<StampRow, 2> answers{};
+        StampsHoldReport report{answers};
+        Require(!StampsHold(rows, rows, true, nullptr, &report) && answers[0] == StampRow::Unproven && answers[1] == StampRow::Unproven, "an unwatched row is not reported unproven");
     }
     const std::array zero{UnchangedQuery{base, 64, 0}};
     Require(!StampsHold(zero, {}) && !StampsHold({}, zero) && StoredOver(base, 64, 0), "a generation-0 row holds in StampsHold");
     const std::array empty{UnchangedQuery{base, 0, TrackerGeneration()}};
     Require(!StampsHold(empty, {}) && !StampsHold({}, empty) && StoredOver(base, 0, empty[0].generation), "an empty row holds in StampsHold");
+    {
+        std::array<StampRow, 4> answers{};
+        StampsHoldReport report{answers};
+        const std::array held{UnchangedQuery{base, 64, TrackerGeneration()}};
+        Require(!StampsHold(zero, held, true, nullptr, &report) && answers[0] == StampRow::Unproven && answers[1] == StampRow::Held, "a generation-0 row is not reported unproven, or a held row after it is not tested");
+        Require(!StampsHold(empty, empty, false, nullptr, &report) && answers[0] == StampRow::Unproven && answers[1] == StampRow::Unproven, "an empty row is not reported unproven");
+    }
     std::uint64_t current = 0;
     Require(StampsHold({}, {}, true, &current) && current == TrackerGeneration(), "StampsHold without rows did not hold, or read another generation than the tracker's");
     {
@@ -1950,7 +1973,11 @@ void CheckStampsHold() {
         HostWriteBytes(memory + 2 * Block + 100, 16, 0x66);
         std::uint64_t seen = 0;
         Require(StampsHold(rows, {}, false, &seen) && seen == before, "a StampsHold without the drain stamped a queued host write");
+        std::array<StampRow, 1> answer{};
+        StampsHoldReport report{answer};
+        Require(StampsHold(rows, {}, false, nullptr, &report) && report.hostWritesPending && answer[0] == StampRow::Held, "a StampsHold without the drain did not report the queued host write pending (its row held)");
         Require(!StampsHold(rows, {}), "the draining StampsHold missed a queued host write");
+        Require(!StampsHold(rows, {}, false, nullptr, &report) && !report.hostWritesPending && answer[0] == StampRow::Stamped, "the stamped host write was still reported pending, or its row not stamped");
     }
 }
 

@@ -12760,7 +12760,7 @@ void depthLeaseClassifyTests() {
     single([](DepthLeaseMark& now) { ++now.clearedHtiles; }, DepthLease::ClearedHtile, "a cleared HTILE set");
     single([](DepthLeaseMark& now) { ++now.mirrorEpoch; }, DepthLease::MirrorEpoch, "a mirror created");
     single([](DepthLeaseMark& now) { ++now.finished; }, DepthLease::Reaped, "a batch finished");
-    for (const auto stamp : {DepthLease::Unproven, DepthLease::StampedDepth, DepthLease::StampedStencil, DepthLease::StampedHtile}) expect(ClassifyDepthLease(previous, previous, stamp, false), stamp, false, std::string("a stamp test failed (") + DepthLeaseName(stamp) + ")");
+    for (const auto stamp : {DepthLease::Unproven, DepthLease::StampedDepth, DepthLease::StampedStencil, DepthLease::StampedHtile, DepthLease::HostWrites}) expect(ClassifyDepthLease(previous, previous, stamp, false), stamp, false, std::string("a stamp test failed (") + DepthLeaseName(stamp) + ")");
     expect(ClassifyDepthLease(previous, previous, DepthLease::WouldHit, true), DepthLease::HtileNote, false, "a write over the HTILE noted");
     // A covering cleared HTILE left at the end (the previous mark's flag; a start's is never read).
     auto left = previous;
@@ -12788,10 +12788,11 @@ void depthLeaseClassifyTests() {
     ++all.mirrorEpoch;
     ++all.finished;
     ++all.writeGeneration;
-    // The caller names a range with no proof before a stamp, so `stamped` carries Unproven first.
+    // The caller names a range with no proof before a stamp, and a stamp before pending host writes, so
+    // `stamped` carries Unproven first, then a stamp, then HostWrites.
     auto stamped = DepthLease::Unproven;
     bool written = true;
-    constexpr std::array order{DepthLease::Identity, DepthLease::Epoch, DepthLease::Allocations, DepthLease::Unwatch, DepthLease::Surfaces, DepthLease::Unretired, DepthLease::PlaneBinds, DepthLease::ClearedHtile, DepthLease::MirrorEpoch, DepthLease::Reaped, DepthLease::Unproven, DepthLease::StampedDepth, DepthLease::HtileNote, DepthLease::WouldHit};
+    constexpr std::array order{DepthLease::Identity, DepthLease::Epoch, DepthLease::Allocations, DepthLease::Unwatch, DepthLease::Surfaces, DepthLease::Unretired, DepthLease::PlaneBinds, DepthLease::ClearedHtile, DepthLease::MirrorEpoch, DepthLease::Reaped, DepthLease::Unproven, DepthLease::StampedDepth, DepthLease::HostWrites, DepthLease::HtileNote, DepthLease::WouldHit};
     for (std::size_t step = 0; step < order.size(); ++step) {
         expect(ClassifyDepthLease(previous, all, stamped, written), order[step], true, std::string("every condition from ") + DepthLeaseName(order[step]) + " on moved");
         switch (step) {
@@ -12806,8 +12807,9 @@ void depthLeaseClassifyTests() {
         case 8: all.mirrorEpoch = previous.mirrorEpoch; break;
         case 9: all.finished = previous.finished; break;
         case 10: stamped = DepthLease::StampedDepth; break;
-        case 11: stamped = DepthLease::WouldHit; break;
-        case 12: written = false; break;
+        case 11: stamped = DepthLease::HostWrites; break;
+        case 12: stamped = DepthLease::WouldHit; break;
+        case 13: written = false; break;
         default: break;
         }
     }
@@ -12826,7 +12828,7 @@ void depthLeaseClassifyTests() {
     Require(after.hitWork[0] - before.hitWork[0] == 1 && after.hitWork[1] == before.hitWork[1] && after.hitWork[2] - before.hitWork[2] == 1, "D5-0 counts: the work of the would-hits' calls was not counted as such (or a miss's was)");
     Require(after.calls == before.calls && after.ineligible[DepthLeaseEligible] == before.ineligible[DepthLeaseEligible], "D5-0 counts: counting an outcome counted a call");
     const auto report = DepthLeaseReport();
-    for (const char* part : {"would-hit 2 (writeGeneration moved in 1; today's call still did work: HTILE stored back 1, cleared HTILE taken 0, mirror synced 1)", "misses by reason: no entry 1,", ", plane binds 1,", ", reaped 0, no proof (unwatched or generation 0) 0, stamped: depth 0,", "writeGeneration moved in 1 of the classified misses", "ms in the [draws] prepare phase (Draw) and ", " ms in readTarget (DrawWithRecipe)"}) {
+    for (const char* part : {"would-hit 2 (writeGeneration moved in 1; today's call still did work: HTILE stored back 1, cleared HTILE taken 0, mirror synced 1)", "misses by reason: no entry 1,", ", plane binds 1,", ", reaped 0, no proof (unwatched or generation 0) 0, stamped: depth 0,", ", HTILE 0, host writes pending 0, HTILE note 0", "writeGeneration moved in 1 of the classified misses", "ms in the [draws] prepare phase (Draw) and ", " ms in readTarget (DrawWithRecipe)"}) {
         Require(report.find(part) != std::string::npos, std::string("D5-0 report: '") + part + "' is not in: " + report);
     }
     Require(DepthLeaseReport().find("would-hit 0 (") != std::string::npos, "D5-0 report: a second report did not start from the first one's counts");
@@ -12962,6 +12964,30 @@ bool depthLeaseCounterTests(const Device& device, Recorder& recorder) {
     expect(a, none, DepthLease::WouldHit, "the call after the HTILE fill (still pending)");
     expect(a, settle, DepthLease::Reaped, "the batch holding the HTILE fill finished");
     expect(a, none, DepthLease::WouldHit, "the call after the reap");
+    {
+        // Host writes that ended unstamped (queued for the next tracker lock holder, as under
+        // APS5_EXPERIMENT_HOST_WRITE_STAMPS=1; the hook installed by hand): the stamp test takes its
+        // lock without the drain, so with every range unstamped the call misses as pending host
+        // writes, over the depth plane too (not stamped first to name the plane); the call's own
+        // collects then stamp the queue, and the next call would hit.
+        struct HostWriteHook {
+            HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&note); }
+            ~HostWriteHook() { GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr); }
+            HostWriteHook(const HostWriteHook&) = delete;
+            HostWriteHook& operator=(const HostWriteHook&) = delete;
+            static void note(std::uintptr_t address, std::size_t bytes) { AgcDriver::GuestMemory::NoteHostWrite(address, bytes); }
+        } hook;
+        const auto hostWrite = [](std::uint64_t address) {
+            auto* bytes = reinterpret_cast<std::uint8_t*>(address);
+            const GuestArena::HostWrite write(bytes, 16);
+            Require(write.Open(), "D5-0: the host write did not open");
+            std::memset(bytes, 0x66, 16);
+        };
+        expect(a, [&] { hostWrite(unrelated + 4096); }, DepthLease::HostWrites, "a host write elsewhere ended unstamped");
+        expect(a, none, DepthLease::WouldHit, "the call after the host write elsewhere was stamped");
+        expect(a, [&] { hostWrite(a.address + 4096); }, DepthLease::HostWrites, "a host write over the depth plane ended unstamped");
+        expect(a, none, DepthLease::WouldHit, "the call after the host write over the depth plane was stamped");
+    }
     {
         const auto before = DepthLeaseTotals();
         expect(a, [&] { recorder.NotePendingWrite(unrelated, 256); }, DepthLease::WouldHit, "a write noted outside the target");

@@ -1921,9 +1921,12 @@ std::uint64_t depthLeaseNs(std::chrono::steady_clock::time_point start) {
 }
 
 // Reads only: the memo key, the recorder under the GPU lock (eligibility requires it held) and, while
-// the memo key and the finished serial held, one tracker lock for the stamps (none when a range has
-// no generation; after a failed test, Watched and then UnchangedSince per range only to name the
-// range: unproven before stamped) and the HTILE's newer writes.
+// the memo key and the finished serial held, one tracker lock for the stamps, taken without the drain
+// (none when a range has no generation), whose per-range answers name a failed range (unproven before
+// stamped, depth before stencil before HTILE), and with every range unstamped, the host writes that
+// ended unstamped (a miss of their own: a drain could stamp a range) and else the HTILE's newer
+// writes. The host writes queued meanwhile stay queued for the call's own first collect, so profiling
+// moves neither the tracker's drain order nor its lock count beyond that one lock.
 void depthLeaseStart(DepthLeaseUse& use, const Context& context, const DepthTarget& target, bool native) {
     const auto start = std::chrono::steady_clock::now();
     use.recorder = RecorderFor(context);
@@ -1951,31 +1954,35 @@ void depthLeaseStart(DepthLeaseUse& use, const Context& context, const DepthTarg
     }
     if (use.found && use.now.memo == use.previous.memo && use.now.finished == use.previous.finished) {
         std::array<GuestMemory::UnchangedQuery, 3> queries{};
+        // The plane of each query (0 depth, 1 stencil, 2 HTILE), in that order.
+        std::array<std::size_t, 3> planes{};
         std::size_t count = 0;
         bool unproven = false;
-        for (const auto& range : use.ranges) {
+        for (std::size_t plane = 0; plane < use.ranges.size(); ++plane) {
+            const auto& range = use.ranges[plane];
             if (range.bytes == 0) continue;
+            planes[count] = plane;
             queries[count++] = range;
             if (range.generation == 0) unproven = true;
         }
-        const std::span proved(queries.data(), count);
-        // UnchangedSinceAll also fails on a range with no proof (generation 0, or no longer covered by
-        // the tracker, as after an import unwatched it), which no stamp moved: such a range misses as
-        // unproven, named before a stamp.
+        std::array<GuestMemory::StampRow, 3> rows{};
+        GuestMemory::StampsHoldReport report{std::span(rows.data(), count)};
+        // A range with no proof (generation 0, or no longer covered by the tracker, as after an import
+        // unwatched it) fails the test though no stamp moved it: it misses as unproven, named before a
+        // stamp (and a failure with no range named: the tracker watches nothing).
         if (unproven) {
             use.stamped = DepthLease::Unproven;
-        } else if (!GuestMemory::UnchangedSinceAll(proved)) {
-            if (std::ranges::any_of(proved, [](const GuestMemory::UnchangedQuery& range) { return !GuestMemory::Watched(range.address, range.bytes); })) {
-                use.stamped = DepthLease::Unproven;
-            } else {
-                use.stamped = DepthLease::StampedHtile;
-                for (std::size_t plane = 0; plane < 2; ++plane) {
-                    const auto& range = use.ranges[plane];
-                    if (range.bytes == 0 || GuestMemory::UnchangedSince(range.address, range.bytes, range.generation)) continue;
-                    use.stamped = plane == 0 ? DepthLease::StampedDepth : DepthLease::StampedStencil;
+        } else if (!GuestMemory::StampsHold(std::span(queries.data(), count), {}, false, nullptr, &report)) {
+            use.stamped = DepthLease::Unproven;
+            if (std::ranges::none_of(std::span(rows.data(), count), [](GuestMemory::StampRow row) { return row == GuestMemory::StampRow::Unproven; })) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (rows[i] != GuestMemory::StampRow::Stamped) continue;
+                    use.stamped = planes[i] == 0 ? DepthLease::StampedDepth : planes[i] == 1 ? DepthLease::StampedStencil : DepthLease::StampedHtile;
                     break;
                 }
             }
+        } else if (report.hostWritesPending) {
+            use.stamped = DepthLease::HostWrites;
         } else if (use.recorder != nullptr && use.ranges[2].bytes != 0) {
             use.htileWritten = use.recorder->WrittenAfterNote(use.ranges[2].address, use.ranges[2].bytes, use.previous.writeNotes);
         }
@@ -2128,7 +2135,7 @@ DepthLeaseCounts DepthLeaseTotals() {
 }
 
 const char* DepthLeaseName(DepthLease lease) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DepthLease::Count)> names{"would-hit", "no entry", "evicted by a set conflict", "identity", "memo key moved: epoch", "allocations", "unwatch", "surfaces serial", "un-retired", "plane binds", "cleared HTILE set or left", "mirror epoch", "reaped", "no proof (unwatched or generation 0)", "stamped: depth", "stencil", "HTILE", "HTILE note"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DepthLease::Count)> names{"would-hit", "no entry", "evicted by a set conflict", "identity", "memo key moved: epoch", "allocations", "unwatch", "surfaces serial", "un-retired", "plane binds", "cleared HTILE set or left", "mirror epoch", "reaped", "no proof (unwatched or generation 0)", "stamped: depth", "stencil", "HTILE", "host writes pending", "HTILE note"};
     const auto index = static_cast<std::size_t>(lease);
     return index < names.size() ? names[index] : "?";
 }

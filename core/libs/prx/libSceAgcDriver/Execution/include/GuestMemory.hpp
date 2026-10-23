@@ -96,7 +96,18 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 // verify's prediction must, which may not stamp them earlier than today's path would; `current`,
 // when given, receives the tracker generation read under the lock (after the drain, when it
 // drains: what a memoized collect would answer there).
-bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain = true, std::uint64_t* current = nullptr);
+// LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): `report`, when given, receives each row's
+// answer from the same lock (every row is then tested, none skipped after a failure): in `rows`, which
+// holds at least one entry per row, the unchanged rows first, then the not-stored-over ones: Held;
+// Unproven (generation 0, empty, not covered, an unwatched tracker, or a not-stored-over row over a
+// host region: no stamp moved it); Stamped. And whether host writes had ended unstamped when a lock
+// without the drain was taken (what the drain would stamp first; false when it drains).
+enum class StampRow : std::uint8_t { Held, Unproven, Stamped };
+struct StampsHoldReport {
+    std::span<StampRow> rows;
+    bool hostWritesPending = false;
+};
+bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain = true, std::uint64_t* current = nullptr, StampsHoldReport* report = nullptr);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
