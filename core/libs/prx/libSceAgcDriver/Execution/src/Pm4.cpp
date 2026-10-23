@@ -631,7 +631,7 @@ std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet
     return std::nullopt;
 }
 
-std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, const QueueState& queue, std::size_t limit) {
+std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, const QueueState& queue, std::size_t limit, bool gdsStores) {
     // The same decode as Execute's cases below (a packet Validate accepted): a store that is not
     // resolved here still runs there. The size and alignment tests precede any memory read: a store
     // the GPU path would reject anyway must not read (and sync for) its source here and again there.
@@ -646,7 +646,17 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
             return StoreWrite{destination, {}, copyDataSource(packet, queue, bytes)};
         }
         case 0x50: {
-            if (packet.size() < 7 || dmaDestination(packet) == DmaSelectGds) return std::nullopt;
+            if (packet.size() < 7) return std::nullopt;
+            if (dmaDestination(packet) == DmaSelectGds) {
+                // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): the GDS lives in guest
+                // memory (GdsAddress), so a store into it can take a store into memory's path (the r41
+                // F2 decode, 8fd37fbdd); the caller records it on the GPU or keeps its own path.
+                const std::size_t bytes = DmaBytes(packet);
+                if (!gdsStores || packet[5] != 0 || !gdsRange(packet[4], bytes)) return std::nullopt;
+                const auto destination = GdsAddress() + packet[4];
+                if (!fits(destination, bytes)) return std::nullopt;
+                return StoreWrite{destination, {}, dmaSourceBytes(packet)};
+            }
             if (dmaDestination(packet) == DmaDestinationNowhere) return StoreWrite{address(packet[2], packet[3]), {}, {}};
             const std::size_t bytes = DmaBytes(packet);
             const auto destination = address(packet[4], packet[5]);
@@ -760,6 +770,27 @@ std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet
     const auto source = address(packet[2], packet[3]);
     const auto destination = address(packet[4], packet[5]);
     if (bytes == 0 || (source < destination + bytes && destination < source + bytes)) return std::nullopt;
+    return MemoryCopy{source, destination, bytes};
+}
+
+std::optional<MemoryCopy> DecodeGdsCopy(std::span<const std::uint32_t> packet, GdsCopyRefusal* refusal) {
+    const auto refuse = [refusal](GdsCopyRefusal reason) -> std::optional<MemoryCopy> {
+        if (refusal != nullptr) *refusal = reason;
+        return std::nullopt;
+    };
+    if (refusal != nullptr) *refusal = GdsCopyRefusal::None;
+    if (packet.size() != 7 || ((packet[0] >> 8u) & 0xffu) != 0x50) return refuse(GdsCopyRefusal::NotCopy);
+    const bool fromGds = dmaSource(packet) == DmaSelectGds;
+    const bool toGds = dmaDestination(packet) == DmaSelectGds;
+    if ((!fromGds && !toGds) || (!fromGds && !memorySelector(dmaSource(packet))) || (!toGds && !memorySelector(dmaDestination(packet)))) return refuse(GdsCopyRefusal::NotCopy);
+    const std::size_t bytes = DmaBytes(packet);
+    if (bytes == 0) return refuse(GdsCopyRefusal::NotCopy);
+    if ((fromGds && packet[3] != 0) || (toGds && packet[5] != 0)) return refuse(GdsCopyRefusal::HighWord);
+    if ((fromGds && !gdsRange(packet[2], bytes)) || (toGds && !gdsRange(packet[4], bytes))) return refuse(GdsCopyRefusal::Range);
+    if (bytes > GdsBytes) return refuse(GdsCopyRefusal::Size);
+    const auto source = fromGds ? GdsAddress() + packet[2] : address(packet[2], packet[3]);
+    const auto destination = toGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
+    if (bytes % 4 != 0 || (source < destination + bytes && destination < source + bytes)) return refuse(GdsCopyRefusal::Shape);
     return MemoryCopy{source, destination, bytes};
 }
 

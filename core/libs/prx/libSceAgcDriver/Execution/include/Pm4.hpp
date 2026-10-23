@@ -132,13 +132,17 @@ std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet
 // such a store, when it stores more than `limit` bytes, or when its destination or size is not a
 // multiple of 4 (the GPU store needs both; the source is then not read: the caller keeps its CPU
 // path). A store of zero bytes resolves with empty bytes.
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): `gdsStores` also resolves a DMA_DATA
+// into the GDS (immediate, memory or GDS source), as a store at GdsAddress() + its offset, under the
+// same tests (and a GDS-side high word of 0 and a range inside the GDS). Without it (every caller but
+// that switch's) a store into the GDS resolves to nothing, as before.
 struct StoreWrite {
     std::uint64_t address;
     std::span<const std::byte> viewBytes;
     std::vector<std::byte> ownedBytes;
     std::span<const std::byte> Bytes() const { return ownedBytes.empty() ? viewBytes : std::span<const std::byte>(ownedBytes); }
 };
-std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, const QueueState& queue, std::size_t limit);
+std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, const QueueState& queue, std::size_t limit, bool gdsStores = false);
 struct MemoryCopy {
     std::uint64_t source;
     std::uint64_t destination;
@@ -151,6 +155,18 @@ inline constexpr std::uint32_t DmaSelectGds = 1;
 inline constexpr std::uint32_t DmaSourceData = 2;
 inline constexpr std::uint32_t DmaDestinationNowhere = 2;
 inline std::size_t DmaBytes(std::span<const std::uint32_t> packet) { return packet[6] & 0x3ffffffu; }
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): whether a DMA_DATA names the GDS
+// as its source or its destination.
+inline bool DmaTouchesGds(std::span<const std::uint32_t> packet) { return packet.size() >= 7 && (DmaSource(packet) == DmaSelectGds || DmaDestination(packet) == DmaSelectGds); }
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): a DMA_DATA copy with the GDS on one
+// side or both, as DecodeMemoryCopy's copy between guest ranges: a GDS selector maps to GdsAddress() +
+// the packet's offset (packet[2] for the source, packet[4] for the destination). Nothing, with the
+// first test that failed in `refusal`, unless: the other side is memory or the GDS (NotCopy: an
+// immediate source, no destination, or no GDS side; also zero bytes), every GDS side's high word is 0
+// (HighWord), its range lies inside the GDS (Range), the copy is at most 64 KiB (Size), and its byte
+// count is a multiple of 4 and the two ranges do not overlap (Shape).
+enum class GdsCopyRefusal : std::uint8_t { None, NotCopy, HighWord, Range, Size, Shape };
+std::optional<MemoryCopy> DecodeGdsCopy(std::span<const std::uint32_t> packet, GdsCopyRefusal* refusal = nullptr);
 inline constexpr std::uint32_t CopyDataGpuClockSource = 18;
 inline std::uint32_t CopyDataSource(std::span<const std::uint32_t> packet) { return ((packet[1] & 0xfu) << 1u) | ((packet[1] >> 30u) & 1u); }
 inline bool CopyDataImmediate(std::uint32_t source) { return source >= 10 && source != CopyDataGpuClockSource; }
