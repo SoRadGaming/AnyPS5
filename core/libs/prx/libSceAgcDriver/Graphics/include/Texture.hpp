@@ -216,8 +216,12 @@ public:
     // UnitShadow.hpp; the reason string picks the publish reason), `published` receiving whether
     // any unit was: a reader of the import must sync for a publish as for a store. Only images
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
-    // overlapping pending image, as before).
-    static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
+    // overlapping pending image, as before). `nothingPendingAt` (LOCAL EXPERIMENT,
+    // APS5_EXPERIMENT_INPUT_LEASES row P, REVALIDATE-PLAN 5.2): a draw input's S; while it holds
+    // (PendingRowStill) nothing is pending, flushing or shadowed over the range, so the call returns
+    // after FlushDepthPlanes, as the scan would (0, the default: today's call). At =2 it never
+    // returns there: the caller's prediction is taken there (PendingRowSkip), and today's call runs.
+    static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, std::uint64_t nothingPendingAt = 0);
     static void FlushAllPending(const char* reason);
     static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
@@ -251,6 +255,9 @@ public:
     // is current (a stale one is not rebuilt, so no snapshot is published for SurelyClear).
     enum class PendingOver : std::uint8_t { Nothing, Pending, Flushing, Shadow, Moved, NoSerial };
     static std::uint64_t NothingPendingOver(std::uint64_t address, std::size_t bytes, PendingOver* over = nullptr);
+    // LOCAL EXPERIMENT (REVALIDATE-PLAN 9 (q1), (q2)): test only; while set, NothingPendingOver does not
+    // see the images in the registry (a seeded wrong proof for row P's =2 death rows).
+    static void HidePendingFromQueryForTest(bool hide);
     // One registry scan for several ranges (the fast Revalidate): each query's `overlaps` receives
     // whether an image other than `except` has results pending, or is being stored right now, over
     // [begin, end), and `found` the image FindPending would return for the range (null: none);

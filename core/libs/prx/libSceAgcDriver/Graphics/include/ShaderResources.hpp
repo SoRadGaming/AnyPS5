@@ -452,6 +452,20 @@ public:
         std::uint64_t wrong = 0, voided = 0, movedMidProof = 0;
     };
     static CollectLeaseCounts CollectLeaseCountsNow();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6, L2; stage S2): the lease
+    // applied. Unset or 0: today's collects (V0 above still only records). 1: a record leased under
+    // the lease the proof found at its start takes CoveredCollectGeneration in place of its collect,
+    // and a proof that did so fails (FastFail::Collect) when the key moved before its end. 2: verify:
+    // today's collects run and are used; before each record the lease predicts held, the key must
+    // still be the proof's (else the prediction is void) and the range covered under it (else abort
+    // with a [collect-lease] line); a move before the end is counted, never applied. Cumulative counts
+    // while the switch is set (with or without APS5_PROFILE_DRAW): `skipped` records (=1), `collects`
+    // that ran under the switch, `predicted`/`verified`/`voided` records (=2), and proofs whose key
+    // moved after a leased record (=1: failed; =2: counted). =2 prints them every 10 s.
+    struct CollectLeaseExperimentCounts {
+        std::uint64_t skipped = 0, collects = 0, predicted = 0, verified = 0, voided = 0, moved = 0;
+    };
+    static CollectLeaseExperimentCounts CollectLeaseExperimentNow();
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
@@ -728,7 +742,11 @@ private:
     // its coverage owner and a generation that moves at every rekey; captureValidation clears the key
     // and owner), the storage images' leasedAt (parallel to storageTextures), and one fast proof's
     // view of it: the key read at its start, why it rekeyed (0: it did not), and whether a record of
-    // it would have skipped its collect.
+    // it would have skipped its collect. LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, L2): the
+    // same state, applied (=1) or verified (=2) while the switch is set (`mode`); `profiled`: V0 counts.
+    // A record is leased when its leasedAt is the lease's generation: only its own collect, reported
+    // covered while the lease had that generation, sets it (a generation never repeats: at the
+    // wrap every leasedAt is cleared).
     struct CollectLease {
         GuestMemory::CollectMemoKey key{};
         std::uint64_t owner = 0;
@@ -739,16 +757,20 @@ private:
     struct CollectLeaseProof {
         bool on = false;
         bool leased = false;
+        bool profiled = false;
+        std::uint8_t mode = 0;
         std::uint8_t rekeyed = 0;
         GuestMemory::CollectMemoKey key{};
     };
     CollectLeaseProof beginCollectLease();
-    // Today's collect of one record (CollectWritesCovering is CollectWrites), with the lease's
-    // prediction for it before and its fill after.
-    std::uint64_t leaseCollect(CollectLeaseProof& proof, std::uint32_t& leasedAt, std::uint64_t address, std::size_t bytes);
-    // Before UnchangedSinceAll: a proof that would have skipped a collect while the key moved after
-    // its start would fail (FastFail::Collect) at =1; counted only.
-    void endCollectLease(const CollectLeaseProof& proof);
+    // One record's collect (`storage` and `record` name it): =1 and a leased record, the coverage
+    // hit's answer (CoveredCollectGeneration); else today's (CollectWritesCovering is CollectWrites),
+    // after =2's check of a leased record, and the record leased when it was reported covered.
+    std::uint64_t leaseCollect(CollectLeaseProof& proof, std::uint32_t& leasedAt, std::uint64_t address, std::size_t bytes, bool storage, std::size_t record);
+    // Before UnchangedSinceAll: whether a proof that leased a record saw the key move since its start
+    // (the move then landed before a skipped collect, which today would have walked): true only at
+    // =1, which fails the proof (FastFail::Collect) for the full walk to collect; =2 and V0 count it.
+    bool endCollectLease(const CollectLeaseProof& proof);
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;

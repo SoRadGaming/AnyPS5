@@ -286,11 +286,13 @@ public:
     void KeepDrawSlice(std::uint64_t address, const SnapshotArena::Slice& slice, std::uint64_t generation, std::uint64_t registryGeneration);
     // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.1 and 7, I0): a draw input's lease in this
     // recorder's table (see InputLease.hpp; the table exists from the first probe on, only while
-    // profiling), or null: not profiling, the calling thread does not hold the GpuMutex (counted), an
-    // empty input or one of 4 GiB or more.
+    // profiling or APS5_EXPERIMENT_INPUT_LEASES is set), or null: neither, the calling thread does not
+    // hold the GpuMutex (counted), an empty input or one of 4 GiB or more.
     struct InputLease;
     InputLease* InputLeaseFor(std::uint64_t address, std::size_t bytes, SnapshotUse use);
     // `lease` (I0): row M's prediction is checked against this lookup and the entry it finds is kept.
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 5.4, L1 row M): =1 takes the
+    // lease's entry in place of the lookup while its set serial holds; =2 checks it against the lookup.
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, InputLease* lease = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
@@ -1187,7 +1189,9 @@ private:
     // the only mutations of drawSnapshots, bump the set serial of their (address, use).
     struct InputLeaseTable;
     std::unique_ptr<InputLeaseTable> inputLeases;
-    void noteInputLeaseMap(InputLease& lease, std::uint64_t address, SnapshotUse use, std::map<DrawSnapshotKey, DrawSnapshot>::iterator found);
+    // ReusableDrawSnapshot's lookup with a lease (InputLease.cpp): row M's hold (=1), prediction (=2)
+    // or record (I0), then the entry found kept in the lease.
+    std::map<DrawSnapshotKey, DrawSnapshot>::iterator inputLeaseLookup(InputLease& lease, std::uint64_t address, std::size_t bytes, SnapshotUse use);
     struct IndexRange {
         std::uint64_t generation;
         std::uint64_t registryGeneration;

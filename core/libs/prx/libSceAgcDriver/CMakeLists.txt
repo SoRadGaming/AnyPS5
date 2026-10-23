@@ -1664,6 +1664,46 @@ if(BUILD_TESTING)
         set_tests_properties(agc_draw_input_lease_counter agc_draw_input_lease_counter_no_key agc_draw_input_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 5 and 9, L1): the draw-input leases
+    # over real CopyDrawInput calls, every row with the epoch coverage that gives the thread a collect
+    # memo key: unset, on and verify (both with the draw inputs in VRAM, as the play build runs them),
+    # verify while profiling (the plain _2 row proves the =2 checks do not need APS5_PROFILE_DRAW); then
+    # =2's death rows (the coverage dropped under the same key must abort row C, an entry kept without
+    # its set serial's bump row M, each with its [input-lease] line, matched; the test turns abort() into
+    # exit code 3).
+    set(drawInputLeaseTests agc_draw_input_lease agc_draw_input_lease_1 agc_draw_input_lease_2 agc_draw_input_lease_2_profile)
+    foreach(drawInputLeaseTest IN LISTS drawInputLeaseTests)
+        add_test(NAME ${drawInputLeaseTest} COMMAND agc_driver_recorder_tests --input-lease-only)
+    endforeach()
+    set_tests_properties(${drawInputLeaseTests} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_draw_input_lease PROPERTIES ENVIRONMENT "APS5_DEBUG_COVERAGE=1")
+    set_tests_properties(agc_draw_input_lease_1 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+    set_tests_properties(agc_draw_input_lease_2 PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1")
+    set_tests_properties(agc_draw_input_lease_2_profile PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1;APS5_PROFILE_DRAW=1")
+    add_test(NAME agc_draw_input_lease_2_death_c COMMAND agc_driver_recorder_tests --input-lease-death-c)
+    set_tests_properties(agc_draw_input_lease_2_death_c PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\\[input-lease\\] APS5_EXPERIMENT_INPUT_LEASES=2: C: [^\r\n]*does not hold the range under that key")
+    add_test(NAME agc_draw_input_lease_2_death_m COMMAND agc_driver_recorder_tests --input-lease-death-m)
+    set_tests_properties(agc_draw_input_lease_2_death_m PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\\[input-lease\\] APS5_EXPERIMENT_INPUT_LEASES=2: M: [^\r\n]*today's lookup finds another entry of the range")
+    # Row P (stage S4): on and verify with the flush hook's FlushPending path (APS5_HOOK_FLUSH_CPU_BLOCKS=0:
+    # the hook skip goes through FlushPending, which still runs FlushDepthPlanes); =2's death rows: a
+    # pending image hidden from the row's query must abort (p1), also when a removal bumps PendingSerial
+    # between the prediction and today's call (p2: removals never excuse a difference).
+    add_test(NAME agc_draw_input_lease_1_hook_flush COMMAND agc_driver_recorder_tests --input-lease-only)
+    add_test(NAME agc_draw_input_lease_2_hook_flush COMMAND agc_driver_recorder_tests --input-lease-only)
+    set_tests_properties(agc_draw_input_lease_1_hook_flush PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1;APS5_HOOK_FLUSH_CPU_BLOCKS=0" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_draw_input_lease_2_hook_flush PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1;APS5_HOOK_FLUSH_CPU_BLOCKS=0" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    foreach(drawInputLeaseDeath IN ITEMS p1 p2)
+        add_test(NAME agc_draw_input_lease_2_death_${drawInputLeaseDeath} COMMAND agc_driver_recorder_tests --input-lease-death-${drawInputLeaseDeath})
+        set_tests_properties(agc_draw_input_lease_2_death_${drawInputLeaseDeath} PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1" TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "\\[input-lease\\] APS5_EXPERIMENT_INPUT_LEASES=2: P: [^\r\n]*=1 would have skipped it")
+    endforeach()
+    list(APPEND drawInputLeaseTests agc_draw_input_lease_2_death_c agc_draw_input_lease_2_death_m agc_draw_input_lease_1_hook_flush agc_draw_input_lease_2_hook_flush agc_draw_input_lease_2_death_p1 agc_draw_input_lease_2_death_p2)
+    if(WIN32)
+        set_tests_properties(${drawInputLeaseTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     # LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12 D5): DepthSurfaceView leases:
     # =2's classification without a device, then real DepthSurfaceView calls (every row with the epoch
     # coverage that gives the calls a collect memo key, but the last): off (nothing counted, today's
@@ -3068,6 +3108,29 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_resource_cache_collect_lease_counter agc_driver_resource_cache_collect_lease_counter_no_key agc_driver_resource_cache_collect_lease_counter_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # LOCAL EXPERIMENT (APS5_EXPERIMENT_COLLECT_LEASE, REVALIDATE-PLAN 6 and 9, L2): the template collect
+    # lease over real fast proofs at each switch value (unset, on, verify; on and verify again with
+    # APS5_PROFILE_DRAW, whose V0 misses tell captureValidation's clear from a key move), every row with
+    # the epoch coverage that gives the thread a collect memo key and the template audit off; then =2's
+    # death case (the coverage dropped under the same key must abort with the [collect-lease] line,
+    # matched; the test turns abort() into exit code 3).
+    set(collectLeaseTests agc_driver_resource_cache_collect_lease agc_driver_resource_cache_collect_lease_1 agc_driver_resource_cache_collect_lease_2 agc_driver_resource_cache_collect_lease_1_profile agc_driver_resource_cache_collect_lease_2_profile)
+    foreach(collectLeaseTest IN LISTS collectLeaseTests)
+        add_test(NAME ${collectLeaseTest} COMMAND agc_driver_sampled_cache_budget_tests collect-lease)
+    endforeach()
+    set_tests_properties(agc_driver_resource_cache_collect_lease PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_1 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_2 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=2" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_1_profile PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=1;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_2_profile PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=2;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME agc_driver_resource_cache_collect_lease_2_death COMMAND agc_driver_sampled_cache_budget_tests collect-lease-death)
+    set_tests_properties(agc_driver_resource_cache_collect_lease_2_death PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEMPLATE_AUDIT_MS=0;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_COLLECT_LEASE=2" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\\[collect-lease\\] APS5_EXPERIMENT_COLLECT_LEASE=2: object [^\r\n]*but the thread's coverage does not hold its range")
+    list(APPEND collectLeaseTests agc_driver_resource_cache_collect_lease_2_death)
+    if(WIN32)
+        set_tests_properties(${collectLeaseTests} PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     # The driver draw test again with the draw key off: the draw cache then keys on the decoded vertex
     # stage, which must include PA_CL_VS_OUT_CNTL.
     add_test(NAME agc_driver_vertex_clip_cull_draw_no_key COMMAND agc_driver_vertex_clip_cull_draw_tests no-key)
@@ -3361,6 +3424,18 @@ if(BUILD_TESTING)
             # collect lease counter counting, with the epoch coverage and the draw inputs in VRAM as the
             # play build runs them; they change no draw.
             "input_lease_counter|APS5_PROFILE_DRAW=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
+            # LOCAL EXPERIMENT (REVALIDATE-PLAN 6, L2): the template collect lease verified (=2: every
+            # record it holds checked against the coverage before today's collect, which is used) and
+            # on, with the epoch coverage that gives the proofs a collect memo key (without it no record
+            # is held); its own cases are in agc_driver_resource_cache_collect_lease*.
+            "collect_lease|APS5_EXPERIMENT_COLLECT_LEASE=2,APS5_DEBUG_COVERAGE=1"
+            "collect_lease_on|APS5_EXPERIMENT_COLLECT_LEASE=1,APS5_DEBUG_COVERAGE=1"
+            # LOCAL EXPERIMENT (REVALIDATE-PLAN 5, L1): the draw-input leases verified (=2: every row's
+            # hold predicted and checked against today's path, which is used) and on, every row of the
+            # mask, with the epoch coverage and the draw inputs in VRAM as the play build runs them; their
+            # own cases are in agc_draw_input_lease*.
+            "input_leases|APS5_EXPERIMENT_INPUT_LEASES=2,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
+            "input_leases_on|APS5_EXPERIMENT_INPUT_LEASES=1,APS5_DEBUG_COVERAGE=1,APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1"
             # LOCAL EXPERIMENT (GPU-OWNED-PLAN 9.4.2 D4-A): the storage cache's surface size and key memos
             # verified (=2: every hit computed too, a difference fatal) and on; their own cases are in
             # agc_storage_target_memos*.

@@ -1022,6 +1022,8 @@ private:
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row P (b)): a draw input's arguments, taken first.
+    InputLeaseHookSkip leaseSkip(address, bytes);
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
@@ -1066,14 +1068,19 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     // publish is all FlushPending would do (one registry scan, not two).
     bool stored = false;
     std::size_t images = 0, evicted = 0;
-    const bool kept = !HookFlushCpuBlocks() && StorageTexture::AccessKeptByCpu(address, bytes, &images, &evicted);
-    if (kept || (images == 0 && !HookFlushCpuBlocks())) {
+    // Row P: nothing pending, flushing or shadowed over the input at S, so the branch below would keep,
+    // store and publish nothing (=2 runs it and checks that; FlushPending decides after FlushDepthPlanes).
+    const auto nothingPendingAt = leaseSkip.At(HookFlushCpuBlocks());
+    const bool kept = nothingPendingAt == 0 && !HookFlushCpuBlocks() && StorageTexture::AccessKeptByCpu(address, bytes, &images, &evicted);
+    if (nothingPendingAt != 0 && !HookFlushCpuBlocks()) {
+    } else if (kept || (images == 0 && !HookFlushCpuBlocks())) {
         stored = StorageTexture::WaitForFlushing(address, bytes);
         published = StorageTexture::PublishShadowsOnly(address, bytes, scope);
         if (kept && HookSyncProfiled()) CountRecordedStoreSkip(RecordedStoreKey(), evicted);
     } else {
-        stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published);
+        stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published, nothingPendingAt);
     }
+    leaseSkip.Verify(stored, published, kept, images);
     if (stored || published) {
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
         // targets the batch holding them (the open one: SyncThrough submits it) and runs with the
@@ -3021,9 +3028,9 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, InputLease* lease) {
     GuestMemory::AssertGpuLockHeld("Recorder::ReusableDrawSnapshot");
-    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
-    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.4, I0): row M, predicted and filled only.
-    if (lease != nullptr) noteInputLeaseMap(*lease, address, use, found);
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 5.4, I0): row M, predicted and filled. LOCAL
+    // EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, L1 row M): held (=1) or verified (=2); see InputLease.cpp.
+    auto found = lease != nullptr ? inputLeaseLookup(*lease, address, bytes, use) : use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {

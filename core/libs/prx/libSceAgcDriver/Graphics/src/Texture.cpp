@@ -4398,17 +4398,20 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
         if (wasLent) {
-            BumpPendingSerial();
             // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition (the lent re-mark).
-            if (InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Lent);
+            // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row P, 5.2): counted before it lands, and
+            // off the GpuMutex it first turns row P off.
+            if (InputLeaseViewed()) NotePendingAddition(PendingAdditionSite::Lent);
+            BumpPendingSerial();
         }
         return;
     }
     dirty = true;
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition to the registry. LOCAL
+    // EXPERIMENT (row P): counted before the push, and off the GpuMutex it first turns row P off.
+    if (InputLeaseViewed()) NotePendingAddition(PendingAdditionSite::Mark);
     pending.textures.push_back(this);
     BumpPendingSerial();
-    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition to the registry.
-    if (InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Mark);
 }
 
 void StorageTexture::reconcilePending() {
@@ -4417,11 +4420,12 @@ void StorageTexture::reconcilePending() {
     const bool any = anyLayerPending();
     if (any == dirty) return;
     dirty = any;
+    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition to the registry. LOCAL
+    // EXPERIMENT (row P): counted before the push, and off the GpuMutex it first turns row P off.
+    if (any && InputLeaseViewed()) NotePendingAddition(PendingAdditionSite::Reconcile);
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
     BumpPendingSerial();
-    // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): an addition to the registry.
-    if (any && InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Reconcile);
 }
 
 bool StorageTexture::Dirty() const {
@@ -4581,9 +4585,12 @@ void waitForIdlePublish(const char* reason) {
 
 }
 
-bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, std::uint64_t nothingPendingAt) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row P, 5.2): nothing over the range at S (=2: the
+    // prediction is taken here, after FlushDepthPlanes, and the call goes on).
+    if (nothingPendingAt != 0 && PendingRowSkip(nothingPendingAt)) return false;
     if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
         queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -5115,6 +5122,15 @@ std::uint64_t StorageTexture::PendingSerial() {
     return pendingSerial.load(std::memory_order_acquire);
 }
 
+namespace {
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 9 (q1), (q2)): see StorageTexture::HidePendingFromQueryForTest.
+std::atomic<bool> hidePendingFromQuery{false};
+}
+
+void StorageTexture::HidePendingFromQueryForTest(bool hide) {
+    hidePendingFromQuery.store(hide, std::memory_order_relaxed);
+}
+
 std::uint64_t StorageTexture::NothingPendingOver(std::uint64_t address, std::size_t bytes, PendingOver* over) {
     const auto answer = [over](PendingOver kind) {
         if (over != nullptr) *over = kind;
@@ -5130,7 +5146,7 @@ std::uint64_t StorageTexture::NothingPendingOver(std::uint64_t address, std::siz
         std::lock_guard lock(pending.mutex);
         // Read-only: a stale index is not rebuilt here (MayOverlap would publish a new snapshot, and
         // later SurelyClear readers would skip the registry mutex where today they take it).
-        if (pending.textures.MayOverlapIfIndexed(address, bytes)) {
+        if (!hidePendingFromQuery.load(std::memory_order_relaxed) && pending.textures.MayOverlapIfIndexed(address, bytes)) {
             for (const auto* texture : pending.textures) {
                 if (!texture->overlaps(address, bytes)) continue;
                 answer(PendingOver::Pending);

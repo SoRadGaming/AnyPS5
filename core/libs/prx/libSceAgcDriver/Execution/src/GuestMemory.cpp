@@ -57,8 +57,44 @@ namespace AgcDriver::GuestMemory {
 namespace {
 thread_local ISpeculativeReadGate* speculativeGate = nullptr;
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row E, REVALIDATE-PLAN 5.5, L1): the gate mirrored in
+// a TEB slot (HostThreadSlot), so its readers skip the thread_local's emutls lookup. The switch and
+// its row mask (APS5_EXPERIMENT_INPUT_LEASE_ROWS, letters of PCME, default all) are read here once,
+// as InputLease.cpp reads them (this file links without it). 0: off (the thread_local alone, as
+// before; the slot is never written); 1: the readers read the slot; 2: verify: they read both, abort
+// on a difference, and use the thread_local. SpeculativeReadScope is the only writer of either and
+// sets and restores both; TlsAlloc zeroes the slot for every thread, so a thread that never set a gate
+// reads null.
+struct SpeculativeGateSlotTag {};
+using SpeculativeGateSlot = HostThreadSlot<ISpeculativeReadGate*, SpeculativeGateSlotTag>;
+
+int speculativeGateMirror() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_INPUT_LEASES");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        if (value == 0) return 0;
+        if (const char* rows = std::getenv("APS5_EXPERIMENT_INPUT_LEASE_ROWS"); rows != nullptr && std::strchr(rows, 'E') == nullptr && std::strchr(rows, 'e') == nullptr) return 0;
+        return value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+ISpeculativeReadGate* currentSpeculativeGate() {
+    const int mirror = speculativeGateMirror();
+    if (mirror == 0) return speculativeGate;
+    if (mirror == 1) return SpeculativeGateSlot::Get();
+    auto* const gate = speculativeGate;
+    if (auto* const mirrored = SpeculativeGateSlot::Get(); mirrored != gate) {
+        std::fprintf(stderr, "[input-lease] APS5_EXPERIMENT_INPUT_LEASES=2: E: the speculative read gate's TEB slot holds %p but the thread_local holds %p\n", static_cast<void*>(mirrored), static_cast<void*>(gate));
+        std::fflush(stderr);
+        std::abort();
+    }
+    return gate;
+}
+
 void requireNotSpeculative(const char* operation) {
-    if (speculativeGate != nullptr) throw SpeculativeReadRefused(std::string("guest memory ") + operation + " is not available to a speculative reader");
+    if (currentSpeculativeGate() != nullptr) throw SpeculativeReadRefused(std::string("guest memory ") + operation + " is not available to a speculative reader");
 }
 
 void require(bool condition, const char* reason) {
@@ -2458,6 +2494,15 @@ bool CollectCovered(std::uint64_t address, std::size_t bytes) {
     return epochCovers(key.epoch, key.unwatched, key.mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
 }
 
+// LOCAL EXPERIMENT (REVALIDATE-PLAN 5.6): CollectCovered's test under a given key.
+bool CollectCoveredUnder(const CollectMemoKey& key, std::uint64_t address, std::size_t bytes) {
+    if (!key.Valid() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    return epochCovers(key.epoch, key.unwatched, key.mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+}
+
 // LOCAL EXPERIMENT (REVALIDATE-PLAN 4): the shared collect-lease API (see the header).
 namespace {
 std::atomic<std::uint64_t> nextCoverageOwner{0};
@@ -2485,6 +2530,10 @@ std::uint64_t CoveredCollectGeneration() {
 
 void SetCollectWalkHook(void (*hook)()) {
     collectWalkHook.store(hook, std::memory_order_release);
+}
+
+void DropCollectCoverageForTest() {
+    epochCoverage().ranges.clear();
 }
 
 void AdoptLatestCollectEpoch() {
@@ -3953,10 +4002,17 @@ void flushBeforeAccess(std::uint64_t address, std::size_t bytes) {
 
 SpeculativeReadScope::SpeculativeReadScope(ISpeculativeReadGate& gate) : previous(speculativeGate) {
     speculativeGate = &gate;
+    // LOCAL EXPERIMENT (L1 row E): the mirror, set and restored with the thread_local.
+    if (speculativeGateMirror() != 0) SpeculativeGateSlot::Set(&gate);
 }
 
 SpeculativeReadScope::~SpeculativeReadScope() {
     speculativeGate = previous;
+    if (speculativeGateMirror() != 0) SpeculativeGateSlot::Set(previous);
+}
+
+bool SpeculativeGateMirrored() {
+    return speculativeGateMirror() == 0 || SpeculativeGateSlot::Get() == speculativeGate;
 }
 
 bool SpeculativeReadsSupported() {
@@ -3969,7 +4025,7 @@ bool SpeculativeReadsSupported() {
 }
 
 bool SpeculativeReader() {
-    return speculativeGate != nullptr;
+    return currentSpeculativeGate() != nullptr;
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
@@ -3980,7 +4036,7 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
     GuardRead(address, destination.size());
-    if (auto* gate = speculativeGate) {
+    if (auto* gate = currentSpeculativeGate()) {
         try {
             CheckRange(reinterpret_cast<const void*>(address), destination.size(), alignment);
         } catch (const std::runtime_error& error) {
