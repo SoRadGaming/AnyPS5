@@ -584,6 +584,14 @@ public:
         stencilMemory = target.stencilAddress != 0 ? GuestMemory::CollectWrites(target.stencilAddress, static_cast<std::size_t>(stencilBytes())) : 0;
     }
 
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.6): NoteMemory where both collects
+    // are memo hits answering `generation` (a DepthSurfaceView lease's hit). Mirror tripwire (11.13):
+    // NoteMemory.
+    void NoteMemoryAt(std::uint64_t generation) {
+        depthMemory = generation;
+        stencilMemory = target.stencilAddress != 0 ? generation : 0;
+    }
+
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0): the depth and stencil ranges with the
     // generations NoteMemory last took (the stencil range empty without a stencil plane).
     std::array<GuestMemory::UnchangedQuery, 2> NotedMemory() const {
@@ -899,6 +907,33 @@ public:
             copyPlane(mirrorPlane, mirror, false, false, true);
         }
         written = ++depthWrites;
+    }
+
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.6): for a DepthSurfaceView lease,
+    // under the surfaces mutex. UnitsSized: SizeUnits(planeBytes) would return early (the same unit size
+    // and count; the switch is read once, as SizeUnits reads it). OldestUnitGeneration: the generation
+    // WrittenUnits tests the plane from (the only unit's, or the oldest of several; 0 without units).
+    // SyncUnchanged: SyncFromMemory's exit with nothing changed (SizeUnits, then every unit assigned
+    // `generation`, TrackerGeneration's answer). Mirror tripwire (11.13): SizeUnits, WrittenUnits,
+    // SyncFromMemory. HasMirror: a test hook (SyncFromMemory made the mirror plane).
+    bool UnitsSized(std::uint64_t planeBytes) const {
+        static const bool whole = std::getenv("APS5_DEPTH_PLANE_WHOLE_STORE") != nullptr;
+        const std::uint64_t bytes = !whole && target.address % 65536u == 0 ? std::uint64_t{65536} : std::max<std::uint64_t>(planeBytes, 1u);
+        const auto count = static_cast<std::size_t>(std::max<std::uint64_t>((planeBytes + bytes - 1u) / bytes, 1u));
+        return unitBytes == bytes && staleUnits.size() == count && unitGeneration.size() == count;
+    }
+
+    std::uint64_t OldestUnitGeneration() const {
+        return unitGeneration.empty() ? 0 : *std::min_element(unitGeneration.begin(), unitGeneration.end());
+    }
+
+    void SyncUnchanged(std::uint64_t planeBytes, std::uint64_t generation) {
+        SizeUnits(planeBytes);
+        unitGeneration.assign(unitGeneration.size(), generation);
+    }
+
+    bool HasMirror() const {
+        return mirrorPlane.storage != nullptr;
     }
 
     void DropMirror() {
@@ -1610,7 +1645,9 @@ bool RoutesToNativeDepthOwner(const DepthTarget& target) {
     return std::ranges::any_of(depthGuards(), [&](const auto& range) { return range.active->load(std::memory_order_acquire) && target.htileAddress < range.address + range.bytes && range.address < target.htileAddress + bytes; });
 }
 
-std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.8): `covered`, when given, receives
+// whether the pending fills covered the whole range (so no guest word was read) once a word landed.
+std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, std::uint64_t address, std::size_t bytes, bool* covered = nullptr) {
     auto writes = recorder.PendingWritesOver(address, bytes);
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{address, address + bytes}};
@@ -1634,6 +1671,7 @@ std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, st
         landed = static_cast<std::uint32_t>(write.word);
     }
     if (!landed.has_value()) return std::nullopt;
+    if (covered != nullptr) *covered = unwritten.empty();
     for (const auto& [from, to] : unwritten) {
         if (from % 4u != 0 || to % 4u != 0) return std::nullopt;
         const auto* words = reinterpret_cast<const volatile std::uint32_t*>(from);
@@ -1665,32 +1703,76 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     return true;
 }
 
-VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.10): storeBackClearedHtile's switch,
+// read once, hoisted so a DepthSurfaceView lease's hit reads the same answer.
+bool pendingHtileFills() {
+    static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
+    return pendingFills;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.8): what storeBackClearedHtile
+// decided, for a DepthSurfaceView lease's creation and =2's check, each value read at its decision
+// before any store of its own: where it returned (DepthLease.hpp), the Accessible answer (when read),
+// the collect's generation and the recorder's finished serial and newest write note (read together,
+// right before the pending test: GPU-OWNED-PLAN 11.2 row 22), and the not-pending read-proof lookup.
+struct HtileVerdict {
+    HtileVerdictKind kind = HtileVerdictKind::NoHtile;
+    bool accessibleRead = false;
+    bool accessible = false;
+    bool collectedRead = false;
+    std::uint64_t collected = 0;
+    std::uint64_t finished = 0;
+    std::uint64_t notes = 0;
+    bool lookedUp = false;
+    bool found = false;
+    std::uint64_t foundValue = 0;
+};
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES): `verdict` (null: today exactly) receives HtileVerdict.
+// Mirror tripwire (GPU-OWNED-PLAN 9.6, 11.13): a DepthSurfaceView lease's hit (depthViewLeaseHit) stands
+// in for this function's routes; any change here re-runs the =2 rows and one in-game =2 run.
+VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target, HtileVerdict* verdict = nullptr) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
+    const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true);
+    if (verdict != nullptr) *verdict = {HtileVerdictKind::NotAccessible, true, accessible};
+    if (!accessible) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
     auto* recorder = RecorderFor(context);
+    if (verdict != nullptr) {
+        verdict->collectedRead = true;
+        verdict->collected = collected;
+        verdict->finished = recorder != nullptr ? recorder->FinishedSerial() : 0;
+        verdict->notes = recorder != nullptr ? recorder->WriteNotes() : 0;
+    }
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes);
     if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
+        if (verdict != nullptr) {
+            verdict->kind = HtileVerdictKind::NotPendingProved;
+            verdict->lookedUp = true;
+            verdict->found = found != htileReads().end();
+            verdict->foundValue = verdict->found ? found->second : 0;
+        }
         if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
     }
-    static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
-    if (pending && pendingFills) {
+    if (pending && pendingHtileFills()) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        if (const auto landed = htileAfterPendingFills(*recorder, target.htileAddress, bytes)) {
+        bool covered = false;
+        if (const auto landed = htileAfterPendingFills(*recorder, target.htileAddress, bytes, verdict != nullptr ? &covered : nullptr)) {
             const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(*landed, target.htileStencil);
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = collected;
+                if (verdict != nullptr) verdict->kind = covered ? HtileVerdictKind::PendingCovered : HtileVerdictKind::PendingNotCovering;
                 return 0;
             }
             if (storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, expandedHtileWord(*landed, target.htileStencil, cleared))) {
                 const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = generation;
+                if (verdict != nullptr) verdict->kind = HtileVerdictKind::StoredBack;
                 return cleared;
             }
         }
@@ -1707,6 +1789,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     }
     std::lock_guard lock(htileReadsMutex());
     htileReads()[target.htileAddress] = generation;
+    if (verdict != nullptr) verdict->kind = cleared != 0 ? HtileVerdictKind::StoredBack : !pending ? HtileVerdictKind::NotPendingRead : pendingHtileFills() ? HtileVerdictKind::PendingNotCovering : HtileVerdictKind::PendingFillsOff;
     return cleared;
 }
 
@@ -2079,6 +2162,503 @@ void depthLeaseEnd(DepthLeaseUse& use, const Context& context, const DepthTarget
     entry->used = ++table.tick;
     countDepthLeaseNs(use.ns + depthLeaseNs(start));
 }
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11 D5, DepthLease.hpp): DepthSurfaceView
+// leases. depthViewLeaseHit runs right after RoutesToNativeDepthOwner, before any of the call's own
+// work; depthViewPoint reads =2's race evidence at the points of today's path; depthViewLeaseEnd, under
+// the surfaces mutex at the call's end, renews a hit's lease, checks =2's prediction against today's
+// path and makes (or refuses) the lease after a full path. Why a hit is exact is GPU-OWNED-PLAN 11.7;
+// in short, a hit re-reads live every input of the steps it skips:
+// - the HTILE store-back: on the not-pending route, no write was open or in flight over the HTILE at
+//   the decision that made the lease, writes enter batches only by an append with a fresh global note
+//   and leave only from the in-flight front, so a pending one now carries a note newer than the
+//   lease's (WrittenAfterNote); the read proof is found live under its mutex and tested with
+//   UnchangedSince's own predicate in the hit's tracker lock. On the pending route, no batch finished
+//   (FinishedSerial) and no write over the HTILE was noted since, so PendingWritesOver returns the
+//   writes the decision saw, the same fill word lands and clears nothing, and today writes the read
+//   proof as a collect answers it: the hit writes memoCurrent. Accessible runs live (page protection
+//   is not in the memo key);
+// - takeClearedHtile: no covering entry, found without the erase under the surfaces mutex every
+//   clearedHtiles writer takes;
+// - the surface scan: the surfaces and released serials (each list change moves one) prove the same
+//   members in the same order; `active` only falls, and only for native guard ranges (samples != 1);
+//   so the scan returns the lease's surface, nothing is created and the owner is never read;
+// - SyncFromMemory: SizeUnits would return early (UnitsSized), and the plane's not-written row from the
+//   live oldest unit generation (every unitGeneration writer holds the surfaces mutex) is WrittenUnits'
+//   test, so nothing changed and every unit gets TrackerGeneration's answer (current);
+// - the skipped collects (store-back's, WrittenUnits', NoteMemory's): the lease's creation proved them
+//   covered under its memo key, which still holds (coverage only grows under a key), so each would be
+//   a memo hit answering hitGeneration: memoCurrent, read under the hit's draining tracker lock.
+// When another thread moves the tracker between the hit's lock and today's last read, the hit's values
+// are today's under the schedule in which that update landed after them: only ever lower, which only
+// makes a later check fail (a miss, a sync, a retire through OverwrittenInMemory).
+// Mirror tripwire (GPU-OWNED-PLAN 9.6, 11.13): this block copies the behaviour of, or reads the state
+// written by, in this file DepthSurfaceView, storeBackClearedHtile, htileAfterPendingFills,
+// takeClearedHtile, takePlane, releaseRetired, forgetHtileReads, NoteHtileDepthClear,
+// NoteDepthMetadataFill, SizeUnits, WrittenUnits, SyncFromMemory, NoteStored, NoteMemory, Mirror,
+// retire, retireStoringStale, FlushDepthPlanes, ClearDepthSurfaces, RetireDepthSurfaces,
+// RetireUnmappedDepth_nid_no_patch and RoutesToNativeDepthOwner; in E/GuestMemory.cpp WrittenSince,
+// UnchangedSince, rangeUnchanged, unchanged, stamp, hitGeneration, TrackerGeneration, lockTracker,
+// CollectCovered, CurrentCollectMemoKey and verify/Accessible; in G/Recorder.cpp PendingWriteOverlaps,
+// PendingWritesOver, WrittenAfterNote, FinishedSerial, WriteNotes and publishPendingWrites. An upstream
+// change to any of them re-runs the =2 ctest rows and one in-game =2 run before the merged build is
+// adopted. The writers the channels rest on, at 367000dc5 (GPU-OWNED-PLAN 11.18 risk 1): unitGeneration
+// (SizeUnits; NoteStored from retireStoringStale and FlushDepthPlanes; SyncFromMemory); htileReads
+// (storeBackClearedHtile; forgetHtileReads from NoteHtileDepthClear and NoteDepthMetadataFill);
+// clearedHtiles (NoteHtileDepthClear's insert, takeClearedHtile's erase); the surface list
+// (DepthSurfaceView's creation, releaseRetired, ClearDepthSurfaces); retired (retire, DepthSurfaceView);
+// active (RetireUnmappedDepth_nid_no_patch only); recorder batches (an append, and pop_front under the
+// GPU lock). A writer a merge adds breaks a channel silently until a =2 run.
+
+struct DepthViewCounters {
+    std::atomic<std::uint64_t> calls{0};
+    std::array<std::atomic<std::uint64_t>, DepthViewIndex(DepthViewIneligible::Count)> ineligible{};
+    std::atomic<std::uint64_t> hits{0};
+    std::array<std::atomic<std::uint64_t>, DepthViewIndex(DepthViewRoute::Count)> hitRoutes{};
+    std::array<std::atomic<std::uint64_t>, DepthViewIndex(HtileVerdictKind::Count)> verdicts{};
+    std::atomic<std::uint64_t> created{0};
+    std::atomic<std::uint64_t> renewed{0};
+    std::array<std::atomic<std::uint64_t>, DepthViewIndex(DepthViewRefusal::Count)> refusals{};
+    std::array<std::atomic<std::uint64_t>, DepthViewIndex(DepthViewMiss::Count)> misses{};
+    std::atomic<std::uint64_t> evictions{0};
+    std::atomic<std::uint64_t> predicted{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::array<std::atomic<std::uint64_t>, 4> raced{};
+};
+// Relaxed and cumulative, counted only while the switch is set (DepthViewLeaseTotals).
+constinit DepthViewCounters depthViewCounters;
+
+void countView(std::atomic<std::uint64_t>& counter) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+// A lease (GPU-OWNED-PLAN 11.5): no generation of any kind. The key is D5-0's (sameDepthKey, under its
+// field-count tripwire), with the recorder and the device; the set is D5-0's (depthLeaseSet).
+struct DepthViewLeaseEntry {
+    bool valid = false;
+    bool leased = false;
+    const Recorder* recorder = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    DepthTarget target{};
+    std::uint64_t used = 0;
+    // The memo key the creation proved every skipped collect's range covered under (renewals keep it).
+    GuestMemory::CollectMemoKey memo;
+    // The surface, and the serials it was found under (read before it is dereferenced).
+    DepthSurface* surface = nullptr;
+    std::uint64_t surfaces = 0;
+    std::uint64_t released = 0;
+    DepthViewRoute route = DepthViewRoute::NoHtile;
+    // Recorder::FinishedSerial and WriteNotes, read at the decision (the creation's store-back, a
+    // renewing hit's check), never at a call's end (GPU-OWNED-PLAN 11.2 row 22).
+    std::uint64_t finished = 0;
+    std::uint64_t notes = 0;
+    // DescribeSurface(mirrorResource(target)).guestBytes (pure) and HtileMetadataBytes(extent).
+    std::uint64_t planeBytes = 0;
+    std::size_t htileBytes = 0;
+};
+
+struct DepthViewLeaseTable {
+    std::array<std::array<DepthViewLeaseEntry, DepthLeaseWays>, DepthLeaseSets> sets{};
+    // Per set, fingerprints of the last keys a set conflict evicted (0 empty), as D5-0's.
+    std::array<std::array<std::uint64_t, DepthLeaseWays>, DepthLeaseSets> evicted{};
+    std::array<std::uint8_t, DepthLeaseSets> nextEvicted{};
+    std::uint64_t tick = 0;
+};
+struct DepthViewLeaseTableTag {};
+
+DepthViewLeaseEntry* findDepthViewLease(DepthViewLeaseTable& table, std::size_t set, const Recorder* recorder, VkDevice device, const DepthTarget& target) {
+    for (auto& way : table.sets[set]) {
+        if (way.valid && way.recorder == recorder && way.device == device && sameDepthKey(way.target, target)) return &way;
+    }
+    return nullptr;
+}
+
+// A new entry: a free way, else the set's least recently used one (counted, its fingerprint kept for
+// the "evicted" miss); the new key's own fingerprint leaves the evicted list (it has an entry again).
+DepthViewLeaseEntry& insertDepthViewLease(DepthViewLeaseTable& table, std::size_t set, const Recorder* recorder, VkDevice device, const DepthTarget& target) {
+    const auto fingerprint = depthLeaseFingerprint(recorder, device, target);
+    for (auto& evicted : table.evicted[set]) {
+        if (evicted == fingerprint) evicted = 0;
+    }
+    auto* entry = &table.sets[set][0];
+    for (auto& way : table.sets[set]) {
+        if (!way.valid) {
+            entry = &way;
+            break;
+        }
+        if (way.used < entry->used) entry = &way;
+    }
+    if (entry->valid) {
+        countView(depthViewCounters.evictions);
+        table.evicted[set][table.nextEvicted[set]++ % DepthLeaseWays] = depthLeaseFingerprint(entry->recorder, entry->device, entry->target);
+    }
+    *entry = DepthViewLeaseEntry{};
+    entry->valid = true;
+    entry->recorder = recorder;
+    entry->device = device;
+    entry->target = target;
+    return *entry;
+}
+
+// takeClearedHtile's find, without its erase (under the surfaces mutex; the map is normally empty).
+bool clearedHtileCovers(const DepthTarget& target) {
+    if (target.htileAddress == 0) return false;
+    const auto& cleared = clearedHtiles();
+    return std::any_of(cleared.begin(), cleared.end(), [&](const auto& entry) { return HtileFillCovers(target.htileAddress, target.extent, entry.first, entry.second); });
+}
+
+enum class DepthViewPoint : std::uint8_t { StoreBack, Identity, Sync };
+
+// =2: what the prediction read (GPU-OWNED-PLAN 11.9), in the call's stack frame.
+struct DepthViewPrediction {
+    DepthViewRoute route = DepthViewRoute::NoHtile;
+    DepthSurface* surface = nullptr;
+    std::uint64_t oldest = 0;
+    std::uint64_t h = 0;
+    std::uint64_t current = 0;
+    std::uint64_t memoCurrent = 0;
+    std::uint64_t surfaces = 0;
+    std::uint64_t released = 0;
+    GuestMemory::CollectMemoKey memo;
+    bool accessible = false;
+    std::uint64_t planeBytes = 0;
+    std::size_t htileBytes = 0;
+};
+
+// One DepthSurfaceView call while the switch is set (in the call's stack frame, so no thread_local).
+struct DepthViewLease {
+    int mode = 0;
+    // Eligible: depthViewLeaseEnd runs at the call's end.
+    bool tracking = false;
+    // =1: the lease answered (the call holds the surfaces mutex from the check on).
+    bool hit = false;
+    // =2: the prediction held; today's path runs with its points and is checked at the end.
+    bool predicting = false;
+    Recorder* recorder = nullptr;
+    // The memo key, read before today's store-back.
+    GuestMemory::CollectMemoKey memo;
+    // Today's store-back (a full path).
+    HtileVerdict verdict;
+    // A hit: its route, the recorder's serials its check read, the plane's size and the generations
+    // its tracker lock read.
+    DepthViewRoute route = DepthViewRoute::NoHtile;
+    std::uint64_t finished = 0;
+    std::uint64_t notes = 0;
+    std::uint64_t planeBytes = 0;
+    std::uint64_t current = 0;
+    std::uint64_t memoCurrent = 0;
+    // Today's path: the surface found retired, and whether SyncFromMemory synced (depthWrites moved).
+    bool retiredBefore = false;
+    std::uint64_t writes = 0;
+    bool synced = false;
+    DepthViewPrediction prediction;
+    DepthViewStoreBackEvidence storeBack;
+    // At the identity point, then the sync point.
+    std::array<DepthViewEvidence, 2> evidence{};
+
+    HtileVerdict* VerdictOut() {
+        return tracking && !hit ? &verdict : nullptr;
+    }
+};
+
+// The check (GPU-OWNED-PLAN 11.6 L1-L13). Any failure is a miss counted by its reason that releases what
+// the check took and changed nothing; today's path then runs whole. =1: a hit writes the pending
+// route's read proof (today's store-back write), moves the surfaces mutex into `held` and returns the
+// surface. =2: the same check without the drain (a queued host write makes it a miss) and without any
+// write, which keeps what it read and returns null. Lock order: the GPU lock (held), the surfaces
+// mutex, htileReads', the tracker's: every edge exists in today's path (NoteHtileDepthClear takes the
+// first two, storeBackClearedHtile's not-pending test the last two, SyncFromMemory under the surfaces
+// mutex the tracker's); DepthSurfaceView's own GPU lock after a hit re-enters it, adding no edge.
+DepthSurface* depthViewLeaseHit(DepthViewLease& view, const Context& context, const DepthTarget& target, bool native, std::unique_lock<std::recursive_mutex>& held) {
+    auto& counters = depthViewCounters;
+    view.mode = DepthViewLeases();
+    countView(counters.calls);
+    const auto ineligible = [&](DepthViewIneligible reason) -> DepthSurface* {
+        countView(counters.ineligible[DepthViewIndex(reason)]);
+        return nullptr;
+    };
+    // Eligibility (11.4). Native excludes samples != 1 too.
+    if (native) return ineligible(DepthViewIneligible::Native);
+    if (!mirrorable(target)) return ineligible(DepthViewIneligible::NotMirrorable);
+    auto* recorder = RecorderFor(context);
+    if (recorder == nullptr || !GuestMemory::GpuMutex().HeldByThisThread()) return ineligible(DepthViewIneligible::Unlocked);
+    const auto memo = GuestMemory::CurrentCollectMemoKey();
+    if (!memo.Valid()) return ineligible(DepthViewIneligible::NoMemoKey);
+    countView(counters.ineligible[DepthViewIndex(DepthViewIneligible::Eligible)]);
+    view.tracking = true;
+    view.recorder = recorder;
+    view.memo = memo;
+    const auto missed = [&](DepthViewMiss miss) -> DepthSurface* {
+        countView(counters.misses[DepthViewIndex(miss)]);
+        return nullptr;
+    };
+    // L1. The table (only read here; a full path's end writes it).
+    auto& table = ThreadScratch<DepthViewLeaseTable, DepthViewLeaseTableTag>();
+    const auto set = depthLeaseSet(target.address);
+    const auto* entry = findDepthViewLease(table, set, recorder, context.device, target);
+    if (entry == nullptr) {
+        const auto fingerprint = depthLeaseFingerprint(recorder, context.device, target);
+        const bool evicted = std::find(table.evicted[set].begin(), table.evicted[set].end(), fingerprint) != table.evicted[set].end();
+        return missed(evicted ? DepthViewMiss::Evicted : DepthViewMiss::NoLease);
+    }
+    if (!entry->leased) return missed(DepthViewMiss::NoLease);
+    // L2. The memo key, part by part.
+    if (entry->memo.epoch != memo.epoch) return missed(DepthViewMiss::Epoch);
+    if (entry->memo.mapping != memo.mapping) return missed(DepthViewMiss::Allocations);
+    if (entry->memo.unwatched != memo.unwatched) return missed(DepthViewMiss::Unwatch);
+    // L3. The recorder, which no other thread moves while this one holds the GPU lock. Pending: no batch
+    // finished and no write over the HTILE noted since the decision (the pending fills switch is read
+    // once and a pending lease is made only with it on). Not pending: no such write.
+    const auto route = entry->route;
+    const bool htile = route == DepthViewRoute::NotPending || route == DepthViewRoute::Pending;
+    if (route == DepthViewRoute::Pending && (!pendingHtileFills() || recorder->FinishedSerial() != entry->finished)) return missed(DepthViewMiss::Reaped);
+    if (htile && recorder->WrittenAfterNote(target.htileAddress, entry->htileBytes, entry->notes)) return missed(DepthViewMiss::HtileNote);
+    view.finished = recorder->FinishedSerial();
+    view.notes = recorder->WriteNotes();
+    // L4. The HTILE's page protection, live (not in the memo key).
+    bool accessible = false;
+    if (route != DepthViewRoute::NoHtile) {
+        accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), entry->htileBytes, true);
+        if (accessible != (route != DepthViewRoute::NotAccessible)) return missed(DepthViewMiss::Accessibility);
+    }
+    // L5-L6. Under the surfaces mutex (today takes it after the GPU lock, as here): the serials, before
+    // the surface is dereferenced.
+    std::unique_lock<std::recursive_mutex> lock(surfacesMutex());
+    if (DepthSurfacesSerial() != entry->surfaces || DepthSurfacesReleased() != entry->released) return missed(DepthViewMiss::Surfaces);
+    auto* surface = entry->surface;
+    // L7-L8.
+    if (!surface->active->load(std::memory_order_acquire) || surface->retired) return missed(DepthViewMiss::Retired);
+    if (clearedHtileCovers(target)) return missed(DepthViewMiss::ClearedHtile);
+    // L9. The plane's units: sized, and the oldest generation live (the refutation of a stored one:
+    // GPU-OWNED-PLAN 11.2 row 1); 0 proves nothing.
+    if (!surface->UnitsSized(entry->planeBytes)) return missed(DepthViewMiss::UnitsResized);
+    const auto oldest = surface->OldestUnitGeneration();
+    if (oldest == 0) return missed(DepthViewMiss::NoPlaneProof);
+    // L10. Not pending: the HTILE's read proof, found as today finds it (no insert), held through L11.
+    std::unique_lock<std::mutex> readsLock;
+    std::uint64_t h = 0;
+    if (route == DepthViewRoute::NotPending) {
+        readsLock = std::unique_lock<std::mutex>(htileReadsMutex());
+        const auto found = htileReads().find(target.htileAddress);
+        if (found == htileReads().end() || found->second == 0) return missed(DepthViewMiss::HtileReadProofMoved);
+        h = found->second;
+    }
+    // L11. One tracker lock (draining at =1, where today's first collect would drain): the HTILE's
+    // unchanged row (not pending: UnchangedSince's predicate), the plane's not-written row (WrittenUnits'
+    // predicate), and the generations TrackerGeneration and a memo-hit collect answer under it.
+    const bool apply = view.mode == 1;
+    const std::size_t htileRows = route == DepthViewRoute::NotPending ? 1 : 0;
+    const GuestMemory::UnchangedQuery htileRow{target.htileAddress, entry->htileBytes, h};
+    const GuestMemory::UnchangedQuery planeRow{target.address, static_cast<std::size_t>(entry->planeBytes), oldest};
+    std::array<GuestMemory::StampRow, 2> rows{};
+    GuestMemory::StampsHoldReport report{std::span(rows.data(), htileRows + 1)};
+    std::uint64_t current = 0;
+    std::uint64_t memoCurrent = 0;
+    if (!GuestMemory::StampsHold(std::span(&htileRow, htileRows), {}, std::span(&planeRow, 1), apply, &current, &memoCurrent, &report)) {
+        const auto plane = rows[htileRows];
+        if (plane != GuestMemory::StampRow::Held) return missed(plane == GuestMemory::StampRow::Stamped ? DepthViewMiss::PlaneStamped : DepthViewMiss::PlaneUnproven);
+        return missed(rows[0] == GuestMemory::StampRow::Stamped ? DepthViewMiss::HtileStamped : DepthViewMiss::HtileUnproven);
+    }
+    // =2 took the lock without the drain: any host write queued then would move the generation at
+    // today's first tracker lock.
+    if (!apply && report.hostWritesPending) return missed(DepthViewMiss::HostWritesPending);
+    view.route = route;
+    view.planeBytes = entry->planeBytes;
+    view.current = current;
+    view.memoCurrent = memoCurrent;
+    if (!apply) {
+        // L12. The prediction; every lock is released on return, and today's path runs.
+        auto& prediction = view.prediction;
+        prediction.route = route;
+        prediction.surface = surface;
+        prediction.oldest = oldest;
+        prediction.h = h;
+        prediction.current = current;
+        prediction.memoCurrent = memoCurrent;
+        prediction.surfaces = entry->surfaces;
+        prediction.released = entry->released;
+        prediction.memo = memo;
+        prediction.accessible = accessible;
+        prediction.planeBytes = entry->planeBytes;
+        prediction.htileBytes = entry->htileBytes;
+        view.predicting = true;
+        countView(counters.predicted);
+        return nullptr;
+    }
+    // L13. The pending route's read proof, as today's store-back writes it (DS's htileReads write in
+    // storeBackClearedHtile's covered branch), with the memo-hit generation its collect would answer.
+    if (route == DepthViewRoute::Pending) {
+        std::lock_guard reads(htileReadsMutex());
+        htileReads()[target.htileAddress] = memoCurrent;
+    }
+    view.hit = true;
+    countView(counters.hits);
+    countView(counters.hitRoutes[DepthViewIndex(route)]);
+    held = std::move(lock);
+    return surface;
+}
+
+// =2: the evidence at one point of today's path (DepthLease.hpp). The store-back's point, before it,
+// reads the memo key only (its other evidence is its verdict's); the identity and sync points hold
+// the surfaces mutex.
+void depthViewPoint(DepthViewLease& view, DepthViewPoint point, const DepthTarget& target) {
+    const auto& prediction = view.prediction;
+    const bool memoMoved = GuestMemory::CurrentCollectMemoKey() != prediction.memo;
+    if (point == DepthViewPoint::StoreBack) {
+        view.storeBack.memoMoved = memoMoved;
+        return;
+    }
+    auto& evidence = view.evidence[point == DepthViewPoint::Identity ? 0 : 1];
+    evidence.memoMoved = memoMoved;
+    evidence.surfacesMoved = DepthSurfacesSerial() != prediction.surfaces || DepthSurfacesReleased() != prediction.released;
+    if (!evidence.surfacesMoved) {
+        const auto& surface = *prediction.surface;
+        evidence.retired = !surface.active->load(std::memory_order_acquire) || surface.retired;
+        evidence.oldestMoved = !surface.UnitsSized(prediction.planeBytes) || surface.OldestUnitGeneration() != prediction.oldest;
+    }
+    evidence.clearedHtile = clearedHtileCovers(target);
+    evidence.clockMoved = GuestMemory::TrackerGenerationNoDrain() > prediction.current;
+}
+
+// =2, at the call's end under the surfaces mutex: today's path against the prediction
+// (CheckDepthViewPrediction). Raced calls are counted (the first 8 printed); a disagreement no evidence
+// explains prints [depth-lease] and aborts.
+void verifyDepthViewPrediction(DepthViewLease& view, const DepthTarget& target, const DepthSurface& surface, bool created, VkImageAspectFlags htileCleared, bool cleared) {
+    const auto& prediction = view.prediction;
+    const auto& verdict = view.verdict;
+    DepthViewFacts facts;
+    facts.route = prediction.route;
+    facts.stencil = target.stencilAddress != 0;
+    facts.h = prediction.h;
+    facts.current0 = prediction.current;
+    facts.memoCurrent0 = prediction.memoCurrent;
+    facts.verdict = verdict.kind;
+    facts.htileCleared = static_cast<std::uint32_t>(htileCleared);
+    facts.storeBack = view.storeBack;
+    facts.storeBack.accessibleDiffers = verdict.accessibleRead && verdict.accessible != prediction.accessible;
+    facts.storeBack.foundDiffers = prediction.route == DepthViewRoute::NotPending && verdict.lookedUp && (!verdict.found || verdict.foundValue != prediction.h);
+    facts.storeBack.collectedAbove = verdict.collectedRead && verdict.collected > prediction.memoCurrent;
+    facts.cleared = cleared;
+    facts.created = created;
+    facts.sameSurface = &surface == prediction.surface;
+    facts.retiredBefore = view.retiredBefore;
+    facts.identity = view.evidence[0];
+    facts.synced = view.synced;
+    facts.sync = view.evidence[1];
+    if (prediction.route == DepthViewRoute::NotPending || prediction.route == DepthViewRoute::Pending) {
+        std::lock_guard reads(htileReadsMutex());
+        if (const auto found = htileReads().find(target.htileAddress); found != htileReads().end()) {
+            facts.htileReadFound = true;
+            facts.htileRead = found->second;
+        }
+    }
+    if (!surface.unitGeneration.empty()) {
+        const auto [low, high] = std::minmax_element(surface.unitGeneration.begin(), surface.unitGeneration.end());
+        facts.unitsLow = *low;
+        facts.unitsHigh = *high;
+    }
+    const auto noted = surface.NotedMemory();
+    facts.depthMemory = noted[0].generation;
+    facts.stencilMemory = noted[1].generation;
+    const auto check = CheckDepthViewPrediction(facts);
+    auto& counters = depthViewCounters;
+    if (check.part == DepthViewPart::None) {
+        countView(counters.verified);
+        return;
+    }
+    const auto evidence = [](const DepthViewEvidence& at) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "memo key %d, surfaces %d, retired %d, units %d, cleared HTILE %d, clock %d", at.memoMoved ? 1 : 0, at.surfacesMoved ? 1 : 0, at.retired ? 1 : 0, at.oldestMoved ? 1 : 0, at.clearedHtile ? 1 : 0, at.clockMoved ? 1 : 0);
+        return std::string(text);
+    };
+    char text[1536];
+    std::snprintf(text, sizeof(text), "target 0x%llx (stencil 0x%llx, HTILE 0x%llx): the lease predicted a hit (route %s, oldest %llu, h %llu, current %llu, memo-current %llu) but today's %s part disagrees: %s (today: store-back %s returned 0x%x, cleared HTILE taken %d, created %d, the predicted surface %d, retired %d, synced %d; HTILE read proof %s%llu, units %llu..%llu, depth memory %llu, stencil memory %llu; evidence: store-back memo key %d, Accessible %d, read proof %d, collect above %d; identity: %s; sync: %s)",
+                  static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.htileAddress), DepthViewRouteName(prediction.route), static_cast<unsigned long long>(prediction.oldest), static_cast<unsigned long long>(prediction.h), static_cast<unsigned long long>(prediction.current), static_cast<unsigned long long>(prediction.memoCurrent),
+                  DepthViewPartName(check.part), check.reason, HtileVerdictName(verdict.kind), static_cast<unsigned>(htileCleared), cleared ? 1 : 0, created ? 1 : 0, facts.sameSurface ? 1 : 0, view.retiredBefore ? 1 : 0, view.synced ? 1 : 0, facts.htileReadFound ? "" : "absent, ", static_cast<unsigned long long>(facts.htileRead),
+                  static_cast<unsigned long long>(facts.unitsLow), static_cast<unsigned long long>(facts.unitsHigh), static_cast<unsigned long long>(facts.depthMemory), static_cast<unsigned long long>(facts.stencilMemory), facts.storeBack.memoMoved ? 1 : 0, facts.storeBack.accessibleDiffers ? 1 : 0, facts.storeBack.foundDiffers ? 1 : 0, facts.storeBack.collectedAbove ? 1 : 0,
+                  evidence(facts.identity).c_str(), evidence(facts.sync).c_str());
+    if (check.raced) {
+        countView(counters.raced[DepthViewIndex(check.part) - 1]);
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[depth-lease] %s, after an update that landed after the prediction (not a disagreement)\n", text);
+        return;
+    }
+    std::fprintf(stderr, "[depth-lease] APS5_EXPERIMENT_DEPTH_LEASES=2: %s\n", text);
+    std::fflush(stderr);
+    std::abort();
+}
+
+// A full path's lease (GPU-OWNED-PLAN 11.8), or its refusal by the first reason that held (an entry
+// of the key then stops being a lease). The entry is found again by its key: no pointer is kept
+// across the call. =2 makes leases here too, so its predictions read leases full paths made.
+void createDepthViewLease(DepthViewLease& view, const Context& context, const DepthTarget& target, DepthSurface& surface, bool created, VkImageAspectFlags htileCleared, bool cleared) {
+    auto& table = ThreadScratch<DepthViewLeaseTable, DepthViewLeaseTableTag>();
+    const auto set = depthLeaseSet(target.address);
+    auto* entry = findDepthViewLease(table, set, view.recorder, context.device, target);
+    const auto refuse = [&](DepthViewRefusal refusal) {
+        countView(depthViewCounters.refusals[DepthViewIndex(refusal)]);
+        if (entry != nullptr) entry->leased = false;
+    };
+    if (created) return refuse(DepthViewRefusal::Created);
+    if (htileCleared != 0 || cleared) return refuse(DepthViewRefusal::StoredBackOrClearedTaken);
+    auto route = DepthViewRoute::NoHtile;
+    switch (view.verdict.kind) {
+        case HtileVerdictKind::NoHtile: route = DepthViewRoute::NoHtile; break;
+        case HtileVerdictKind::NotAccessible: route = DepthViewRoute::NotAccessible; break;
+        // A CPU read that cleared nothing wrote the read proof the next call's test finds.
+        case HtileVerdictKind::NotPendingProved:
+        case HtileVerdictKind::NotPendingRead: route = DepthViewRoute::NotPending; break;
+        case HtileVerdictKind::PendingCovered: route = DepthViewRoute::Pending; break;
+        case HtileVerdictKind::PendingNotCovering: return refuse(DepthViewRefusal::PendingNotCovering);
+        case HtileVerdictKind::PendingFillsOff: return refuse(DepthViewRefusal::PendingFillsOff);
+        default: return refuse(DepthViewRefusal::StoredBackOrClearedTaken);
+    }
+    // The memo key read before the store-back still holds, and the recorder is the key's.
+    const auto memo = GuestMemory::CurrentCollectMemoKey();
+    if (!memo.Valid() || memo != view.memo) return refuse(DepthViewRefusal::MemoKeyMoved);
+    if (RecorderFor(context) != view.recorder) return refuse(DepthViewRefusal::RecorderChanged);
+    // Every collect a hit skips is covered under that key: the HTILE's (store-back), the plane's
+    // (WrittenUnits) and the depth and stencil slices' (NoteMemory).
+    const auto planeBytes = static_cast<std::uint64_t>(DescribeSurface(mirrorResource(target)).guestBytes);
+    const auto htileBytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
+    const auto noted = surface.NotedMemory();
+    const bool htile = route == DepthViewRoute::NotPending || route == DepthViewRoute::Pending;
+    if ((htile && !GuestMemory::CollectCovered(target.htileAddress, htileBytes)) || !GuestMemory::CollectCovered(target.address, static_cast<std::size_t>(planeBytes)) || !GuestMemory::CollectCovered(noted[0].address, noted[0].bytes) || (noted[1].bytes != 0 && !GuestMemory::CollectCovered(noted[1].address, noted[1].bytes))) return refuse(DepthViewRefusal::NotCovered);
+    if (entry == nullptr) entry = &insertDepthViewLease(table, set, view.recorder, context.device, target);
+    entry->leased = true;
+    entry->memo = memo;
+    entry->surface = &surface;
+    entry->surfaces = DepthSurfacesSerial();
+    entry->released = DepthSurfacesReleased();
+    entry->route = route;
+    entry->finished = view.verdict.finished;
+    entry->notes = view.verdict.notes;
+    entry->planeBytes = planeBytes;
+    entry->htileBytes = htileBytes;
+    entry->used = ++table.tick;
+    countView(depthViewCounters.created);
+}
+
+// At the end of every eligible call, under the surfaces mutex. A hit renews its lease with the
+// recorder's serials its check read (memo key, route, surface and serials are unchanged: the surfaces
+// mutex has been held since its check). A full path counts its store-back verdict, is checked
+// against =2's prediction, then makes or refuses the lease.
+void depthViewLeaseEnd(DepthViewLease& view, const Context& context, const DepthTarget& target, DepthSurface& surface, bool created, VkImageAspectFlags htileCleared, bool cleared) {
+    auto& counters = depthViewCounters;
+    if (view.hit) {
+        auto& table = ThreadScratch<DepthViewLeaseTable, DepthViewLeaseTableTag>();
+        if (auto* entry = findDepthViewLease(table, depthLeaseSet(target.address), view.recorder, context.device, target); entry != nullptr && entry->leased) {
+            entry->finished = view.finished;
+            entry->notes = view.notes;
+            entry->used = ++table.tick;
+            countView(counters.renewed);
+        }
+        return;
+    }
+    countView(counters.verdicts[DepthViewIndex(view.verdict.kind)]);
+    if (view.predicting) verifyDepthViewPrediction(view, target, surface, created, htileCleared, cleared);
+    createDepthViewLease(view, context, target, surface, created, htileCleared, cleared);
+}
 }
 
 bool DepthLeaseSetInRecipe(bool inside) {
@@ -2160,6 +2740,188 @@ std::string DepthLeaseReport() {
     line += text;
     reported = now;
     return line;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.3): read once, as TargetLeases.
+int DepthViewLeases() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_EXPERIMENT_DEPTH_LEASES");
+        if (text == nullptr) return 0;
+        const auto value = std::strtol(text, nullptr, 10);
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    }();
+    return mode;
+}
+
+DepthViewLeaseCounts DepthViewLeaseTotals() {
+    const auto& counters = depthViewCounters;
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    DepthViewLeaseCounts totals;
+    totals.calls = load(counters.calls);
+    for (std::size_t i = 0; i < counters.ineligible.size(); ++i) totals.ineligible[i] = load(counters.ineligible[i]);
+    totals.hits = load(counters.hits);
+    for (std::size_t i = 0; i < counters.hitRoutes.size(); ++i) totals.hitRoutes[i] = load(counters.hitRoutes[i]);
+    for (std::size_t i = 0; i < counters.verdicts.size(); ++i) totals.verdicts[i] = load(counters.verdicts[i]);
+    totals.created = load(counters.created);
+    totals.renewed = load(counters.renewed);
+    for (std::size_t i = 0; i < counters.refusals.size(); ++i) totals.refusals[i] = load(counters.refusals[i]);
+    for (std::size_t i = 0; i < counters.misses.size(); ++i) totals.misses[i] = load(counters.misses[i]);
+    totals.evictions = load(counters.evictions);
+    totals.predicted = load(counters.predicted);
+    totals.verified = load(counters.verified);
+    for (std::size_t i = 0; i < counters.raced.size(); ++i) totals.raced[i] = load(counters.raced[i]);
+    return totals;
+}
+
+const char* DepthViewRouteName(DepthViewRoute route) {
+    constexpr std::array<const char*, DepthViewIndex(DepthViewRoute::Count)> names{"no HTILE", "not accessible", "not pending", "pending"};
+    const auto index = DepthViewIndex(route);
+    return index < names.size() ? names[index] : "?";
+}
+
+const char* HtileVerdictName(HtileVerdictKind kind) {
+    constexpr std::array<const char*, DepthViewIndex(HtileVerdictKind::Count)> names{"no HTILE", "not accessible", "not pending proved", "not pending CPU read", "pending covered", "pending not covering", "pending fills off", "stored back"};
+    const auto index = DepthViewIndex(kind);
+    return index < names.size() ? names[index] : "?";
+}
+
+const char* DepthViewMissName(DepthViewMiss miss) {
+    constexpr std::array<const char*, DepthViewIndex(DepthViewMiss::Count)> names{"no lease", "evicted", "memo key: epoch", "allocations", "unwatch", "reaped", "HTILE note", "accessibility", "surfaces", "retired", "cleared HTILE", "units resized", "no plane proof", "HTILE read proof moved", "plane: unproven", "stamped", "HTILE: unproven", "stamped", "host writes pending"};
+    const auto index = DepthViewIndex(miss);
+    return index < names.size() ? names[index] : "?";
+}
+
+const char* DepthViewRefusalName(DepthViewRefusal refusal) {
+    constexpr std::array<const char*, DepthViewIndex(DepthViewRefusal::Count)> names{"created", "HTILE stored back or cleared taken", "pending not covering", "pending fills off", "memo key moved", "recorder changed", "not covered"};
+    const auto index = DepthViewIndex(refusal);
+    return index < names.size() ? names[index] : "?";
+}
+
+const char* DepthViewPartName(DepthViewPart part) {
+    constexpr std::array<const char*, DepthViewIndex(DepthViewPart::Count)> names{"none", "store-back", "identity", "sync", "refresh"};
+    const auto index = DepthViewIndex(part);
+    return index < names.size() ? names[index] : "?";
+}
+
+std::string DepthViewLeaseReport() {
+    static DepthViewLeaseCounts reported;
+    const auto now = DepthViewLeaseTotals();
+    const auto delta = [](std::uint64_t value, std::uint64_t before) { return static_cast<unsigned long long>(value - before); };
+    const auto route = [&](DepthViewRoute at) { return delta(now.hitRoutes[DepthViewIndex(at)], reported.hitRoutes[DepthViewIndex(at)]); };
+    const auto ineligible = [&](DepthViewIneligible at) { return delta(now.ineligible[DepthViewIndex(at)], reported.ineligible[DepthViewIndex(at)]); };
+    std::string line;
+    char text[512];
+    std::snprintf(text, sizeof(text), "; D5 (APS5_EXPERIMENT_DEPTH_LEASES=%d): eligible %llu of %llu (ineligible: native or multisampled %llu, not mirrorable %llu, no recorder or unlocked %llu, no memo key %llu); hits %llu (pending %llu, not pending %llu, no HTILE %llu, not accessible %llu); full-path verdicts:", DepthViewLeases(),
+                  ineligible(DepthViewIneligible::Eligible), delta(now.calls, reported.calls), ineligible(DepthViewIneligible::Native), ineligible(DepthViewIneligible::NotMirrorable), ineligible(DepthViewIneligible::Unlocked), ineligible(DepthViewIneligible::NoMemoKey),
+                  delta(now.hits, reported.hits), route(DepthViewRoute::Pending), route(DepthViewRoute::NotPending), route(DepthViewRoute::NoHtile), route(DepthViewRoute::NotAccessible));
+    line += text;
+    for (std::size_t i = 0; i < DepthViewIndex(HtileVerdictKind::Count); ++i) {
+        std::snprintf(text, sizeof(text), "%s %s %llu", i == 0 ? "" : ",", HtileVerdictName(static_cast<HtileVerdictKind>(i)), delta(now.verdicts[i], reported.verdicts[i]));
+        line += text;
+    }
+    std::snprintf(text, sizeof(text), "; created %llu, renewed %llu, refused:", delta(now.created, reported.created), delta(now.renewed, reported.renewed));
+    line += text;
+    for (std::size_t i = 0; i < DepthViewIndex(DepthViewRefusal::Count); ++i) {
+        std::snprintf(text, sizeof(text), "%s %s %llu", i == 0 ? "" : ",", DepthViewRefusalName(static_cast<DepthViewRefusal>(i)), delta(now.refusals[i], reported.refusals[i]));
+        line += text;
+    }
+    line += "; misses:";
+    for (std::size_t i = 0; i < DepthViewIndex(DepthViewMiss::Count); ++i) {
+        std::snprintf(text, sizeof(text), "%s %s %llu", i == 0 ? "" : ",", DepthViewMissName(static_cast<DepthViewMiss>(i)), delta(now.misses[i], reported.misses[i]));
+        line += text;
+    }
+    std::uint64_t raced = 0;
+    std::uint64_t racedBefore = 0;
+    for (std::size_t i = 0; i < 4; ++i) {
+        raced += now.raced[i];
+        racedBefore += reported.raced[i];
+    }
+    std::snprintf(text, sizeof(text), "; table evictions %llu; =2: predicted hits %llu, verified %llu, raced %llu (store-back %llu, identity %llu, sync %llu, refresh %llu)", delta(now.evictions, reported.evictions), delta(now.predicted, reported.predicted), delta(now.verified, reported.verified), delta(raced, racedBefore),
+                  delta(now.raced[0], reported.raced[0]), delta(now.raced[1], reported.raced[1]), delta(now.raced[2], reported.raced[2]), delta(now.raced[3], reported.raced[3]));
+    line += text;
+    reported = now;
+    return line;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.9): see DepthLease.hpp.
+DepthViewCheck CheckDepthViewPrediction(const DepthViewFacts& facts) {
+    const auto expected = facts.route == DepthViewRoute::NoHtile ? HtileVerdictKind::NoHtile : facts.route == DepthViewRoute::NotAccessible ? HtileVerdictKind::NotAccessible : facts.route == DepthViewRoute::NotPending ? HtileVerdictKind::NotPendingProved : HtileVerdictKind::PendingCovered;
+    if (facts.verdict != expected || facts.htileCleared != 0) return {DepthViewPart::StoreBack, facts.storeBack.Any(), facts.htileCleared != 0 ? "today's store-back cleared the HTILE" : "today's store-back took another route"};
+    if (facts.cleared || facts.created || !facts.sameSurface || facts.retiredBefore) {
+        const char* reason = facts.cleared ? "today took a cleared HTILE" : facts.created ? "today created the surface" : !facts.sameSurface ? "today found another surface" : "today found the surface retired";
+        return {DepthViewPart::Identity, facts.identity.Any(), reason};
+    }
+    if (facts.synced) return {DepthViewPart::Sync, facts.sync.Any() || facts.unitsLow > facts.current0, "today synced the depth plane"};
+    bool lower = false;
+    bool higher = false;
+    const auto compare = [&](std::uint64_t value, std::uint64_t predicted) {
+        if (value < predicted) lower = true;
+        else if (value > predicted) higher = true;
+    };
+    if (facts.route == DepthViewRoute::Pending || facts.route == DepthViewRoute::NotPending) {
+        if (!facts.htileReadFound) lower = true;
+        else compare(facts.htileRead, facts.route == DepthViewRoute::Pending ? facts.memoCurrent0 : facts.h);
+    }
+    if (facts.unitsLow != facts.unitsHigh) lower = true;
+    compare(facts.unitsLow, facts.current0);
+    compare(facts.unitsHigh, facts.current0);
+    compare(facts.depthMemory, facts.memoCurrent0);
+    if (facts.stencil) compare(facts.stencilMemory, facts.memoCurrent0);
+    else if (facts.stencilMemory != 0) lower = true;
+    if (lower) return {DepthViewPart::Refresh, false, "a refresh value is below its prediction, missing, or unequal across the units"};
+    if (higher) return {DepthViewPart::Refresh, true, "a refresh value is above its prediction"};
+    return {};
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.12): test hooks (DepthLease.hpp).
+DepthViewLeaseState DepthViewLeaseProbe(const Context& context, const DepthTarget& target) {
+    DepthViewLeaseState state;
+    std::lock_guard lock(surfacesMutex());
+    DepthSurface* surface = nullptr;
+    for (const auto& candidate : surfaces()) {
+        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
+            surface = candidate.get();
+            break;
+        }
+    }
+    if (surface == nullptr) return state;
+    state.found = true;
+    state.units = surface->unitGeneration;
+    const auto noted = surface->NotedMemory();
+    state.depthMemory = noted[0].generation;
+    state.stencilMemory = noted[1].generation;
+    state.staleCount = surface->staleCount;
+    state.staleUnits = surface->staleUnits.size();
+    state.pendingClear = surface->pendingClear;
+    state.written = surface->written;
+    state.mirrored = surface->HasMirror();
+    state.retired = surface->retired;
+    if (target.htileAddress != 0) {
+        std::lock_guard reads(htileReadsMutex());
+        if (const auto found = htileReads().find(target.htileAddress); found != htileReads().end()) {
+            state.htileRead = true;
+            state.htileReadValue = found->second;
+        }
+    }
+    if (mirrorable(target)) {
+        const std::pair<std::uint64_t, std::uint64_t> plane{target.address, target.address + DescribeSurface(mirrorResource(target)).guestBytes};
+        auto& planes = stalePlanes();
+        std::lock_guard staleLock(planes.mutex);
+        state.stalePlaneListed = std::find(planes.ranges.begin(), planes.ranges.end(), plane) != planes.ranges.end();
+    }
+    return state;
+}
+
+bool DepthSurfaceNoteStoredForTest(const Context& context, const DepthTarget& target, std::uint64_t generation, std::size_t units) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& candidate : surfaces()) {
+        if (!candidate->active->load(std::memory_order_acquire) || candidate->context.device != context.device || !sameSurface(candidate->target, target)) continue;
+        std::vector<bool> stored(candidate->unitGeneration.size(), false);
+        for (std::size_t unit = 0; unit < stored.size() && unit < units; ++unit) stored[unit] = true;
+        candidate->NoteStored(stored, generation);
+        return true;
+    }
+    return false;
 }
 
 std::uint64_t DepthSurfacesSerial() {
@@ -2266,20 +3028,32 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
     const bool native = RoutesToNativeDepthOwner(target);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.6, DepthLease.hpp): the lease's
+    // check, before any of the call's own work. A hit (=1) returns the surface and holds the surfaces
+    // mutex in `held`; the steps it proved to be no-ops are skipped below, every other step runs. =2's
+    // prediction holds nothing, and today's path runs with its points. Unset: nothing beyond the test.
+    std::optional<DepthViewLease> view;
+    std::unique_lock<std::recursive_mutex> held;
+    DepthSurface* const leased = DepthViewLeases() != 0 ? depthViewLeaseHit(view.emplace(), context, target, native, held) : nullptr;
     // LOCAL DEBUG (APS5_PROFILE_DRAW, GPU-OWNED-PLAN 9.5 D5-0, DepthLease.hpp): the lease counter, while
-    // profiling only; its start reads the state the call's own work begins from.
+    // profiling only (and not while the D5 leases' switch is set: its table and time would sit in the
+    // phase they are measured by); its start reads the state the call's own work begins from.
     std::optional<DepthLeaseUse> lease;
-    if (depthLeaseProfiled()) depthLeaseStart(lease.emplace(), context, target, native);
-    const auto htileCleared = native ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    if (depthLeaseProfiled() && DepthViewLeases() == 0) depthLeaseStart(lease.emplace(), context, target, native);
+    if (view && view->predicting) depthViewPoint(*view, DepthViewPoint::StoreBack, target);
+    const auto htileCleared = native || leased != nullptr ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target, view ? view->VerdictOut() : nullptr);
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    std::unique_lock lock(surfacesMutex());
+    std::unique_lock<std::recursive_mutex> lock = leased != nullptr ? std::move(held) : std::unique_lock<std::recursive_mutex>(surfacesMutex());
     if (lease) depthLeaseLocked(*lease);
-    const bool cleared = takeClearedHtile(target);
-    DepthSurface* surface = nullptr;
-    for (const auto& candidate : surfaces()) {
-        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
-            surface = candidate.get();
-            break;
+    if (view && view->predicting) depthViewPoint(*view, DepthViewPoint::Identity, target);
+    const bool cleared = leased == nullptr && takeClearedHtile(target);
+    DepthSurface* surface = leased;
+    if (surface == nullptr) {
+        for (const auto& candidate : surfaces()) {
+            if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
+                surface = candidate.get();
+                break;
+            }
         }
     }
     const bool created = surface == nullptr;
@@ -2317,9 +3091,15 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         surface = surfaces().back().get();
     }
     if (lease) depthLeaseUnretire(*lease, surface->retired);
+    if (view) view->retiredBefore = surface->retired;
     surface->retired = false;
-    const auto owner = depthOwners().find({context.device, target.address});
-    const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.6): `inherits` is read only for a
+    // created surface or a cleared HTILE taken, which a hit has neither of, so a hit skips the lookup.
+    bool inherits = false;
+    if (leased == nullptr) {
+        const auto owner = depthOwners().find({context.device, target.address});
+        inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
+    }
     surface->clearDepth = target.clearDepth;
     surface->clearStencil = target.clearStencil;
     takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
@@ -2330,12 +3110,26 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     }
     if (!created) surface->NoteHtileClear(htileCleared);
     if (lease) lease->depthWrites = depthWrites;
-    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
+    if (mirrorable(target)) {
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.6): a hit's sync is
+        // SyncFromMemory's unchanged exit with the generation TrackerGeneration answered under its lock;
+        // a full path's is today's, watched for =2 (its point, and whether it synced) and the lease.
+        if (leased != nullptr) {
+            surface->SyncUnchanged(view->planeBytes, view->current);
+        } else {
+            if (view && view->predicting) depthViewPoint(*view, DepthViewPoint::Sync, target);
+            if (view) view->writes = depthWrites;
+            surface->SyncFromMemory(mirrorResource(target));
+            if (view) view->synced = depthWrites != view->writes;
+        }
+    }
     if (lease) lease->synced = depthWrites != lease->depthWrites;
     surface->ApplyFastClear();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
-    surface->NoteMemory();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES): a hit's NoteMemory, whose collects are memo hits.
+    if (leased != nullptr) surface->NoteMemoryAt(view->memoCurrent);
+    else surface->NoteMemory();
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
         surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);
@@ -2349,12 +3143,16 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     }
     if ((depthWritten || cleared) && mirrorable(target)) {
         const auto plane = target.address;
-        const auto planeBytes = DescribeSurface(mirrorResource(target)).guestBytes;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES): a hit has the plane's size (pure) in its lease.
+        const std::uint64_t planeBytes = leased != nullptr ? view->planeBytes : DescribeSurface(mirrorResource(target)).guestBytes;
         surface->MarkAllStale(planeBytes);
         noteStalePlane(plane, plane + planeBytes);
     }
     drawnDepth = surface;
     if (lease) depthLeaseEnd(*lease, context, target, *surface, created, htileCleared != 0, cleared);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_DEPTH_LEASES, GPU-OWNED-PLAN 11.8): renewal, =2's check and the
+    // lease's creation, under the surfaces mutex.
+    if (view && view->tracking) depthViewLeaseEnd(*view, context, target, *surface, created, htileCleared, cleared);
     return surface->view;
 }
 
