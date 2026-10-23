@@ -252,9 +252,15 @@ void drainPendingInputWrites(std::uint32_t queueId, std::initializer_list<std::p
         pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);
         return;
     }
-    // LOCAL DEBUG (DRAIN-PLAN C6): no queued write declares the inputs, but a draw that may write
-    // guest memory it does not declare is queued (D1's hidden-write drain).
-    if (Stream::On() && pipeline.HiddenWritesQueued() != 0) Drain::NoteGuard(Drain::Guard::HiddenFill, false);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN, DRAIN-PLAN D1) and LOCAL DEBUG (C6): no
+    // queued write declares the inputs, but a draw that may write guest memory it does not declare
+    // is queued: drain (=1) or count (=2).
+    const int hiddenMode = Drain::HiddenWriteDrain();
+    if ((hiddenMode != 0 || Stream::On()) && pipeline.HiddenWritesQueued() != 0) {
+        const bool drainHidden = hiddenMode == 1;
+        Drain::NoteGuard(Drain::Guard::HiddenFill, drainHidden);
+        if (drainHidden) pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);
+    }
 }
 
 }

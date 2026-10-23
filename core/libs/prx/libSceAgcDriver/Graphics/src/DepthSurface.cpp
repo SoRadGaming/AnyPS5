@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FieldCount.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -3330,10 +3331,36 @@ std::optional<MemoryValueFill> MatchMemoryValueFill(std::span<const std::uint32_
     return MemoryValueFill{address, static_cast<std::size_t>(dwords * 4u), valueAddress};
 }
 
+namespace {
+
+std::mutex& notedValueFillMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+NotedMemoryValueFill& notedValueFill() {
+    static NotedMemoryValueFill noted;
+    return noted;
+}
+
+}
+
 void NoteMemoryValueFill(const MemoryValueFill& fill) {
     std::uint32_t value = 0;
     GuestMemory::Read(fill.valueAddress, std::as_writable_bytes(std::span(&value, 1)), 4);
+    if (Drain::NoteGuards() != 0) {
+        std::lock_guard lock(notedValueFillMutex());
+        auto& noted = notedValueFill();
+        noted.address = fill.address;
+        noted.value = value;
+        ++noted.notes;
+    }
     NoteDepthMetadataFill(fill.address, fill.bytes, value);
+}
+
+NotedMemoryValueFill LastNotedMemoryValueFill() {
+    std::lock_guard lock(notedValueFillMutex());
+    return notedValueFill();
 }
 
 std::optional<StorageImageClear> MatchStorageImageClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::array<std::uint32_t, 3>& groups) {

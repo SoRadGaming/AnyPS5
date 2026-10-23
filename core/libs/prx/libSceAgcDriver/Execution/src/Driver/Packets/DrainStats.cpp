@@ -408,6 +408,24 @@ void maybeReportRecipesAlone() {
 
 }
 
+namespace {
+
+int experimentMode(const char* name) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0) return 0;
+    return std::strcmp(text, "2") == 0 ? 2 : 1;
+}
+
+}
+
+int noteGuardMode() {
+    return experimentMode("APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS");
+}
+
+int hiddenWriteMode() {
+    return experimentMode("APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN");
+}
+
 bool GdsOn() {
     static const bool on = [] {
         const char* text = std::getenv("APS5_DEBUG_GDS_STATS");

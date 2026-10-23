@@ -866,6 +866,14 @@ bool TakeMultisampledSingleClear(std::span<const std::uint32_t> code, std::span<
     return true;
 }
 
+std::optional<std::array<std::uint32_t, 4>> RecordedMultisampledSingleClear(std::uint64_t surface) {
+    std::lock_guard lock(singleClearsMutex());
+    for (const auto& clear : singleClears()) {
+        if (clear.surface == surface) return clear.color;
+    }
+    return std::nullopt;
+}
+
 VkClearColorValue MultisampledDccClear(const ColorTarget& target, std::span<const std::byte> dcc, std::span<const std::byte> cmask) {
     Require(target.dccAddress != 0 && (target.dccControl & 0x3ff80u) == 0 && (target.pipeBankXor & ~0xcf00u) == 0, "multisampled DCC address, color transform, lossy mode or XOR is not implemented");
     Require(dcc.size() == MultisampledDccBytes(target), "multisampled DCC metadata snapshot size mismatch");

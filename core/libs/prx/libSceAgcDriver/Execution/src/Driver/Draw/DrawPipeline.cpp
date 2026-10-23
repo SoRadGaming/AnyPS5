@@ -301,7 +301,8 @@ unsigned DrawPipeline::Committers() {
 }
 
 bool DrawPipeline::hiddenWriteTracking() {
-    return Stream::On();
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN, DRAIN-PLAN D1) or the counters reading it.
+    return Stream::On() || Drain::HiddenWriteDrain() != 0;
 }
 
 std::size_t DrawPipeline::CopyWrites(std::vector<Range>& writes) {

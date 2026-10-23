@@ -77,9 +77,10 @@ public:
     std::uint64_t Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, ItemKind kind, const Prepare* prepare = nullptr, bool hiddenWrites = false) {
         return Enqueue(std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), {}, kind, prepare, hiddenWrites);
     }
-    // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN D1's tracking for C3 and C6): whether the draw
-    // enqueues compute their hidden-write flag (off: they pass none and nothing is counted), and the
-    // queued items flagged so, counted at the push and uncounted at the pop after their commit.
+    // DRAIN-PLAN D1 (APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN, and the counters C3 and C6 under
+    // APS5_DEBUG_STREAM_STATS): whether the draw enqueues compute their hidden-write flag (off: they
+    // pass none and nothing is counted), and the queued items flagged so, counted at the push and
+    // uncounted at the pop after their commit.
     static bool HiddenWriteTracking() {
         static const bool on = hiddenWriteTracking();
         return on;

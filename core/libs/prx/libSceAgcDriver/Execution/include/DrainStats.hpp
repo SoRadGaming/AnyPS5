@@ -191,8 +191,27 @@ bool GateWindowOpen();
 void GateCapture(std::uint64_t address, std::size_t bytes);
 void GateClose(GateExit exit);
 
-// C6: D1's guard conditions met with items queued (a hit), and the drains D1 made for them (none
-// before D1). Msaa: TakeMultisampledSingleClear's kernel; ValueFill: NoteMemoryValueFill's; the hidden
+// LOCAL EXPERIMENT (DRAIN-PLAN D1): the queue-0 ordering guards. APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS
+// drains before TakeMultisampledSingleClear and NoteMemoryValueFill when items are queued (G-msaa,
+// G-vfill: both notes read guest memory and change state queued draws read at their commit);
+// APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN drains before an unregistered code read (ReadRawShader) or a
+// fill's input reads (drainPendingInputWrites) when a draw that may write guest memory it does not
+// declare is queued (HiddenWritesQueued). Each =1 drains, =2 only counts (C6); unset (or 0) is
+// today. Read once.
+int noteGuardMode();
+int hiddenWriteMode();
+inline int NoteGuards() {
+    static const int mode = noteGuardMode();
+    return mode;
+}
+inline int HiddenWriteDrain() {
+    static const int mode = hiddenWriteMode();
+    return mode;
+}
+
+// C6: D1's guard conditions met with items queued (a hit), and the drains D1 made for them
+// (APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS=1, APS5_EXPERIMENT_HIDDEN_WRITE_DRAIN=1). Counted under
+// stream stats or the guard's switch. Msaa: TakeMultisampledSingleClear's kernel; ValueFill: NoteMemoryValueFill's; the hidden
 // ones: an unregistered code read (ReadRawShader) or fill inputs (drainPendingInputWrites) with a
 // hidden-write draw queued and no overlap drain. Cumulative totals for the tests; the [dispatch-guards]
 // line prints each window's share.

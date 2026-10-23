@@ -205,28 +205,30 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
     } else {
-        // LOCAL DEBUG (APS5_DEBUG_STREAM_STATS, DRAIN-PLAN C3, C6): the two notes below read guest
-        // memory and change state queued draws read at their commit, with no drain of their own: D1's
-        // guard conditions met with items queued (today's gap), and C3's window exits at them. Both
-        // matchers read only code and user data.
-        if (Stream::On() && indirectArguments == 0) {
-            const bool queued = DrawPipeline::Active() && DrawPipeline::Queue0().Busy();
-            if (queued || Drain::GateWindowOpen()) {
-                const auto code = std::span(snapshot.code).subspan(codeOffset);
-                if (Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads)) {
-                    if (queued) Drain::NoteGuard(Drain::Guard::Msaa, false);
-                    Drain::GateClose(Drain::GateExit::MsaaGuard);
-                }
-                if ((packet[4] & 0x20u) == 0 && Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]})) {
-                    if (queued) Drain::NoteGuard(Drain::Guard::ValueFill, false);
-                    Drain::GateClose(Drain::GateExit::ValueFillGuard);
-                }
-            }
-        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS, DRAIN-PLAN D1) and LOCAL DEBUG
+        // (APS5_DEBUG_STREAM_STATS, C3, C6): the two notes below read guest memory and change state
+        // that queued draws read at their commit (TakeMultisampledSingleClear records the single-clear
+        // color a draw's commit consumes; NoteMemoryValueFill reads the fill value and changes depth
+        // clear state), with no drain of their own when this dispatch is not first after a gate.
+        // G-msaa and G-vfill drain queue 0 first (=1) or count (=2); C3's window exits there. Both
+        // matchers read only code and user data, so no queued write changes whether a guard fires.
+        const int noteGuards = Drain::NoteGuards();
+        const auto guardNote = [&](bool matched, Drain::Guard guard, Drain::GateExit exit) {
+            if (!matched) return;
+            if (Stream::On()) Drain::GateClose(exit);
+            if (!DrawPipeline::Active() || !DrawPipeline::Queue0().Busy()) return;
+            const bool drain = noteGuards == 1;
+            Drain::NoteGuard(guard, drain);
+            if (drain) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture, 0x15);
+        };
+        const bool guardsLook = (noteGuards != 0 || Stream::On()) && indirectArguments == 0;
+        const auto guardsQueued = [&] { return (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) || (Stream::On() && Drain::GateWindowOpen()); };
+        if (guardsLook && guardsQueued()) guardNote(Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads).has_value(), Drain::Guard::Msaa, Drain::GateExit::MsaaGuard);
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
         }
+        if (guardsLook && (packet[4] & 0x20u) == 0 && guardsQueued()) guardNote(Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]}).has_value(), Drain::Guard::ValueFill, Drain::GateExit::ValueFillGuard);
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }

@@ -65,6 +65,14 @@ struct MemoryValueFill {
 };
 std::optional<MemoryValueFill> MatchMemoryValueFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups);
 void NoteMemoryValueFill(const MemoryValueFill& fill);
+// LOCAL EXPERIMENT (DRAIN-PLAN D1, a test hook kept only while APS5_EXPERIMENT_DISPATCH_NOTE_GUARDS
+// is set): the last NoteMemoryValueFill's fill address and the value it read, and how many it noted.
+struct NotedMemoryValueFill {
+    std::uint64_t address = 0;
+    std::uint32_t value = 0;
+    std::uint64_t notes = 0;
+};
+NotedMemoryValueFill LastNotedMemoryValueFill();
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture);
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile);
