@@ -178,6 +178,12 @@ void noteGuestAccess(std::uint64_t address, std::size_t bytes, bool store);
 inline void NoteGuestAccess(std::uint64_t address, std::size_t bytes, bool store) {
     if (GdsCounting()) noteGuestAccess(address, bytes, store);
 }
+// The counter GuestMemory calls before the flush hook (GuestMemory::SetGuestAccessCounter): C1's
+// noteGuestAccess under APS5_DEBUG_GDS_STATS, and LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM,
+// DRAIN-PLAN D2) the GDS stream's invariant check once it recorded an operation
+// (GdsStream::CheckGuestAccess). Registered at load under the GDS stats, by GdsStream at its first
+// recorded operation otherwise; either way the same function.
+void GuestAccess(std::uint64_t address, std::size_t bytes, bool store);
 // Driver::waitMemory's record: the readback destinations it reads (taken at once, filed under Wait
 // with how it ended), and for queue 0 the 0x93 blame of a wait that polled: the producer queue of
 // the label that satisfied it, and how much of the wait that queue's GDS DMA_DATAs spent in GPU

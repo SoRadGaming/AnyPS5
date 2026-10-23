@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/DrainStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GdsStream.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -644,10 +645,17 @@ void noteGuestAccess(std::uint64_t address, std::size_t bytes, bool store) {
     noteTouch(store ? Touch::Overwritten : Touch::HookRead, address, bytes);
 }
 
+void GuestAccess(std::uint64_t address, std::size_t bytes, bool store) {
+    if (GdsCounting()) noteGuestAccess(address, bytes, store);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): armed by its first recorded
+    // operation only, so the switch is not read here.
+    if (GdsStream::Armed()) GdsStream::CheckGuestAccess(address, bytes);
+}
+
 namespace {
 // GuestMemory's flush path calls the counter through a registered pointer (it links without this file).
 const bool guestAccessCounterRegistered = [] {
-    if (GdsCounting()) GuestMemory::SetGuestAccessCounter(&noteGuestAccess);
+    if (GdsCounting()) GuestMemory::SetGuestAccessCounter(&GuestAccess);
     return true;
 }();
 }
@@ -854,6 +862,7 @@ void ReportWindow(Window window, bool print) {
         Take(Stream::counters.segmentSyncs);
         Take(Stream::counters.segmentSyncNs);
         if (GdsCounting()) reportGds("-", false);
+        GdsStream::ReportWindow("-", false);
         const auto totals = GuardTotals();
         lastHits = totals.hits;
         lastDrains = totals.drains;
@@ -943,6 +952,8 @@ void ReportWindow(Window window, bool print) {
     }
     // C1.
     if (GdsCounting()) reportGds(name);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): its [gds-stream] line, tagged too.
+    GdsStream::ReportWindow(name, true);
 }
 
 }
