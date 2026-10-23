@@ -4891,7 +4891,12 @@ bool drawInputLeaseCounterTests(const Device& device, Recorder& recorder) {
 
 // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 9): =2's death rows of L1 (each ends
 // the process through abort(), turned into exit code 3 as for the snapshot hash's =3 case).
-enum class InputLeaseDeath : std::uint8_t { None, C, M };
+enum class InputLeaseDeath : std::uint8_t { None, C, M, P1, P2 };
+
+// (q2): a removal's PendingSerial bump (no addition), between row P's prediction and today's call.
+void bumpPendingSerialForTest() {
+    StorageTexture::BumpPendingSerial();
+}
 
 [[maybe_unused]] void inputLeaseExitOnAbort(int) {
     std::_Exit(3);
@@ -4928,8 +4933,19 @@ struct InputLeaseTestGate final : AgcDriver::GuestMemory::ISpeculativeReadGate {
 // is made; (n) a second thread that adopted the epoch and holds the GpuMutex does not take row C
 // (owner mismatch) and walks (profiled rows), and C then misses back on this thread; (m) nested
 // speculative read scopes on a helper thread: the gate's mirror equals the thread_local at every
-// point and a flush is refused inside. `death` (=2): the coverage dropped under the same key (C), or an
-// in-between vertex entry kept without its set serial's bump (M): the next input must abort.
+// point and a flush is refused inside. Row P (stage S4) holds at the flush hook of every one of these
+// inputs (nothing is pending over them; one after-input check each at =2); its own cases follow over a
+// second block of storage images (registered, without host imports, as the slice tests make them):
+// both skip points of a vertex range nothing is pending over, by query then by memo; (e) a pending
+// image over a vertex range: P does not hold and today's path flushes it; (f) an image dirty only in
+// another slice: P does not hold over the slice with no pending unit, nor after units are added there
+// without a PendingSerial bump; (o) with no flush hook installed the hook arguments are cleared on
+// return, and a later hook does not skip; (p) an addition without the GpuMutex turns row P off for
+// good (the next input holds no point; =2 prints U and does not abort; last, as the switch stays off).
+// `death` (=2): the coverage dropped under the same key (C); an in-between vertex entry kept without its
+// set serial's bump (M); a pending image hidden from row P's query (P1), and the same with a removal's
+// PendingSerial bump between the prediction and today's call (P2), which must not excuse it: the next
+// input must abort.
 bool drawInputLeaseTests(const Device& device, Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu, InputLeaseDeath death) {
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
@@ -4955,20 +4971,39 @@ bool drawInputLeaseTests(const Device& device, Recorder& recorder, std::unique_l
     for (std::uint32_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) words[i] = i * 7 + 3;
     const auto address = reinterpret_cast<std::uint64_t>(memory);
     constexpr std::size_t size = 256;
+    const bool rowP = InputLeaseRowOn(InputLeaseRow::P);
     BumpCollectEpoch();
+    // Row P needs a PendingSerial other than 0 (a fresh process may still have 0: no proof).
+    StorageTexture::BumpPendingSerial();
     auto before = InputLeaseExperimentNow();
-    // The step's holds of rows C and M since the last step: each applied at =1, predicted and verified
-    // at =2 (none void: nothing moves a key part between the reads); none counted with the switch unset
-    // or its row off.
-    const auto expect = [&](std::uint64_t c, std::uint64_t m, const char* what) {
+    // The step's holds since the last step: rows C and M (Any: not checked) and the skip points row P
+    // held, each applied at =1, predicted and verified at =2 (none void or raced, and one after-input
+    // check for each of the step's `inputs` that held a point); none counted with the switch unset or the
+    // row off.
+    constexpr std::uint64_t Any = ~std::uint64_t{0};
+    using X = InputLeaseExperimentCounts;
+    const auto expectRows = [&](std::uint64_t c, std::uint64_t m, std::uint64_t p, std::uint64_t inputs, const char* what) {
         const auto now = InputLeaseExperimentNow();
+        const auto delta = [&](std::uint64_t X::*field) { return now.*field - before.*field; };
         const auto cRows = rowC ? c : 0;
         const auto mRows = rowM ? m : 0;
-        if (mode == 1) Require(now.cHeld - before.cHeld == cRows && now.mHeld - before.mHeld == mRows && now.cPredicted == before.cPredicted && now.mPredicted == before.mPredicted, what);
-        else if (mode == 2) Require(now.cPredicted - before.cPredicted == cRows && now.cVerified - before.cVerified == cRows && now.cVoided == before.cVoided && now.mPredicted - before.mPredicted == mRows && now.mVerified - before.mVerified == mRows && now.cHeld == before.cHeld && now.mHeld == before.mHeld, what);
-        else Require(now.cHeld == 0 && now.mHeld == 0 && now.cPredicted == 0 && now.mPredicted == 0, what);
+        const auto pRows = rowP ? p : 0;
+        if (mode == 1) {
+            if (c != Any) Require(delta(&X::cHeld) == cRows, what);
+            if (m != Any) Require(delta(&X::mHeld) == mRows, what);
+            Require(delta(&X::pHeld) == pRows && delta(&X::cPredicted) == 0 && delta(&X::mPredicted) == 0 && delta(&X::pPredicted) == 0, what);
+        } else if (mode == 2) {
+            if (c != Any) Require(delta(&X::cPredicted) == cRows && delta(&X::cVerified) == cRows, what);
+            if (m != Any) Require(delta(&X::mPredicted) == mRows && delta(&X::mVerified) == mRows, what);
+            Require(delta(&X::cVoided) == 0 && delta(&X::pPredicted) == pRows && delta(&X::pVerified) == pRows && delta(&X::pRaced) == 0 && delta(&X::pAfter) == (pRows != 0 ? inputs : 0) && delta(&X::pAfterMoved) == 0, what);
+            Require(delta(&X::cHeld) == 0 && delta(&X::mHeld) == 0 && delta(&X::pHeld) == 0, what);
+        } else {
+            Require(now.cHeld == 0 && now.mHeld == 0 && now.pHeld == 0 && now.cPredicted == 0 && now.mPredicted == 0 && now.pPredicted == 0, what);
+        }
         before = now;
     };
+    // Every step of rows C and M below is one CopyDrawInput, whose flush hook row P holds.
+    const auto expect = [&](std::uint64_t c, std::uint64_t m, const char* what) { expectRows(c, m, 1, 1, what); };
     const auto index = [&](std::size_t bufferBytes = 0) { return CopyDrawInput(context, &recorder, address, size, 4, Use::Index32, bufferBytes); };
     const auto equalsGuest = [&](const DrawInputCopy& copy) { return std::memcmp(copy.buffer->Bytes().data(), memory, size) == 0; };
     // (a)
@@ -5141,6 +5176,137 @@ bool drawInputLeaseTests(const Device& device, Recorder& recorder, std::unique_l
     }).join();
     Require(failure.empty(), failure);
     Require(!SpeculativeReader() && SpeculativeGateMirrored(), "this thread's speculative gate or its mirror moved");
+    // Row P's own cases (stage S4). A vertex input as prepareDrawInputs makes it: its lease view, then
+    // InPlaceDrawInput (skip point (a), its FlushPending, where the device binds draw inputs in place),
+    // then the copy (skip point (b), CopyDrawInput's flush hook) unless it was bound in place.
+    TextureDetiler detiler(context);
+    auto imageContext = context;
+    imageContext.hostImportAlignment = 0;
+    imageContext.detiler = &detiler;
+    imageContext.recorder = &recorder;
+    const auto vertexInput = [&](std::uint64_t at, std::size_t length) {
+        InputLeaseShadow shadow(&recorder, at, length, Use::Vertex);
+        bool behind = false;
+        if (InPlaceDrawInput(imageContext, at, length, 1, &behind, &shadow) != nullptr) {
+            shadow.InPlace();
+            return true;
+        }
+        const auto copy = CopyDrawInput(imageContext, &recorder, at, length, 1, Use::Vertex, 0, &shadow);
+        Require(std::memcmp(copy.buffer->Bytes().data(), reinterpret_cast<const void*>(at), length) == 0, "a vertex input's copy differs from guest memory");
+        KeepDrawInput(&recorder, at, copy, Use::Vertex, 0);
+        return false;
+    };
+    const auto points = [&](bool inPlace) -> std::uint64_t { return (imageContext.drawInputsInPlace ? 1u : 0u) + (inPlace ? 0u : 1u); };
+    const auto clear = address + 2 * block + 16384;
+    expectRows(Any, Any, points(vertexInput(clear, 2048)), 1, "row P did not hold at the skip points of a vertex range nothing is pending over (query)");
+    expectRows(Any, Any, points(vertexInput(clear, 2048)), 1, "row P did not hold at the skip points of a vertex range nothing is pending over (memo)");
+    void* imageBlock = AllocateWatched(bytes, block);
+    Require(imageBlock != nullptr, "no watched block for the storage images although write watching is on");
+    std::memset(imageBlock, 0x33, bytes);
+    const auto images = reinterpret_cast<std::uint64_t>(imageBlock);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(imageBlock, bytes, true, true, true);
+    }
+    struct UnregisterImages {
+        const Context& context;
+        void* block;
+        ~UnregisterImages() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } unregisterImages{context, imageBlock};
+    CollectWritesUncached(images, bytes);
+    const auto resource = [&](std::uint64_t at, bool layered) {
+        GuestTextureResource described{};
+        described.baseAddress = at;
+        described.width = 128;
+        described.height = 128;
+        described.depthOrLastArray = layered ? 1 : 0;
+        described.mipCount = 1;
+        described.tileMode = TextureTileMode::kR64KBX;
+        described.dimension = layered ? TextureDimension::k2DArray : TextureDimension::k2D;
+        described.format = 56;
+        described.dstSelX = 4;
+        described.dstSelY = 5;
+        described.dstSelZ = 6;
+        described.dstSelW = 7;
+        return described;
+    };
+    const auto flat = resource(images, false);
+    Require(DescribeSurface(flat).guestBytes == block, "row P's image fixture is not one 64 KiB block");
+    const auto pendingImage = [&](const GuestTextureResource& described) {
+        auto image = StorageTexture::Create(imageContext, detiler, described, 0);
+        static_cast<void>(recorder.Commands());
+        recorder.Keep(image);
+        return image;
+    };
+    if (death == InputLeaseDeath::P1 || death == InputLeaseDeath::P2) {
+        auto image = pendingImage(flat);
+        image->MarkDirty();
+        StorageTexture::HidePendingFromQueryForTest(true);
+        if (death == InputLeaseDeath::P2) InputLeaseSetPendingProbeHookForTest(&bumpPendingSerialForTest);
+        prepareInputLeaseDeath(death == InputLeaseDeath::P1 ? "a pending image is hidden from row P's query" : "a pending image is hidden from row P's query and a removal bumps PendingSerial after the prediction");
+        static_cast<void>(CopyDrawInput(imageContext, &recorder, images, size, 4, Use::Index32));
+        Require(false, "=2 did not abort on a row P hold over a pending image");
+    }
+    // (e)
+    {
+        auto image = pendingImage(flat);
+        image->MarkDirty();
+        Require(image->Dirty(), "(e) the storage image did not go pending");
+        static_cast<void>(vertexInput(images, 4096));
+        expectRows(Any, Any, 0, 1, "(e) row P held over a pending storage image");
+        Require(!image->Dirty(), "(e) the pending storage image over the vertex range was not flushed");
+        recorder.Sync();
+    }
+    // (f)
+    {
+        const auto layered = resource(images + 2 * block, true);
+        const auto geometry = DescribeSurface(layered);
+        Require(geometry.imageLayers == 2 && geometry.layerBytes == block, "(f) the layered image does not hold two 64 KiB slices");
+        auto image = pendingImage(layered);
+        image->MarkSliceDirty(1);
+        const auto slice0 = layered.baseAddress + geometry.GuestLayerOffset(0);
+        static_cast<void>(vertexInput(slice0, 4096));
+        expectRows(Any, Any, 0, 1, "(f) row P held over an image dirty in another slice");
+        Require(image->Dirty(), "(f) an image with no pending unit over the range was flushed");
+        // Units of a dirty image go pending without a PendingSerial bump.
+        const auto serial = StorageTexture::PendingSerial();
+        image->MarkSliceDirty(0);
+        Require(StorageTexture::PendingSerial() == serial, "(f) a dirty image's new units bumped PendingSerial");
+        static_cast<void>(vertexInput(slice0, 4096));
+        expectRows(Any, Any, 0, 1, "(f) row P held over units added without a bump");
+        image->WriteBack();
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        Require(!image->Dirty(), "(f) the layered image stayed pending after its write-back");
+    }
+    // (o) No flush hook: the arguments live only while FlushGpuWrites runs; then a hook (reinstalled)
+    // over the same range, at another S, finds none.
+    SetFlushHook(nullptr);
+    const auto unhooked = index();
+    recorder.Activate();
+    Require(!InputLeaseHookArgsSet(), "(o) the flush hook's arguments outlived CopyDrawInput's FlushGpuWrites");
+    Require(equalsGuest(unhooked), "(o) a draw input without a flush hook differs from guest memory");
+    expectRows(Any, Any, 0, 1, "(o) row P held without a flush hook");
+    StorageTexture::BumpPendingSerial();
+    FlushGpuWrites(address, size);
+    expectRows(0, 0, 0, 0, "(o) a later flush hook skipped with arguments left behind");
+    // (p) The kill switch (last: it stays on).
+    std::thread([] { NotePendingAddition(PendingAdditionSite::Shadow); }).join();
+    Require(PendingRowOff() == (mode != 0 && rowP), "(p) an addition without the GpuMutex did not turn row P off, or turned it off with the switch unset");
+    Require(equalsGuest(index()), "(p) a draw input after the kill switch differs from guest memory");
+    if (mode != 0 && rowP) {
+        expectRows(Any, Any, 0, 1, "(p) row P held after the kill switch");
+    } else {
+        expectRows(Any, Any, 1, 1, "(p) row P stopped holding without the switch");
+    }
     recorder.Sync();
     return true;
 }
@@ -14453,9 +14619,10 @@ int main(int argc, char** argv) {
         // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, REVALIDATE-PLAN 5 and 9, L1): the draw-input
         // leases over real CopyDrawInput calls in the switch's mode, and =2's death rows; skipped (77)
         // without write watching.
-        if (argc == 2 && (std::string_view(argv[1]) == "--input-lease-only" || std::string_view(argv[1]) == "--input-lease-death-c" || std::string_view(argv[1]) == "--input-lease-death-m")) {
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--input-lease-") && (std::string_view(argv[1]) == "--input-lease-only" || std::string_view(argv[1]).starts_with("--input-lease-death-"))) {
             const std::string_view which = argv[1];
-            const auto death = which == "--input-lease-death-c" ? InputLeaseDeath::C : which == "--input-lease-death-m" ? InputLeaseDeath::M : InputLeaseDeath::None;
+            const auto death = which == "--input-lease-death-c" ? InputLeaseDeath::C : which == "--input-lease-death-m" ? InputLeaseDeath::M : which == "--input-lease-death-p1" ? InputLeaseDeath::P1 : which == "--input-lease-death-p2" ? InputLeaseDeath::P2 : InputLeaseDeath::None;
+            Require(which == "--input-lease-only" || death != InputLeaseDeath::None, "an unknown draw input lease death row");
             if (!drawInputLeaseTests(device, recorder, gpu, death)) {
                 std::cout << "skipped, the device watches no memory for the draw input leases\n";
                 return 77;

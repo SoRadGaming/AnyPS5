@@ -1685,7 +1685,20 @@ if(BUILD_TESTING)
     add_test(NAME agc_draw_input_lease_2_death_m COMMAND agc_driver_recorder_tests --input-lease-death-m)
     set_tests_properties(agc_draw_input_lease_2_death_m PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1" TIMEOUT 60
         PASS_REGULAR_EXPRESSION "\\[input-lease\\] APS5_EXPERIMENT_INPUT_LEASES=2: M: [^\r\n]*today's lookup finds another entry of the range")
-    list(APPEND drawInputLeaseTests agc_draw_input_lease_2_death_c agc_draw_input_lease_2_death_m)
+    # Row P (stage S4): on and verify with the flush hook's FlushPending path (APS5_HOOK_FLUSH_CPU_BLOCKS=0:
+    # the hook skip goes through FlushPending, which still runs FlushDepthPlanes); =2's death rows: a
+    # pending image hidden from the row's query must abort (p1), also when a removal bumps PendingSerial
+    # between the prediction and today's call (p2: removals never excuse a difference).
+    add_test(NAME agc_draw_input_lease_1_hook_flush COMMAND agc_driver_recorder_tests --input-lease-only)
+    add_test(NAME agc_draw_input_lease_2_hook_flush COMMAND agc_driver_recorder_tests --input-lease-only)
+    set_tests_properties(agc_draw_input_lease_1_hook_flush PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=1;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1;APS5_HOOK_FLUSH_CPU_BLOCKS=0" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_draw_input_lease_2_hook_flush PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1;APS5_EXPERIMENT_DRAW_INPUTS_VRAM=1;APS5_HOOK_FLUSH_CPU_BLOCKS=0" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    foreach(drawInputLeaseDeath IN ITEMS p1 p2)
+        add_test(NAME agc_draw_input_lease_2_death_${drawInputLeaseDeath} COMMAND agc_driver_recorder_tests --input-lease-death-${drawInputLeaseDeath})
+        set_tests_properties(agc_draw_input_lease_2_death_${drawInputLeaseDeath} PROPERTIES ENVIRONMENT "APS5_EXPERIMENT_INPUT_LEASES=2;APS5_DEBUG_COVERAGE=1" TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "\\[input-lease\\] APS5_EXPERIMENT_INPUT_LEASES=2: P: [^\r\n]*=1 would have skipped it")
+    endforeach()
+    list(APPEND drawInputLeaseTests agc_draw_input_lease_2_death_c agc_draw_input_lease_2_death_m agc_draw_input_lease_1_hook_flush agc_draw_input_lease_2_hook_flush agc_draw_input_lease_2_death_p1 agc_draw_input_lease_2_death_p2)
     if(WIN32)
         set_tests_properties(${drawInputLeaseTests} PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

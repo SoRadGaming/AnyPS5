@@ -732,16 +732,18 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                     ++lost;
                     continue;
                 }
+                // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): units go live, an addition to
+                // what a draw input's pending check sees (the PendingSerial bump follows outside this
+                // lock). LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row P, 5.2): counted before the
+                // first unit goes live, and off the GpuMutex it first turns row P off.
+                if (!live && InputLeaseViewed()) NotePendingAddition(PendingAdditionSite::Shadow);
+                live = true;
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 current->lastUse = present;
-                live = true;
             }
         }
         shadow->Recount();
-        // LOCAL DEBUG (APS5_PROFILE_DRAW, REVALIDATE-PLAN 7 I0): units went live, an addition to what
-        // a draw input's pending check sees (the PendingSerial bump follows outside this lock).
-        if (live && InputLeaseCounting()) NotePendingAddition(PendingAdditionSite::Shadow);
     }
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);

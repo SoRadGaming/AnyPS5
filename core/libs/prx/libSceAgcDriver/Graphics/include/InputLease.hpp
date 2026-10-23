@@ -40,7 +40,20 @@
 //   M (5.4): a lease whose set serial did not move since it found its drawSnapshots entry takes that
 //      entry in place of ReusableDrawSnapshot's lookup; =2: the lookup must find that very entry;
 //   E (5.5): GuestMemory's speculative read gate is mirrored in a TEB slot, read in place of the
-//      thread_local (GuestMemory.cpp; =2 compares both at every read).
+//      thread_local (GuestMemory.cpp; =2 compares both at every read);
+//   P (5.2): nothing pending, flushing or live-shadowed overlaps the range at PendingSerial S (the
+//      lease's S while it holds, else StorageTexture::NothingPendingOver's answer, kept): while S
+//      holds (PendingRowStill), InPlaceDrawInput's vertex FlushPending returns after FlushDepthPlanes
+//      (skip point (a)) and the flush hook of CopyDrawInput's FlushGpuWrites skips AccessKeptByCpu,
+//      WaitForFlushing and PublishShadowsOnly (skip point (b); with HookFlushCpuBlocks its
+//      FlushPending skips as (a)). Every addition to what the query sees (a pending image pushed or
+//      re-marked, unit shadows made live) bumps PendingSerial atomically with it, except MarkShadowed
+//      (the bump follows the registry mutex): every P skip holds the GpuMutex, and an addition made
+//      without it first turns row P off for good (the kill switch, counted as U). =2: today's path runs
+//      at each skip point, which must have had no effect where the row would have skipped; an effect
+//      is raced only when other threads' additions moved since the prediction (removals and the
+//      thread's own additions never excuse one), else an [input-lease] P line and abort; after the
+//      input, while S still holds, NothingPendingOver must still answer S.
 // Probes need the GpuMutex (InputLeaseFor), as every row's proof does.
 namespace AgcDriver::Graphics {
 
@@ -104,11 +117,24 @@ void InputLeaseSuppressBumpsForTest(bool suppress);
 // The pending registry's addition sites (REVALIDATE-PLAN 5.2): markLayersPending's push, its lent
 // re-mark bump, reconcilePending's push and MarkShadowed's units going live.
 enum class PendingAdditionSite : std::uint8_t { Mark, Lent, Reconcile, Shadow, Count };
-// Counts one addition at its site (PendingAdditions) and, when the calling thread does not hold the
-// GpuMutex, one U for the site (row P's invariant: every addition runs under the GpuMutex, as every
-// P skip would). Called under InputLeaseCounting() only, inside the site's own lock.
+// Counts one addition at its site (PendingAdditions, and the calling thread's own) and, when the
+// calling thread does not hold the GpuMutex, one U for the site (row P's invariant: every addition
+// runs under the GpuMutex, as every P skip does). LOCAL EXPERIMENT (L1 row P): with the switch set
+// such an addition first turns row P off for good (seq_cst, before the addition lands: a skip that
+// read the flag clear was decided before it); =2 prints the site. Called while InputLeaseViewed(),
+// inside the site's own lock, before the push, the bump or the units going live.
 void NotePendingAddition(PendingAdditionSite site);
 std::uint64_t PendingAdditions();
+// The calling thread's own additions (a TEB slot), which never excuse a =2 difference.
+std::uint64_t OwnPendingAdditions();
+// LOCAL EXPERIMENT (L1 row P): whether S proves row P now: S is not 0, the kill switch is off and
+// PendingSerial is still S (seq_cst loads).
+bool PendingRowStill(std::uint64_t serial);
+// Whether the kill switch turned row P off (for tests).
+bool PendingRowOff();
+// Test only (REVALIDATE-PLAN 9 (q2)): called at =2 between a skip point's prediction (a hold) and
+// today's call there; null outside tests.
+void InputLeaseSetPendingProbeHookForTest(void (*hook)());
 
 // The I0 counts since the last [input-lease] report (InputLeaseCountsNow reads them without taking
 // them, for tests). While the switch is set they count its holds (=1) or predictions (=2) as
@@ -128,9 +154,13 @@ InputLeaseCounts InputLeaseCountsNow();
 // =2 prints 10 s deltas on its own [input-lease] =2 line). Per row: `held` (=1: applied),
 // `predicted` (=2), `verified` (=2: today's path agreed), `voided` (=2, row C: the key moved before
 // today's collect, so =1 would not have skipped it either).
+// Row P counts skip points: `pHeld` (=1: a skip), `pPredicted`/`pVerified`/`pRaced` (=2), the
+// after-input checks (`pAfter`; `pAfterMoved`: the query saw PendingSerial move, so it proved nothing
+// either way) and `pKilled` (additions that turned row P off).
 struct InputLeaseExperimentCounts {
     std::uint64_t cHeld = 0, cPredicted = 0, cVerified = 0, cVoided = 0;
     std::uint64_t mHeld = 0, mPredicted = 0, mVerified = 0;
+    std::uint64_t pHeld = 0, pPredicted = 0, pVerified = 0, pRaced = 0, pAfter = 0, pAfterMoved = 0, pKilled = 0;
 };
 InputLeaseExperimentCounts InputLeaseExperimentNow();
 
@@ -159,16 +189,78 @@ public:
     Recorder::InputLease* Lease() const { return lease; }
     // CopyDrawInput's outcome: a kept copy reused, or one refused for its padding (else a copy).
     void Result(bool reused, bool padding);
+    // LOCAL EXPERIMENT (L1 row P): the S the row holds the input at (0: none), from the lease while it
+    // holds, else the query (counted as I0's memo and query rows while profiling).
+    std::uint64_t PendingAt() const { return pAt; }
+    // Skip point (a), InPlaceDrawInput's vertex FlushPending: =1 passes S (FlushPending returns after
+    // FlushDepthPlanes while it holds); =2 runs today's call and checks it; else today's call.
+    void FlushPending(std::uint64_t address, std::size_t bytes);
+    // =2: a skip point's prediction and its check against today's path there (`effect`: it stored,
+    // waited, published, kept or listed an image); the after-input check uses the first one.
+    struct PendingPrediction {
+        bool would = false;
+        std::uint64_t additions = 0;
+        std::uint64_t own = 0;
+    };
+    PendingPrediction PredictPending();
+    void VerifyPending(const PendingPrediction& prediction, bool effect, const char* point);
 
 private:
     // I0's collect (S1): today's, with row C's prediction and W check while counting.
     std::uint64_t countedCollect(std::uint64_t address, std::size_t bytes);
     Recorder::InputLease* lease = nullptr;
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::uint64_t pAt = 0;
+    // =2: the skip points predicted, whether every one would have skipped, the first prediction's
+    // additions (the after-input check's raced rule).
+    std::uint32_t pPoints = 0;
+    bool pAllWould = true;
+    PendingPrediction pFirst{};
     bool active = false;
     bool counting = false;
     bool pHeld = false;
     bool cHeld = false;
     bool finished = false;
+};
+
+// LOCAL EXPERIMENT (L1 row P, skip point (b)): CopyDrawInput's arguments for the flush hook, set by
+// this scope around its FlushGpuWrites and cleared when it ends (no hook is installed until the first
+// storage image goes pending, and a later, unrelated hook must not find them). A TEB slot points at
+// the scope's own copy; nothing is set without row P or an S.
+class InputLeaseHookArgs {
+public:
+    InputLeaseHookArgs(InputLeaseShadow* shadow, std::uint64_t address, std::size_t bytes);
+    ~InputLeaseHookArgs();
+    InputLeaseHookArgs(const InputLeaseHookArgs&) = delete;
+    InputLeaseHookArgs& operator=(const InputLeaseHookArgs&) = delete;
+    struct Data {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::uint64_t serial = 0;
+        InputLeaseShadow* shadow = nullptr;
+    };
+
+private:
+    Data data{};
+    bool set = false;
+};
+// Whether the calling thread has hook arguments set (for tests).
+bool InputLeaseHookArgsSet();
+
+// The flush hook's side (FlushForAccess, at most 12 lines there): takes and clears the arguments at
+// its top (nested hooks never see them) and keeps them when they are this access's. At(), at the skip
+// point: =1 the S to skip at while it holds (0: today's path); =2 predicts and returns 0. Verify(),
+// after today's path at =2, checks it.
+class InputLeaseHookSkip {
+public:
+    InputLeaseHookSkip(std::uint64_t address, std::size_t bytes);
+    std::uint64_t At();
+    void Verify(bool stored, bool published, bool kept, std::size_t images);
+
+private:
+    const InputLeaseHookArgs::Data* args = nullptr;
+    InputLeaseShadow::PendingPrediction prediction{};
 };
 
 }

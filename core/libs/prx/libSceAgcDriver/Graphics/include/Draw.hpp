@@ -77,7 +77,9 @@ struct DrawInputCopy {
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t bufferBytes = 0, InputLeaseShadow* shadow = nullptr);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
-const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr);
+// `lease` (LOCAL EXPERIMENT, APS5_EXPERIMENT_INPUT_LEASES row P, REVALIDATE-PLAN 5.2 (a)): the vertex
+// input's lease view; its FlushPending is the vertex range's (skipped while row P holds).
+const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr, InputLeaseShadow* lease = nullptr);
 struct InPlaceIndices {
     std::optional<std::uint32_t> highest;
     bool reused = false;

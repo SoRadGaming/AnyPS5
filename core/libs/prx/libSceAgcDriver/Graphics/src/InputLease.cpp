@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -45,10 +46,22 @@ Counters& counters() {
 struct Experiment {
     std::atomic<std::uint64_t> cHeld{0}, cPredicted{0}, cVerified{0}, cVoided{0};
     std::atomic<std::uint64_t> mHeld{0}, mPredicted{0}, mVerified{0};
+    std::atomic<std::uint64_t> pHeld{0}, pPredicted{0}, pVerified{0}, pRaced{0}, pAfter{0}, pAfterMoved{0}, pKilled{0};
     InputLeaseExperimentCounts reported{};
     std::atomic<std::int64_t> lastReportMs{0};
     std::atomic<std::uint32_t> printed{0};
 };
+
+// LOCAL EXPERIMENT (L1 row P): the kill switch (set for good by an addition made without the
+// GpuMutex while the switch is set), the calling thread's own additions, CopyDrawInput's hook
+// arguments (a pointer to its InputLeaseHookArgs' copy, set only while its FlushGpuWrites runs) and
+// the =2 test hook of (q2).
+std::atomic<bool> pendingRowOff{false};
+struct OwnAdditionsTag {};
+using OwnAdditions = HostThreadSlot<std::uint64_t, OwnAdditionsTag>;
+struct HookArgsTag {};
+using HookArgsSlot = HostThreadSlot<const InputLeaseHookArgs::Data*, HookArgsTag>;
+std::atomic<void (*)()> pendingProbeHook{nullptr};
 
 Experiment& experiment() {
     static auto* counts = new Experiment();
@@ -160,8 +173,50 @@ void reportInputLeaseExperiment() {
     using U = unsigned long long;
     const auto cPredicted = now.cPredicted - was.cPredicted;
     const auto cVoided = now.cVoided - was.cVoided;
-    AgcDriver::ProfilePrint_nid_no_patch("[input-lease] APS5_EXPERIMENT_INPUT_LEASES=2 (10 s): C predicted %llu, verified %llu, void %llu (%.3f%%); M predicted %llu, verified %llu; E checked at every gate read\n",
-        static_cast<U>(cPredicted), static_cast<U>(now.cVerified - was.cVerified), static_cast<U>(cVoided), 100.0 * ratio(cVoided, cPredicted), static_cast<U>(now.mPredicted - was.mPredicted), static_cast<U>(now.mVerified - was.mVerified));
+    const auto pPredicted = now.pPredicted - was.pPredicted;
+    const auto pRaced = now.pRaced - was.pRaced;
+    AgcDriver::ProfilePrint_nid_no_patch("[input-lease] APS5_EXPERIMENT_INPUT_LEASES=2 (10 s): C predicted %llu, verified %llu, void %llu (%.3f%%); M predicted %llu, verified %llu; P predicted %llu, verified %llu, raced %llu (%.3f%%), after the input checked %llu (serial moved %llu), additions without the GpuMutex %llu%s; E checked at every gate read\n",
+        static_cast<U>(cPredicted), static_cast<U>(now.cVerified - was.cVerified), static_cast<U>(cVoided), 100.0 * ratio(cVoided, cPredicted), static_cast<U>(now.mPredicted - was.mPredicted), static_cast<U>(now.mVerified - was.mVerified),
+        static_cast<U>(pPredicted), static_cast<U>(now.pVerified - was.pVerified), static_cast<U>(pRaced), 100.0 * ratio(pRaced, pPredicted), static_cast<U>(now.pAfter - was.pAfter), static_cast<U>(now.pAfterMoved - was.pAfterMoved), static_cast<U>(now.pKilled - was.pKilled), pendingRowOff.load(std::memory_order_relaxed) ? " (row P is off)" : "");
+}
+
+// I0's row P categories of a NothingPendingOver answer (memo holds are counted by the caller).
+void countPendingOver(Counters& c, StorageTexture::PendingOver over) {
+    switch (over) {
+        case StorageTexture::PendingOver::Nothing: add(c.pQuery); break;
+        case StorageTexture::PendingOver::Pending: add(c.pPending); break;
+        case StorageTexture::PendingOver::Flushing: add(c.pFlushing); break;
+        case StorageTexture::PendingOver::Shadow: add(c.pShadow); break;
+        case StorageTexture::PendingOver::Moved: add(c.pMoved); break;
+        // PendingSerial still 0 (no storage image went pending yet): no proof, and no memo to keep.
+        case StorageTexture::PendingOver::NoSerial: add(c.pNoSerial); break;
+    }
+}
+
+const char* additionSiteName(PendingAdditionSite site) {
+    switch (site) {
+        case PendingAdditionSite::Mark: return "markLayersPending's push";
+        case PendingAdditionSite::Lent: return "markLayersPending's lent re-mark";
+        case PendingAdditionSite::Reconcile: return "reconcilePending's push";
+        case PendingAdditionSite::Shadow: return "MarkShadowed's units going live";
+        case PendingAdditionSite::Count: break;
+    }
+    return "an unknown site";
+}
+
+// LOCAL EXPERIMENT (L1 row P, PendingRowAt of REVALIDATE-PLAN 5.2): the lease's S while it still
+// holds (memo), else the query's answer, which the lease keeps (0: no proof); none once the kill
+// switch is on.
+std::uint64_t pendingRowAt(Recorder::InputLease& lease, std::uint64_t address, std::size_t bytes, bool counting) {
+    if (lease.pendingAt != 0 && PendingRowStill(lease.pendingAt)) {
+        if (counting) add(counters().pMemo);
+        return lease.pendingAt;
+    }
+    if (pendingRowOff.load(std::memory_order_seq_cst)) return 0;
+    auto over = StorageTexture::PendingOver::Nothing;
+    lease.pendingAt = StorageTexture::NothingPendingOver(address, bytes, &over);
+    if (counting) countPendingOver(counters(), over);
+    return PendingRowStill(lease.pendingAt) ? lease.pendingAt : 0;
 }
 
 // Row C's lease rule (GuestMemory.hpp) for I0's counts: a hold, or the first part that fails.
@@ -234,12 +289,42 @@ void InputLeaseSuppressBumpsForTest(bool suppress) {
 
 void NotePendingAddition(PendingAdditionSite site) {
     auto& c = counters();
-    add(c.additions);
-    if (!GuestMemory::GpuMutex().HeldByThisThread()) add(c.unlocked[static_cast<std::size_t>(site)]);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+        add(c.unlocked[static_cast<std::size_t>(site)]);
+        // LOCAL EXPERIMENT (L1 row P): the kill switch, before the addition lands.
+        if (InputLeaseRowOn(InputLeaseRow::P)) {
+            const bool first = !pendingRowOff.exchange(true, std::memory_order_seq_cst);
+            auto& e = experiment();
+            add(e.pKilled);
+            if (first || (InputLeases() == 2 && e.printed.fetch_add(1, std::memory_order_relaxed) < 8)) AgcDriver::ProfilePrint_nid_no_patch("[input-lease] APS5_EXPERIMENT_INPUT_LEASES=%d: U: %s ran without the GpuMutex; row P is off from here on\n", InputLeases(), additionSiteName(site));
+        }
+    }
+    c.additions.fetch_add(1, std::memory_order_seq_cst);
+    OwnAdditions::Set(OwnAdditions::Get() + 1);
 }
 
 std::uint64_t PendingAdditions() {
-    return counters().additions.load(std::memory_order_relaxed);
+    return counters().additions.load(std::memory_order_seq_cst);
+}
+
+std::uint64_t OwnPendingAdditions() {
+    return OwnAdditions::Get();
+}
+
+bool PendingRowStill(std::uint64_t serial) {
+    return serial != 0 && !pendingRowOff.load(std::memory_order_seq_cst) && StorageTexture::PendingSerial() == serial;
+}
+
+bool PendingRowOff() {
+    return pendingRowOff.load(std::memory_order_seq_cst);
+}
+
+void InputLeaseSetPendingProbeHookForTest(void (*hook)()) {
+    pendingProbeHook.store(hook, std::memory_order_release);
+}
+
+bool InputLeaseHookArgsSet() {
+    return HookArgsSlot::Get() != nullptr;
 }
 
 InputLeaseCounts InputLeaseCountsNow() {
@@ -257,6 +342,13 @@ InputLeaseExperimentCounts InputLeaseExperimentNow() {
     counts.mHeld = load(e.mHeld);
     counts.mPredicted = load(e.mPredicted);
     counts.mVerified = load(e.mVerified);
+    counts.pHeld = load(e.pHeld);
+    counts.pPredicted = load(e.pPredicted);
+    counts.pVerified = load(e.pVerified);
+    counts.pRaced = load(e.pRaced);
+    counts.pAfter = load(e.pAfter);
+    counts.pAfterMoved = load(e.pAfterMoved);
+    counts.pKilled = load(e.pKilled);
     return counts;
 }
 
@@ -377,7 +469,7 @@ auto Recorder::inputLeaseLookup(InputLease& lease, std::uint64_t address, std::s
     return found;
 }
 
-InputLeaseShadow::InputLeaseShadow(Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use) {
+InputLeaseShadow::InputLeaseShadow(Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use) : address(address), bytes(bytes) {
     if (recorder == nullptr || bytes == 0 || !InputLeaseViewed()) return;
     active = true;
     counting = InputLeaseCounting();
@@ -386,9 +478,15 @@ InputLeaseShadow::InputLeaseShadow(Recorder* recorder, std::uint64_t address, st
     lease = recorder->InputLeaseFor(address, bytes, use);
     if (lease == nullptr) return;
     lease->mapHeld = false;
+    // LOCAL EXPERIMENT (L1 row P): the S the row holds the input at, from the lease or the query.
+    if (InputLeases() != 0) {
+        if (InputLeaseRowOn(InputLeaseRow::P)) pAt = pendingRowAt(*lease, address, bytes, counting);
+        pHeld = pAt != 0;
+        return;
+    }
     // I0's row P (PendingRowAt), a shadow prediction, only with the switch unset: the lease's answer
     // while PendingSerial is still the S it held at, else the query, whose answer the lease keeps.
-    if (!counting || InputLeases() != 0) return;
+    if (!counting) return;
     if (lease->pendingAt != 0 && StorageTexture::PendingSerial() == lease->pendingAt) {
         add(c.pMemo);
         pHeld = true;
@@ -396,24 +494,35 @@ InputLeaseShadow::InputLeaseShadow(Recorder* recorder, std::uint64_t address, st
     }
     auto over = StorageTexture::PendingOver::Nothing;
     lease->pendingAt = StorageTexture::NothingPendingOver(address, bytes, &over);
-    switch (over) {
-        case StorageTexture::PendingOver::Nothing:
-            add(c.pQuery);
-            pHeld = true;
-            break;
-        case StorageTexture::PendingOver::Pending: add(c.pPending); break;
-        case StorageTexture::PendingOver::Flushing: add(c.pFlushing); break;
-        case StorageTexture::PendingOver::Shadow: add(c.pShadow); break;
-        case StorageTexture::PendingOver::Moved: add(c.pMoved); break;
-        // PendingSerial still 0 (no storage image went pending yet): no proof, and no memo to keep.
-        case StorageTexture::PendingOver::NoSerial: add(c.pNoSerial); break;
-    }
+    countPendingOver(c, over);
+    pHeld = over == StorageTexture::PendingOver::Nothing;
 }
 
 InputLeaseShadow::~InputLeaseShadow() {
     if (!active) return;
     if (counting && finished && pHeld && cHeld && lease != nullptr && lease->mapHeld) add(counters().held);
+    // LOCAL EXPERIMENT (L1 row P, =2): after a completed input whose every skip point would have
+    // skipped, while S still holds, NothingPendingOver must still answer S (this catches overlaps
+    // HeldReads' early return or the flush pretest hid from today's path). An overlap is raced only
+    // when other threads' additions moved since the first prediction; a query that saw PendingSerial
+    // move proved nothing either way and is counted apart. (Inside the try: a destructor must not throw.)
     try {
+        if (finished && pPoints != 0 && pAllWould && InputLeases() == 2 && PendingRowStill(pAt)) {
+            auto& e = experiment();
+            add(e.pAfter);
+            auto over = StorageTexture::PendingOver::Nothing;
+            const auto serial = StorageTexture::NothingPendingOver(address, bytes, &over);
+            if (over == StorageTexture::PendingOver::Nothing || over == StorageTexture::PendingOver::Moved) {
+                if (serial != pAt) add(e.pAfterMoved);
+            } else if (const auto others = (PendingAdditions() - pFirst.additions) - (OwnPendingAdditions() - pFirst.own); others != 0) {
+                add(e.pRaced);
+                if (e.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[input-lease] APS5_EXPERIMENT_INPUT_LEASES=2: P raced: after the input over 0x%llx+0x%zx something overlaps it at PendingSerial %llu, which row P proved clear; %llu additions by other threads since the prediction\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(pAt), static_cast<unsigned long long>(others));
+            } else {
+                std::fprintf(stderr, "[input-lease] APS5_EXPERIMENT_INPUT_LEASES=2: P: after the input over 0x%llx+0x%zx, with PendingSerial still %llu, NothingPendingOver finds %s over it, which row P proved nothing over at that serial (no addition by another thread since the prediction)\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(pAt), over == StorageTexture::PendingOver::Pending ? "a pending image" : over == StorageTexture::PendingOver::Flushing ? "an image being stored" : "a live unit shadow");
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
         if (counting) reportInputLeases();
         if (InputLeases() == 2) reportInputLeaseExperiment();
     } catch (...) {
@@ -421,7 +530,97 @@ InputLeaseShadow::~InputLeaseShadow() {
 }
 
 void InputLeaseShadow::InPlace() {
+    if (!active) return;
+    finished = true;
     if (counting) add(counters().inPlace);
+}
+
+void InputLeaseShadow::FlushPending(std::uint64_t address, std::size_t bytes) {
+    const int mode = pAt != 0 ? InputLeases() : 0;
+    if (mode == 1) {
+        if (PendingRowStill(pAt)) add(experiment().pHeld);
+        static_cast<void>(StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input", PublishScope::Whole, nullptr, pAt));
+        return;
+    }
+    if (mode == 2) {
+        const auto prediction = PredictPending();
+        bool published = false;
+        const bool stored = StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input", PublishScope::Whole, &published);
+        VerifyPending(prediction, stored || published, "InPlaceDrawInput's FlushPending (skip point (a))");
+        return;
+    }
+    static_cast<void>(StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input"));
+}
+
+// =2's prediction at a skip point: the additions read before the row's test, so an addition by
+// another thread that the test misses (it turned the row off after the test) lands after the read.
+InputLeaseShadow::PendingPrediction InputLeaseShadow::PredictPending() {
+    PendingPrediction prediction;
+    prediction.additions = PendingAdditions();
+    prediction.own = OwnPendingAdditions();
+    prediction.would = PendingRowStill(pAt);
+    if (pPoints++ == 0) pFirst = prediction;
+    pAllWould = pAllWould && prediction.would;
+    if (prediction.would) {
+        add(experiment().pPredicted);
+        if (const auto hook = pendingProbeHook.load(std::memory_order_acquire)) hook();
+    }
+    return prediction;
+}
+
+// =2's check: where the row would have skipped, today's path must have had no effect. An effect is
+// raced only when additions by other threads moved since the prediction; removals (which bump
+// PendingSerial without adding) and this thread's own additions never excuse one.
+void InputLeaseShadow::VerifyPending(const PendingPrediction& prediction, bool effect, const char* point) {
+    if (!prediction.would) return;
+    auto& e = experiment();
+    if (!effect) {
+        add(e.pVerified);
+        return;
+    }
+    if (const auto others = (PendingAdditions() - prediction.additions) - (OwnPendingAdditions() - prediction.own); others != 0) {
+        add(e.pRaced);
+        if (e.printed.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ProfilePrint_nid_no_patch("[input-lease] APS5_EXPERIMENT_INPUT_LEASES=2: P raced: %s over 0x%llx+0x%zx stored, waited, published or found a pending image at PendingSerial %llu, which row P proved clear; %llu additions by other threads since the prediction\n", point, static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(pAt), static_cast<unsigned long long>(others));
+        return;
+    }
+    std::fprintf(stderr, "[input-lease] APS5_EXPERIMENT_INPUT_LEASES=2: P: %s over 0x%llx+0x%zx stored, waited, published or found a pending image where row P held at PendingSerial %llu (now %llu, no addition by another thread since the prediction): =1 would have skipped it\n", point, static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(pAt), static_cast<unsigned long long>(StorageTexture::PendingSerial()));
+    std::fflush(stderr);
+    std::abort();
+}
+
+InputLeaseHookArgs::InputLeaseHookArgs(InputLeaseShadow* shadow, std::uint64_t address, std::size_t bytes) {
+    if (shadow == nullptr || shadow->PendingAt() == 0) return;
+    data = {address, bytes, shadow->PendingAt(), shadow};
+    HookArgsSlot::Set(&data);
+    set = true;
+}
+
+InputLeaseHookArgs::~InputLeaseHookArgs() {
+    if (set) HookArgsSlot::Set(nullptr);
+}
+
+InputLeaseHookSkip::InputLeaseHookSkip(std::uint64_t address, std::size_t bytes) {
+    if (!InputLeaseRowOn(InputLeaseRow::P)) return;
+    const auto* data = HookArgsSlot::Get();
+    if (data == nullptr) return;
+    HookArgsSlot::Set(nullptr);
+    if (data->address == address && data->bytes == bytes) args = data;
+}
+
+std::uint64_t InputLeaseHookSkip::At() {
+    if (args == nullptr) return 0;
+    if (InputLeases() == 1) {
+        if (!PendingRowStill(args->serial)) return 0;
+        add(experiment().pHeld);
+        return args->serial;
+    }
+    prediction = args->shadow->PredictPending();
+    return 0;
+}
+
+void InputLeaseHookSkip::Verify(bool stored, bool published, bool kept, std::size_t images) {
+    if (args == nullptr || InputLeases() != 2) return;
+    args->shadow->VerifyPending(prediction, stored || published || kept || images != 0, "the flush hook of CopyDrawInput's FlushGpuWrites (skip point (b))");
 }
 
 std::uint64_t InputLeaseShadow::countedCollect(std::uint64_t address, std::size_t bytes) {

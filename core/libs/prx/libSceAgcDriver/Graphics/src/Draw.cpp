@@ -1244,7 +1244,11 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         // generation and the generation are today's on every path (InputLeaseShadow::Collect).
         std::optional<InputLeaseShadow> ownShadow;
         if (shadow == nullptr && InputLeaseViewed()) shadow = &ownShadow.emplace(recorder, address, bytes, use);
-        GuestMemory::FlushGpuWrites(address, bytes);
+        {
+            // LOCAL EXPERIMENT (L1 row P, 5.2 (b)): the flush hook's arguments, cleared on return.
+            const InputLeaseHookArgs hookArgs(shadow, address, bytes);
+            GuestMemory::FlushGpuWrites(address, bytes);
+        }
         if (shadow != nullptr) {
             copy.generation = shadow->Collect(address, bytes, copy.registryGeneration);
         } else {
@@ -1298,7 +1302,7 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     recorder->KeepDrawSnapshot(address, copy.bytes != 0 ? copy.bytes : copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 
-const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
+const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite, InputLeaseShadow* lease) {
     auto* recorder = context.recorder;
     // Copied everywhere when the device binds no draw input in place (Context::drawInputsInPlace).
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
@@ -1316,7 +1320,9 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
         GuestMemory::FlushGpuWrites(address, bytes);
         if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
     } else {
-        StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES row P, 5.2 (a)): through the input's lease.
+        if (lease != nullptr) lease->FlushPending(address, bytes);
+        else StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
         if (copies && !behind) return nullptr;
     }
@@ -1927,7 +1933,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // EXPERIMENT (APS5_EXPERIMENT_INPUT_LEASES, L1): its lease.
         std::optional<InputLeaseShadow> leaseShadow;
         if (InputLeaseViewed()) leaseShadow.emplace(context.recorder, begin, bytes, Recorder::SnapshotUse::Vertex);
-        if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
+        if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite, leaseShadow ? &*leaseShadow : nullptr)) {
             if (leaseShadow) leaseShadow->InPlace();
             if (DebugDrawInputBytes()) CountDrawInputBytes(DrawInputBytes::VertexInPlace, bytes);
             rangeHandles.push_back(import->buffer);
