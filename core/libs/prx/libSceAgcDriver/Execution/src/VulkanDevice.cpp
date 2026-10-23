@@ -2380,7 +2380,7 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
     return state->recorder && (state->recorder->PendingWriteOverlaps(address, bytes) || state->recorder->PendingLabelIn(address, bytes));
 }
 
-int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst, bool behindCompletions) {
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
@@ -2425,6 +2425,9 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         // label table. Debug aid: APS5_DRAIN_COMPLETION_LABELS=1 drains as before; try it first when
         // a title misbehaves with this path.
         if (drain) return 2;
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): a caller that refuses the
+        // completion path (a store into the GDS) stores it its own way; nothing is recorded.
+        if (!behindCompletions) return 5;
         recordStore();
         // Commands() opened the batch the store went into, so the completion is appended to that
         // batch and runs at its reap, after the write-backs of every batch before it.
@@ -2746,6 +2749,10 @@ bool VulkanDevice::completionStoresOver(std::uint64_t address, std::size_t bytes
 
 bool VulkanDevice::copyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const {
     return state->recorder->PendingWriteOverlaps(address, bytes) && completionStoresOver(address, bytes);
+}
+
+bool VulkanDevice::CopyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const {
+    return state->recorder && copyWaitsOnCompletions(address, bytes);
 }
 
 bool VulkanDevice::GpuCopyPossible(std::uint64_t destination, std::uint64_t source, std::size_t bytes) const {

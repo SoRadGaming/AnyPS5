@@ -102,7 +102,11 @@ public:
     // imported, 4 unsuitable size or alignment.
     // `reapFirst` retires finished batches before the checks; a caller recording a group of labels
     // under one lock passes it for the first label only.
-    int WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst = true);
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): `behindCompletions` false refuses
+    // the completion path: such a store returns 5 with nothing recorded, noted or stamped (a store into
+    // the GDS: the completion's memcpy would land at a reap, after later GPU users of the GDS), and the
+    // caller stores it its own way.
+    int WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst = true, bool behindCompletions = true);
     bool AfterRecordedWork(std::function<void()> action, bool reapFirst);
     // Pending-label table lookup and open-batch overlap test for WAIT_REG_MEM (see Recorder).
     std::optional<Graphics::Recorder::LabelHit> PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal = nullptr) const;
@@ -173,6 +177,10 @@ public:
     using CopyWriterNote = std::function<void(std::span<const std::byte> value, std::uint64_t generation)>;
     CopyOutcome CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter);
     bool GpuCopyPossible(std::uint64_t destination, std::uint64_t source, std::size_t bytes) const;
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_GDS_IN_STREAM, DRAIN-PLAN D2): GpuCopyPossible's completion test
+    // for one range (a batch writes it and a completion still stores over it on the CPU), so a refused
+    // copy can be counted by why. Under the mutex.
+    bool CopyWaitsOnCompletions(std::uint64_t address, std::size_t bytes) const;
     // APS5_COPY_VERIFY=1 totals: CPU copies verified, whose source bytes changed over the sync (a
     // producer the rule missed), whose destination bytes were overwritten (a store the rule
     // missed), and whose destination an unsignaled batch read in place (the rule's own answer
