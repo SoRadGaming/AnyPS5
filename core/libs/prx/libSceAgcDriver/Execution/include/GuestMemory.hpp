@@ -89,6 +89,14 @@ struct UnchangedQuery {
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): UnchangedSinceAll over
+// `unchanged` and !StoredOver over `notStoredOver` (its watched, covered, generation, length and
+// host-region tests included), all under one tracker lock: true only when every row holds. `drain`
+// false takes the lock without stamping the host writes queued meanwhile (NoteHostWrite), as a
+// verify's prediction must, which may not stamp them earlier than today's path would; `current`,
+// when given, receives the tracker generation read under the lock (after the drain, when it
+// drains: what a memoized collect would answer there).
+bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain = true, std::uint64_t* current = nullptr);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
@@ -195,6 +203,11 @@ struct CollectMemoKey {
     bool operator==(const CollectMemoKey&) const = default;
 };
 CollectMemoKey CurrentCollectMemoKey();
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): whether the calling
+// thread's epoch coverage holds [address, address + bytes), page-rounded as a collect rounds it,
+// under its current collect memo key (false without one): its next collect of the range is then a
+// memo hit that walks nothing, and stays one while the key holds (coverage only grows under a key).
+bool CollectCovered(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it; under
 // APS5_EXPERIMENT_LAZY_GENERATION a collect bumps it only when it stamps): a stamp taken after

@@ -2429,6 +2429,18 @@ CollectMemoKey CurrentCollectMemoKey() {
     return {epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): collectWrites' first
+// memo test (epochCovers, over the same whole pages) under the key CurrentCollectMemoKey reads.
+bool CollectCovered(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const auto key = CurrentCollectMemoKey();
+    if (!key.Valid()) return false;
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    return epochCovers(key.epoch, key.unwatched, key.mapping, static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop));
+}
+
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
@@ -2633,6 +2645,28 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     for (const auto& [address, bytes, generation] : queries) {
         if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
         if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
+    }
+    return true;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the unchanged rows as
+// UnchangedSinceAll tests them, the not-stored-over rows as StoredOver's answer negated, in one lock.
+bool StampsHold(std::span<const UnchangedQuery> unchanged, std::span<const UnchangedQuery> notStoredOver, bool drain, std::uint64_t* current) {
+    auto& tracker = Tracker();
+    const auto lock = drain ? lockTracker(tracker) : acquireTracker(tracker);
+    tracker.initialize();
+    if (current != nullptr) *current = tracker.generation.load(std::memory_order_relaxed);
+    if (!tracker.watched) return false;
+    for (const auto& [address, bytes, generation] : unchanged) {
+        if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+        if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
+    }
+    for (const auto& [address, bytes, generation] : notStoredOver) {
+        if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+#ifdef _WIN32
+        if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(address, bytes)) return false;
+#endif
+        if (tracker.storedOver(address, address + bytes, generation, false)) return false;
     }
     return true;
 }
