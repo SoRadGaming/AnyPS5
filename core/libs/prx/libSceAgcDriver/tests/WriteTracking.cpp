@@ -870,6 +870,9 @@ void CheckHostHole() {
     Require(!UnchangedSince(hole, bytes, before), "an arena host hole reads as unchanged");
     const std::array queries{UnchangedQuery{hole, bytes, before}};
     Require(!UnchangedSinceAll(queries), "an arena host hole reads as unchanged in a batch");
+    // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, D4-B): StampsHold's rows over a host region fail
+    // as UnchangedSinceAll and StoredOver do.
+    Require(!StampsHold(queries, {}) && !StampsHold({}, queries), "an arena host hole reads as unchanged or not stored over in StampsHold");
     Require(!UnchangedSinceCollected(hole, bytes, before), "an arena host hole reads as unchanged since a collect");
     Require(MarkWritten(hole, bytes) == 0, "a driver store into an arena host hole is stamped");
     Require(StoreOwnBytes(hole, bytes, [] {}) == 0, "an own store into an arena host hole is stamped");
@@ -1880,6 +1883,120 @@ void CheckHostWriteLockOrder() {
     Require(lockOrderHookCalls.load() == expected, "the host-write hook was not called at every host write's end");
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): StampsHold is
+// UnchangedSinceAll over its unchanged rows and !StoredOver over its not-stored-over rows, under one
+// lock. Compared on random rows (shared edge blocks included) over driver stores at sub-block
+// precision and walked CPU stores, and on unwatched, generation-0 and empty rows (the host-region row
+// is CheckHostHole's); `current` is the tracker generation; without the drain a queued host write
+// stays unstamped, which the draining form then sees.
+void CheckStampsHold() {
+    constexpr std::size_t bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const WatchedRelease release{memory, bytes};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    std::vector<std::uint64_t> generations{CollectWritesUncached(base, bytes)};
+    Require(generations[0] != 0, "the StampsHold block is not collected");
+    std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    const auto next = [&](std::uint64_t bound) {
+        state ^= state << 13u;
+        state ^= state >> 7u;
+        state ^= state << 17u;
+        return state % bound;
+    };
+    for (int store = 0; store < 32; ++store) {
+        const auto at = next(bytes - 1);
+        if (store % 5 == 4) {
+            memory[at] ^= 0x5a;
+            generations.push_back(CollectWritesUncached(base, bytes));
+            continue;
+        }
+        const auto length = 1 + next(std::min<std::uint64_t>(bytes - at, 3 * 4096));
+        generations.push_back(MarkWritten(base + at, static_cast<std::size_t>(length)));
+    }
+    generations.push_back(TrackerGeneration());
+    const auto row = [&] {
+        const auto at = next(bytes - 1);
+        const auto length = 1 + next(std::min<std::uint64_t>(bytes - at, 2 * Block));
+        return UnchangedQuery{base + at, static_cast<std::size_t>(length), generations[next(generations.size())]};
+    };
+    for (int round = 0; round < 512; ++round) {
+        const std::array rows{row(), row(), row()};
+        const std::span<const UnchangedQuery> unchanged(rows.data(), 1 + next(3));
+        const std::span<const UnchangedQuery> stored(rows.data() + 2, 1);
+        const bool unchangedAll = UnchangedSinceAll(unchanged);
+        const bool notStoredOver = !StoredOver(stored[0].address, stored[0].bytes, stored[0].generation);
+        Require(StampsHold(unchanged, {}) == unchangedAll, "StampsHold's unchanged rows disagree with UnchangedSinceAll");
+        Require(StampsHold({}, stored) == notStoredOver, "StampsHold's not-stored-over row disagrees with StoredOver");
+        Require(StampsHold(unchanged, stored) == (unchangedAll && notStoredOver), "StampsHold's rows together disagree with UnchangedSinceAll and StoredOver");
+    }
+    std::array<std::uint8_t, 64> unwatched{};
+    const auto outside = reinterpret_cast<std::uint64_t>(unwatched.data());
+    if (!Watched(outside, unwatched.size())) {
+        const std::array rows{UnchangedQuery{outside, unwatched.size(), TrackerGeneration()}};
+        Require(!StampsHold(rows, {}) && !UnchangedSinceAll(rows), "an unwatched row holds in StampsHold");
+        Require(!StampsHold({}, rows) && StoredOver(outside, unwatched.size(), rows[0].generation), "an unwatched row reads as not stored over in StampsHold");
+    }
+    const std::array zero{UnchangedQuery{base, 64, 0}};
+    Require(!StampsHold(zero, {}) && !StampsHold({}, zero) && StoredOver(base, 64, 0), "a generation-0 row holds in StampsHold");
+    const std::array empty{UnchangedQuery{base, 0, TrackerGeneration()}};
+    Require(!StampsHold(empty, {}) && !StampsHold({}, empty) && StoredOver(base, 0, empty[0].generation), "an empty row holds in StampsHold");
+    std::uint64_t current = 0;
+    Require(StampsHold({}, {}, true, &current) && current == TrackerGeneration(), "StampsHold without rows did not hold, or read another generation than the tracker's");
+    {
+        const HostWriteHookScope hook(&NoteHostWriteHook);
+        const auto before = TrackerGeneration();
+        const std::array rows{UnchangedQuery{base + 2 * Block, 4096, before}};
+        HostWriteBytes(memory + 2 * Block + 100, 16, 0x66);
+        std::uint64_t seen = 0;
+        Require(StampsHold(rows, {}, false, &seen) && seen == before, "a StampsHold without the drain stamped a queued host write");
+        Require(!StampsHold(rows, {}), "the draining StampsHold missed a queued host write");
+    }
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): CollectCovered holds
+// exactly when the next collect of the range walks nothing (ThreadCollectedBytes, counted under
+// APS5_PROFILE_DRAW), coverage only grows under one collect memo key, and a bump, an unwatch and an
+// allocation change each drop it; always false without the epoch coverage (APS5_DEBUG_COVERAGE=1) or
+// on a thread that never bumped its epoch.
+void CheckCollectCovered() {
+    const bool coverage = std::getenv("APS5_DEBUG_COVERAGE") != nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_SHARED_COLLECT_MEMO") == nullptr;
+    const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    constexpr std::size_t bytes = 3 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
+    const WatchedRelease release{memory, bytes};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    bool unbumped = true;
+    std::thread([&] { unbumped = CollectCovered(base, Block); }).join();
+    Require(!unbumped, "a thread that never bumped its collect epoch has collect coverage");
+    BumpCollectEpoch();
+    if (!coverage) {
+        Require(CollectWrites(base, Block) != 0 && !CollectCovered(base, Block), "collect coverage without the epoch coverage (APS5_DEBUG_COVERAGE)");
+        return;
+    }
+    // One collect: it walks exactly when the range was not covered, and covers it.
+    const auto collect = [&](std::uint64_t address, std::size_t size, bool covered, const char* what) {
+        Require(CollectCovered(address, size) == covered, what);
+        const auto walked = ThreadCollectedBytes();
+        Require(CollectWrites(address, size) != 0, what);
+        if (counted) Require((ThreadCollectedBytes() != walked) == !covered, what);
+        Require(CollectCovered(address, size), what);
+    };
+    collect(base, 2 * Block, false, "the first collect of an epoch found its range covered, did not walk it, or left it uncovered");
+    collect(base, 2 * Block, true, "a second collect of a range in its epoch found it uncovered or walked it");
+    Require(CollectCovered(base + 100, 50) && CollectCovered(base + Block - 10, 20), "a part of a covered range is not covered");
+    collect(base + 2 * Block, Block, false, "another range of the epoch was covered before its collect");
+    Require(CollectCovered(base, 2 * Block) && CollectCovered(base, bytes), "coverage shrank under one collect memo key");
+    BumpCollectEpoch();
+    collect(base, 2 * Block, false, "coverage outlived an epoch bump");
+    Unwatch(base + Block, Block);
+    collect(base, Block, false, "coverage outlived an unwatch");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base), 4096);
+    collect(base, Block, false, "coverage outlived an allocation change");
+    Require(!CollectCovered(base, 0), "an empty range reads as covered");
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -1898,6 +2015,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string_view(argv[1]) == "--collect-memo-key") {
             CheckCollectMemoKey();
             std::cout << "collect memo key tests passed\n";
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): StampsHold and the
+        // collect coverage alone, in the epoch coverage's environment with the walks counted (the full
+        // run checks the coverage stays false without).
+        if (argc > 1 && std::string_view(argv[1]) == "--stamps-hold") {
+            CheckStampsHold();
+            CheckCollectCovered();
+            std::cout << "StampsHold and collect coverage tests passed\n";
             return 0;
         }
 #ifdef _WIN32
@@ -1948,6 +2074,8 @@ int main(int argc, char** argv) {
         CheckLazyGeneration();
         CheckAdoptLatestEpoch();
         CheckCollectMemoKey();
+        CheckStampsHold();
+        CheckCollectCovered();
         CheckHostWriteStamps();
 #ifdef _WIN32
         CheckHostWriteWatchedMiddle();

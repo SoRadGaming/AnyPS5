@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TargetLease.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -7425,6 +7426,497 @@ bool refreshKeyPinTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): a target lease's refresh
+// (StorageTexture::RefreshForLease) on its own: cases (a)-(h) of the D4 design, the lease's own rows,
+// and K1's two (a pinned hit applies the generation advance; a pinned prediction writes nothing). A 1
+// MiB watched host import (a smaller import of private memory is compared instead of watched on a
+// device that settles imports, such as this one): T is a 256 KiB R64KBX surface at 0 with its keys
+// (0xff, uncompressed) at 256 KiB, O a block-unit image without DCC over the whole 1 MiB (16 units of
+// 64 KiB: T lies in O's units 0-3, its keys in unit 4), and a twin of T. RefreshForLease has no switch
+// of its own; its verdicts follow APS5_EXPERIMENT_PROOF_UNITS (unit-checked proofs) and
+// APS5_EXPERIMENT_KEY_PIN (the pinned target). False when nothing could be tested.
+bool targetLeaseRefreshTests(const Device& device, Recorder& recorder) {
+    using Verdict = StorageTexture::LeaseVerdict;
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: lease refreshes not tested\n";
+        return false;
+    }
+    if (!KeyFastPath()) {
+        std::cout << "key fast path off: lease refreshes not tested\n";
+        return false;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+    constexpr std::size_t bytes = std::size_t{1} << 20;
+    // A 64 KiB block neither T nor its keys touch: a stamp there only moves the tracker generation.
+    constexpr std::size_t elsewhere = 6 * 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: lease refreshes not tested\n";
+        return false;
+    }
+    auto* texels = static_cast<std::uint8_t*>(block);
+    std::memset(texels, 0x55, bytes);
+    std::memset(texels + surfaceBytes, 0xff, keyCount);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "no watched host import: lease refreshes not tested\n";
+        return false;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto surface = [](std::uint64_t at, std::uint32_t width, std::uint64_t keys) {
+        GuestTextureResource resource{};
+        resource.baseAddress = at;
+        resource.width = width;
+        resource.height = width;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        resource.dccAddress = keys;
+        return resource;
+    };
+    const auto resource = surface(address, side, address + surfaceBytes);
+    const auto otherResource = surface(address, 512, 0);
+    Require(DescribeSurface(resource).guestBytes == surfaceBytes && DescribeSurface(otherResource).guestBytes == bytes, "lease refresh fixture: unexpected surface sizes");
+    const auto switchMode = [](const char* name) {
+        const char* text = std::getenv(name);
+        const auto value = text != nullptr ? std::strtol(text, nullptr, 10) : 0;
+        return value == 0 ? 0 : value == 2 ? 2 : 1;
+    };
+    const int units = switchMode("APS5_EXPERIMENT_PROOF_UNITS");
+    const int pins = switchMode("APS5_EXPERIMENT_KEY_PIN");
+    const auto proved = [] { return StorageTexture::RefreshesProved(); };
+    const auto layers = [](const StorageTexture& target) {
+        std::vector<std::uint64_t> generations;
+        for (std::uint32_t unit = 0; unit < target.TrackedUnits(); ++unit) generations.push_back(target.LayerGeneration(unit));
+        return generations;
+    };
+    recorder.Sync();
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        recorder.Keep(image);
+        const auto lease = [&](bool apply, StorageTexture::LeaseRows rows = {}) {
+            rows.apply = apply;
+            rows.drain = apply;
+            image->RefreshForLease(rows);
+            return rows;
+        };
+        // One lease refresh with its expected verdict; only an applied hit counts as a proved refresh.
+        const auto expectVerdict = [&](bool apply, Verdict expected, const std::string& what, StorageTexture::LeaseRows rows = {}) {
+            const auto before = proved();
+            rows = lease(apply, rows);
+            Require(rows.verdict == expected, what + " (verdict " + std::to_string(static_cast<int>(rows.verdict)) + ", expected " + std::to_string(static_cast<int>(expected)) + ")");
+            Require(proved() == before + (apply && expected == Verdict::Hit ? 1 : 0), what + ": the proved count moved otherwise than by a hit");
+            return rows;
+        };
+        // Refreshes until one is proved (today's path takes the proof at its unchanged exit).
+        const auto settle = [&](const std::shared_ptr<StorageTexture>& target, const char* what) {
+            for (int round = 0; round < 4; ++round) {
+                const auto before = proved();
+                target->Refresh();
+                if (proved() == before + 1) return;
+            }
+            Require(false, what);
+        };
+
+        // (a) A proved target: the lease's refresh holds over the surface's and the keys' rows, writing
+        // nothing at apply=false; at true it is the proved route.
+        settle(image, "lease refresh (a): the target was never proved");
+        auto state = image->LeaseState();
+        auto rows = expectVerdict(false, Verdict::Hit, "lease refresh (a): a proved target's lease refresh did not hold");
+        const auto unapplied = image->LeaseState();
+        Require(unapplied.proofGeneration == state.proofGeneration && unapplied.pendingSerial == state.pendingSerial && unapplied.generation == state.generation, "lease refresh (a): apply=false changed the refresh proof");
+        Require(!rows.pinned && !rows.unitChecked && rows.surface.address == address && rows.surface.bytes == surfaceBytes && rows.keys.address == resource.dccAddress && rows.keys.bytes == keyCount && rows.surface.generation == state.generation, "lease refresh (a): the rows checked are not the surface's and its keys'");
+        expectVerdict(true, Verdict::Hit, "lease refresh (a): apply=true did not hit");
+
+        // (b) A driver store into the surface: stamped, at both settings.
+        AgcDriver::GuestMemory::MarkWritten(address + 65536, 4096);
+        expectVerdict(false, Verdict::Stamped, "lease refresh (b): a store into the surface did not refuse the lease");
+        expectVerdict(true, Verdict::Stamped, "lease refresh (b): a store into the surface did not refuse the applied lease");
+        settle(image, "lease refresh (b): the proof was not taken again after a store into the surface");
+
+        // (c) A store over the keys (the DCC variant): stamped.
+        AgcDriver::GuestMemory::MarkWritten(resource.dccAddress, keyCount);
+        expectVerdict(false, Verdict::Stamped, "lease refresh (c): a store over the keys did not refuse the lease");
+        settle(image, "lease refresh (c): the proof was not taken again after a key store");
+
+        // The lease's own rows in the same lock: a target-key row (unchanged since) and a CMASK row (not
+        // stored over since), each refusing once stored over.
+        {
+            const auto now = AgcDriver::GuestMemory::TrackerGeneration();
+            StorageTexture::LeaseRows extra;
+            extra.targetKeys = {address + elsewhere, 4096, now};
+            extra.cmask = {address + elsewhere + 8192, 64, now};
+            expectVerdict(false, Verdict::Hit, "lease refresh: unstored target-key and CMASK rows refused the lease", extra);
+            AgcDriver::GuestMemory::MarkWritten(address + elsewhere + 8192, 64);
+            expectVerdict(false, Verdict::Stamped, "lease refresh: a CMASK row stored over did not refuse the lease", extra);
+            extra.cmask = {};
+            expectVerdict(false, Verdict::Hit, "lease refresh: an unstamped target-key row refused the lease", extra);
+            AgcDriver::GuestMemory::MarkWritten(address + elsewhere + 100, 4);
+            expectVerdict(false, Verdict::Stamped, "lease refresh: a stamped target-key row did not refuse the lease", extra);
+        }
+
+        // (d) Another image pending with a unit inside T: other pending (the unit inside named where the
+        // reason is read: P1 on).
+        auto other = StorageTexture::Create(context, detiler, otherResource, 0);
+        recorder.Keep(other);
+        Require(other->BlockUnits() && other->TrackedUnits() == 16, "lease refresh fixture: the other image is not sixteen block units");
+        const auto flushOther = [&] {
+            StorageTexture::FlushPending(address, bytes, nullptr, "lease refresh test", PublishScope::None);
+            recorder.Sync();
+            Require(!other->Dirty(), "lease refresh: the other image is still pending");
+        };
+        std::vector<bool> inside(16, false);
+        inside[1] = true;
+        other->MarkUnitsWritten(inside);
+        rows = expectVerdict(false, Verdict::OtherPending, "lease refresh (d): another image's unit pending inside the target did not refuse the lease");
+        if (units != 0) Require(rows.other == StorageTexture::OtherPending::Inside, "lease refresh (d): the refusal did not name the unit inside");
+        flushOther();
+        settle(image, "lease refresh (d): the target was not proved once nothing else was pending");
+
+        // (e) A unit inside T marked in O while O is pending already (no pending serial moves): the
+        // unit-checked proof, taken with O pending outside T and its keys, refuses it (P1 on). Under
+        // P1's verify the unit-checked proof is a miss; with P1 off no proof is kept with O pending.
+        std::vector<bool> outside(16, false);
+        outside[8] = outside[9] = true;
+        other->MarkUnitsWritten(outside);
+        image->Refresh();
+        if (units == 1) {
+            rows = expectVerdict(false, Verdict::Hit, "lease refresh (e) 1: the unit-checked proof did not hold with the other image pending outside");
+            Require(rows.unitChecked, "lease refresh (e) 1: the hit was not unit-checked");
+            const auto serial = StorageTexture::PendingSerial();
+            auto both = outside;
+            both[1] = true;
+            other->MarkUnitsWritten(both);
+            Require(StorageTexture::PendingSerial() == serial, "lease refresh (e): a unit marked in an image already pending moved the pending serial");
+            rows = expectVerdict(false, Verdict::OtherPending, "lease refresh (e) 1: a unit inside marked without a serial move did not refuse the unit-checked proof");
+            Require(rows.other == StorageTexture::OtherPending::Inside, "lease refresh (e) 1: the refusal did not name the unit inside");
+        } else {
+            expectVerdict(false, units == 2 ? Verdict::P1Verifying : Verdict::NoProof, units == 2 ? "lease refresh (e) 2: a unit-checked proof answered under P1's verify" : "lease refresh (e) 0: a proof was kept with another image pending over the target");
+        }
+        flushOther();
+        // A store drops a unit-checked proof: the next one is taken plain, with nothing else pending.
+        AgcDriver::GuestMemory::MarkWritten(address + 65536, 4096);
+        settle(image, "lease refresh (e): the target was not proved once nothing else was pending");
+
+        // (f) The pending serial moved with nothing over the target: a hit, whose apply leaves the new
+        // serial in the proof as the twin's Refresh() does.
+        auto twin = StorageTexture::Create(context, detiler, resource, 0);
+        recorder.Keep(twin);
+        settle(twin, "lease refresh (f): the twin was never proved");
+        settle(image, "lease refresh (f): the target was not proved");
+        Require(!image->LeaseState().unitChecked && !twin->LeaseState().unitChecked, "lease refresh (f): a proof is unit-checked with nothing else pending");
+        StorageTexture::BumpPendingSerial();
+        const auto bumped = StorageTexture::PendingSerial();
+        rows = expectVerdict(false, Verdict::Hit, "lease refresh (f): a pending serial move with nothing over the target refused the lease");
+        Require(rows.pendingSerial == bumped && rows.serial == bumped && image->LeaseState().pendingSerial != bumped, "lease refresh (f): apply=false wrote the pending serial, or the hit would not leave the new one");
+        expectVerdict(true, Verdict::Hit, "lease refresh (f): apply=true did not hit");
+        settle(twin, "lease refresh (f): the twin's refresh was not proved after the serial move");
+        Require(image->LeaseState().pendingSerial == bumped && twin->LeaseState().pendingSerial == bumped, "lease refresh (f): the lease's apply and the twin's Refresh() left different pending serials");
+
+        // (g) A completion label pending over the surface: the head of CompletePendingCpuWrites would
+        // sync, so the lease misses before anything ran, and nothing synced.
+        {
+            const std::array<std::byte, 4> value{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+            static_cast<void>(recorder.Commands());
+            recorder.NotePendingWrite(address + 64, value.size());
+            recorder.AfterCompletions(address + 64, value, 1, 0, false);
+            Require(CpuWritesWouldSync(context, address, surfaceBytes) == CpuWriteSync::Label, "lease refresh (g): the pending completion label over the surface would not make CompletePendingCpuWrites sync");
+            expectVerdict(false, Verdict::CopiedWriter, "lease refresh (g): a pending completion label over the surface did not refuse the lease");
+            expectVerdict(true, Verdict::CopiedWriter, "lease refresh (g): a pending completion label over the surface did not refuse the applied lease");
+            Require(recorder.PendingWriteOverlaps(address + 64, value.size()) && Recorder::PendingCompletionLabels() != 0, "lease refresh (g): the lease's refresh synced the pending label");
+            recorder.Sync();
+        }
+        settle(image, "lease refresh (g): the target was not proved after the label landed");
+        settle(twin, "lease refresh (g): the twin was not proved after the label landed");
+
+        // (h) apply=true leaves the refresh proof and the proved count as the twin's Refresh() does (the
+        // proved route moves no layer).
+        const auto layersBefore = layers(*image);
+        expectVerdict(true, Verdict::Hit, "lease refresh (h): apply=true did not hit");
+        const auto provedTwin = proved();
+        twin->Refresh();
+        Require(proved() == provedTwin + 1, "lease refresh (h): the twin's refresh was not proved");
+        const auto mine = image->LeaseState();
+        const auto theirs = twin->LeaseState();
+        const auto serialNow = StorageTexture::PendingSerial();
+        Require(mine.proofGeneration == mine.generation && theirs.proofGeneration == theirs.generation && mine.pendingSerial == serialNow && theirs.pendingSerial == serialNow && mine.unitChecked == theirs.unitChecked && mine.keyPinned == theirs.keyPinned, "lease refresh (h): the lease's apply and the twin's Refresh() left different refresh proofs");
+        Require(layers(*image) == layersBefore, "lease refresh (h): a plain hit moved a layer generation");
+        twin.reset();
+
+        // K1: the driver's uncompressed key store pending (as StoreUncompressedOnGpu makes it, without
+        // the command), so today's key read answers from the memo. 1: the pinned proof answers the
+        // lease, apply=false leaves every layer and the proof alone, and apply=true moves every layer
+        // to the generation read in the stamp check's lock. 2: a miss (K1's verify takes it). 0: no
+        // proof under the pending store.
+        static_cast<void>(recorder.Commands());
+        recorder.NotePendingFill(resource.dccAddress, keyCount, 0xff);
+        AgcDriver::GuestMemory::MarkWritten(resource.dccAddress, keyCount);
+        NoteKeysFillOnGpu(resource.dccAddress, keyCount, DccKeys::Uncompressed);
+        image->Refresh();
+        if (pins == 1) {
+            Require(image->KeyProof().pinNote != 0, "lease refresh (K1): the refresh after the key store did not pin the keys");
+            settle(image, "lease refresh (K1) 1: the pinned target was never proved");
+            const auto layersPinned = layers(*image);
+            const auto statePinned = image->LeaseState();
+            AgcDriver::GuestMemory::MarkWritten(address + elsewhere, 4096);
+            rows = expectVerdict(false, Verdict::Hit, "lease refresh (K1) 1: the pinned target's lease refresh did not hold");
+            const auto afterPredict = image->LeaseState();
+            Require(rows.pinned && layers(*image) == layersPinned && afterPredict.generation == statePinned.generation && afterPredict.proofGeneration == statePinned.proofGeneration, "lease refresh (K1) 1: an apply=false run of a pinned target moved a layer or its proof");
+            AgcDriver::GuestMemory::MarkWritten(address + elsewhere, 4096);
+            const auto before = AgcDriver::GuestMemory::TrackerGeneration();
+            rows = expectVerdict(true, Verdict::Hit, "lease refresh (K1) 1: the pinned target's applied lease refresh did not hit");
+            const auto after = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto advanced = image->LeaseState();
+            Require(rows.pinned && rows.current >= before && rows.current <= after && advanced.layersAt && advanced.generation == rows.current && advanced.proofGeneration == rows.current && advanced.keyPinned, "lease refresh (K1) 1: the pinned hit did not move every layer to the generation of its stamp check");
+        } else if (pins == 2) {
+            Require(image->KeyProof().pinNote != 0, "lease refresh (K1): the refresh after the key store did not pin the keys");
+            image->Refresh();
+            expectVerdict(false, Verdict::K1Verifying, "lease refresh (K1) 2: a pinned proof answered the lease under K1's verify");
+        } else {
+            expectVerdict(false, Verdict::NoProof, "lease refresh (K1) 0: a refresh proof was kept under a pending key store with the switch off");
+        }
+        recorder.Sync();
+        other.reset();
+    }
+    recorder.Sync();
+    std::cout << "Lease refreshes (APS5_EXPERIMENT_PROOF_UNITS=" << units << ", APS5_EXPERIMENT_KEY_PIN=" << pins << "): passed\n";
+    return true;
+}
+
+// LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): two draws into one
+// resident DCC + CMASK target, each lookup made as prepareDraw's slot loop makes it
+// (TargetLeaseLookup). Between the draws, each of these must make the second lookup a miss: a CPU
+// store another walk stamps, a key store, a depth plane drawn over the target, its eviction under a
+// tiny budget, an epoch bump, and a replaced cache entry (the full path then returns the new image);
+// a CMASK proof of another address must still allow a hit, and without any of them the second lookup
+// is a hit (=1) or a verified would-hit (=2). The target is 256x256 SW_64KB_R_X at 0 of a 1 MiB
+// watched host import, its keys (0xff) at 256 KiB, its CMASK (0xff, proved expanded beforehand, as
+// an earlier draw would have) at 320 KiB; the other target at 512 KiB. With the switch unset nothing
+// is leased or counted. Needs the epoch coverage (APS5_DEBUG_COVERAGE=1) for a collect memo key.
+// False when nothing could be tested.
+bool targetLeaseDrawTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: lease draws not tested\n";
+        return false;
+    }
+    if (!KeyFastPath()) {
+        std::cout << "key fast path off: lease draws not tested\n";
+        return false;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t bytes = std::size_t{1} << 20;
+    constexpr std::size_t keyOffset = 256 * 1024;
+    constexpr std::size_t cmaskOffset = 320 * 1024;
+    constexpr std::size_t otherOffset = 512 * 1024;
+    constexpr std::size_t otherCmaskOffset = 832 * 1024;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: lease draws not tested\n";
+        return false;
+    }
+    auto* memory = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    ColorTarget color{};
+    color.address = address;
+    color.extent = {side, side};
+    color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    color.componentMapping = 0xe4u;
+    color.tileMode = ColorTileMode::RenderTarget;
+    color.elementBytes = 4;
+    color.bytes = ColorTargetLayout(side, side, color.tileMode, color.elementBytes).Bytes();
+    color.surfaceAddress = address;
+    color.surfaceExtent = color.extent;
+    auto otherColor = color;
+    otherColor.address = address + otherOffset;
+    otherColor.surfaceAddress = otherColor.address;
+    color.dccAddress = address + keyOffset;
+    color.cmaskAddress = address + cmaskOffset;
+    color.cmaskBytes = CmaskLayout(side, side).Bytes();
+    const auto keyCount = DccKeyBytes(color.bytes);
+    Require(color.bytes <= keyOffset && color.bytes <= bytes - otherOffset && keyCount <= cmaskOffset - keyOffset && color.cmaskBytes <= 65536 && DescribeSurface(SurfaceForTarget(color)).guestBytes == color.bytes, "lease draw fixture: unexpected target sizes");
+    std::memset(memory, 0x55, bytes);
+    std::memset(memory + keyOffset, 0xff, keyCount);
+    std::memset(memory + cmaskOffset, 0xff, color.cmaskBytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "no watched host import: lease draws not tested\n";
+        return false;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    context.nullDescriptors = device.NullDescriptors();
+    TextureCache cache(context);
+    context.textureCache = &cache;
+    // The storage cache and the depth surfaces hold the images this test makes through the slot
+    // loop's lookups (they refer to the detiler): let go of them while it lives.
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        ~Cleanup() {
+            recorder.Sync();
+            ClearDepthSurfaces(context.device);
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+        }
+    } cleanup{context, recorder};
+    recorder.Sync();
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    NoteCmaskProof(color.cmaskAddress, color.cmaskBytes, AgcDriver::GuestMemory::CollectWrites(color.cmaskAddress, color.cmaskBytes));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    if (!AgcDriver::GuestMemory::CurrentCollectMemoKey().Valid()) {
+        std::cout << "no collect memo key (APS5_DEBUG_COVERAGE unset): lease draws not tested\n";
+        return false;
+    }
+    const int mode = TargetLeases();
+    const auto start = TargetLeaseTotals();
+    std::shared_ptr<StorageTexture> resident;
+    const auto lookup = [&](const ColorTarget& target) {
+        static_cast<void>(recorder.Commands());
+        auto image = TargetLeaseLookup(context, target);
+        Require(image != nullptr, "lease draws: a target stayed non-resident");
+        return image;
+    };
+    const auto answered = [&](const TargetLeaseCounts& before, const TargetLeaseCounts& after) {
+        if (mode == 1) return after.hits == before.hits + 1;
+        return mode == 2 && after.wouldHits == before.wouldHits + 1 && after.verified == before.verified + 1;
+    };
+    // Lookups until one is answered by the lease: the first lookups after a change walk, take the
+    // refresh proof and make the lease. Three with the switch unset.
+    const auto settle = [&](const char* what) {
+        for (int round = 0; round < 8; ++round) {
+            const auto before = TargetLeaseTotals();
+            resident = lookup(color);
+            if (mode == 0 ? round == 2 : answered(before, TargetLeaseTotals())) return;
+        }
+        Require(false, what);
+    };
+    const auto expectHit = [&](const char* what) {
+        const auto before = TargetLeaseTotals();
+        resident = lookup(color);
+        if (mode != 0) Require(answered(before, TargetLeaseTotals()), what);
+    };
+    const auto expectMiss = [&](const char* what) {
+        const auto before = TargetLeaseTotals();
+        resident = lookup(color);
+        const auto after = TargetLeaseTotals();
+        Require(after.hits == before.hits && after.wouldHits == before.wouldHits, what);
+    };
+
+    settle("lease draws: the target's lookups were never answered by a lease");
+    expectHit("lease draws: the second draw with nothing between was not answered by the lease");
+
+    // A CPU store into the target, which another walk stamps.
+    memory[100] ^= 1;
+    AgcDriver::GuestMemory::CollectWritesUncached(address, color.bytes);
+    expectMiss("lease draws: a stamped CPU store into the target was answered from the lease");
+    settle("lease draws: no lease after a CPU store");
+
+    // A store of the target's keys.
+    AgcDriver::GuestMemory::MarkWritten(color.dccAddress, keyCount);
+    expectMiss("lease draws: a key store was answered from the lease");
+    settle("lease draws: no lease after a key store");
+
+    // A depth plane drawn over the target (stale until the slot loop's flush stores it over the
+    // target, which retires the surface). The harness may not store planes: then not tested.
+    {
+        bool tested = false;
+        try {
+            const DepthTarget depth{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+            if (DepthSurfaceView(context, depth) != VK_NULL_HANDLE && DepthPlanesStaleOver(address, color.bytes)) {
+                expectMiss("lease draws: a depth plane over the target was answered from the lease");
+                tested = true;
+            }
+        } catch (const std::exception& error) {
+            std::cout << "lease draws: a depth plane over the target could not be drawn or stored here (" << error.what() << ")\n";
+        }
+        if (!tested) std::cout << "lease draws: the depth plane case not tested\n";
+        ClearDepthSurfaces(context.device);
+        recorder.Sync();
+    }
+    settle("lease draws: no lease after a depth plane");
+
+    // The target evicted under a tiny budget by another target's creation.
+    OverrideCacheBudgetForTest(1);
+    static_cast<void>(lookup(otherColor));
+    OverrideCacheBudgetForTest(0);
+    Require(!resident->Cached(), "lease draws: the tiny budget did not evict the target");
+    expectMiss("lease draws: an evicted target was answered from the lease");
+    settle("lease draws: no lease after an eviction");
+
+    // An epoch bump.
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    expectMiss("lease draws: the first lookup of an epoch was answered from the lease");
+    settle("lease draws: no lease after an epoch bump");
+
+    // A CMASK proof of another address moves the proof serial but leaves this CMASK's proof: a hit.
+    const auto serial = CmaskProofSerial();
+    NoteCmaskProof(address + otherCmaskOffset, 64, AgcDriver::GuestMemory::CollectWrites(address + otherCmaskOffset, 64));
+    if (mode != 0) Require(CmaskProofSerial() != serial, "lease draws: a CMASK proof did not move the proof serial");
+    expectHit("lease draws: a CMASK proof of another address revoked the lease");
+
+    // A replaced cache entry: the lookup misses and returns the cache's new image (the lookup's
+    // Requires run on it).
+    const auto* replaced = resident.get();
+    ClearCachedTextures(context.device);
+    const auto fresh = CachedStorageSurface(context, SurfaceForTarget(color));
+    Require(fresh.get() != replaced, "lease draws: the replacement is the image it replaced");
+    expectMiss("lease draws: a replaced cache entry was answered from the lease");
+    Require(resident == fresh, "lease draws: the lookup after the replacement did not return the cache's new image");
+    settle("lease draws: no lease after a replaced entry");
+    recorder.Sync();
+
+    const auto end = TargetLeaseTotals();
+    if (mode == 0) Require(end.hits == start.hits && end.wouldHits == start.wouldHits && end.created == start.created && end.refused == start.refused && end.misses == start.misses, "lease draws: a lease was made or counted with the switch unset");
+    if (mode == 1) Require(end.wouldHits == start.wouldHits && end.verified == start.verified && end.created > start.created, "lease draws 1: a lease was verified, or none was made");
+    if (mode == 2) Require(end.hits == start.hits && end.created > start.created, "lease draws 2: a lease answered a lookup, or none was made");
+    Require(end.raced == start.raced, "lease draws: a prediction raced in a single-threaded test");
+    std::cout << "Lease draws (APS5_EXPERIMENT_TARGET_LEASES=" << mode << "): passed\n";
+    return true;
+}
+
 
 void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
@@ -12330,6 +12822,17 @@ int main(int argc, char** argv) {
             const bool keys = keyPinProofTests(device, recorder);
             if (!refreshKeyPinTests(device, recorder) || !keys) {
                 std::cout << "skipped, the device watches no memory or imports no watched host memory for the pinned key proofs\n";
+                return 77;
+            }
+            return 0;
+        }
+        // LOCAL EXPERIMENT (APS5_EXPERIMENT_TARGET_LEASES, GPU-OWNED-PLAN 9.4.3 D4-B): the lease refresh
+        // and lease draw suites, for the switch's rows; skipped (77) when either could not test (no
+        // watched host import, or no collect memo key without APS5_DEBUG_COVERAGE=1).
+        if (argc == 2 && std::string_view(argv[1]) == "--target-lease-only") {
+            const bool refreshes = targetLeaseRefreshTests(device, recorder);
+            if (!targetLeaseDrawTests(device, recorder) || !refreshes) {
+                std::cout << "skipped, the device imports no watched host memory or the lookups have no collect memo key for the target leases\n";
                 return 77;
             }
             return 0;
