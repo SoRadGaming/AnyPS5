@@ -1,0 +1,71 @@
+**seconds 100:30** from present 1228: 235 presents, frame p50 123.7 / p90 127.2 / p99 132.3 / max 1009.0 ms, GPU busy 85.4 ms per present
+AMD Radeon RX 9070 XT, AMD proprietary driver 26.8.1 (LLPC), Windows 10.0.26200, 3840x2160, commit 030fc64fcc6a, dropped: yes
+
+```json
+{"commit":"030fc64fcc6a","dirty":false,"env":{"APS5_HOST_IMPORT_MIB":"14297","APS5_TRACE_SECONDS":"100:30"},"gpu":"AMD Radeon RX 9070 XT","driver":"AMD proprietary driver 26.8.1 (LLPC)","os":"Windows 10.0.26200","cpu":"AMD Ryzen 7 5800X3D 8-Core Processor","cpu_threads":16,"memory_mib":32691,"title_id":"PPSA21564","title":"ASTRO BOT","content_version":"01.007.000","resolution":"3840x2160","window":{"spec":"seconds 100:30","first_present":1228,"ms":30022.686},"presents":235,"frame_ms":{"p50":123.702,"p90":127.242,"p99":132.274,"max":1009.017},"gpu_busy_ms_per_present":85.355,"worker_busy_pct":{"queue worker 0x0":97.444,"queue worker 0x40":99.637,"queue worker 0x48":85.013,"queue worker 0x46":0.713},"phase_totals_ms":{"Driver.Completion":29.179,"Driver.Dispatch":7529.12,"Driver.Dispatch.capture_resources":274.262,"Driver.Dispatch.decode_key_device_setup":4331.422,"Driver.Dispatch.lookup_cache":70.674,"Driver.Dispatch.materialize":9.394,"Driver.Dispatch.prepared_invocation":7.644,"Driver.Draw":18292.218,"Driver.Draw.device_setup":714.895,"Driver.Draw.draw_enqueued":5126.463,"Driver.Draw.post_compile_prepare":132.882,"Driver.Draw.prepare":1238.878,"Driver.Draw.shader_compile_and_link":9557.77,"Driver.EndSubmission":202.765,"Driver.Packet":84674.112,"Driver.Packet.device_lock":146.54,"Driver.Packet.dispatch":7571.331,"Driver.Packet.draw":18467.589,"Driver.Packet.execute":894.019,"Driver.Packet.flip_flush":8.88,"Driver.Packet.flush_between_packets":734.756,"Driver.Packet.memory_wait":49150.652,"Driver.Packet.pipeline_drain":434.323,"Driver.Packet.pipeline_prepare":233.702,"Driver.Packet.prepare_memory":5205.261,"Driver.Packet.rendering_wait":0.279,"Driver.Present":2075.464,"Driver.Present.acquire_image":345.796,"Driver.Present.device_setup":0.117,"Driver.Present.gpu_mutex_wait":10.261,"Driver.Present.inflight_wait":0.609,"Driver.Present.present_display_buffer":35.799,"Driver.Present.queue_present":638.093,"Driver.Present.release_and_callback":1.005,"Driver.Present.render_fence_wait":1043.08,"Driver.Present.resize":0.432,"Driver.Present.validate":0.09,"Driver.Suspend":0.179,"GpuMutex.wait.dispatch":522.59,"GpuMutex.wait.draw":1460.914,"GpuMutex.wait.end":40.656,"GpuMutex.wait.fill":3.277,"GpuMutex.wait.flush":24.292,"GpuMutex.wait.hook":24.396,"GpuMutex.wait.indirect":17.253,"GpuMutex.wait.label":275.279,"GpuMutex.wait.other":0.0,"GpuMutex.wait.present":9.636,"GpuMutex.wait.wait":86.246,"Graphics.Draw":16621.456,"Graphics.Draw.draw_and_resource_release":12888.491,"Graphics.Draw.index_upload":1228.964,"Graphics.Draw.validate":896.441,"Graphics.Draw.vertex_upload":1420.011,"Graphics.DrawWithRecipe":4116.839,"Graphics.DrawWithRecipe.draw_and_resource_release":4059.075,"Graphics.DrawWithRecipe.index_upload":16.45,"Graphics.DrawWithRecipe.validate":12.747,"Graphics.DrawWithRecipe.vertex_upload":22.55,"Recorder.Reap":396.917,"Recorder.Submit":1030.315,"Recorder.WaitSerial":4371.267,"Resources.Complete":196.311,"Resources.Prepare":140.548,"Shader.DrawStage":7326.383,"Shader.DrawStage.capture_resources":4885.963,"Shader.DrawStage.materialize":1507.375,"Shader.DrawStage.prepared_invocation":860.169,"Shader.ResolveAbi":59.303,"Shader.ResolveGraphicsAbi":16.588,"Shader.ResolveGraphicsStagesAbi":511.411,"VideoOut.Flip":2092.954,"VideoOut.Flip.completion_mutex_wait":0.464,"VideoOut.Flip.config_mutex_wait":0.026,"VideoOut.Flip.frame_limit":0.113,"VideoOut.Flip.notify_game":8.232,"VideoOut.Flip.present":2067.54,"VideoOut.Flip.validate":0.264,"VideoOut.Flip.vblank_wait":0.212,"VideoOut.Flip.window_prepare":0.388,"VideoOut.Flip.window_title":15.42,"VideoOut.Readiness":0.541,"VideoOut.Readiness.locks_validate":0.225,"Vulkan.Acquire":345.504,"Vulkan.Acquire.acquire_fence_wait":321.892,"Vulkan.Acquire.acquire_image":22.484,"Vulkan.Acquire.fence_reset":0.588,"Vulkan.Acquire.retired_swapchains":0.421,"Vulkan.Dispatch":1032.265,"Vulkan.Dispatch.command_record":168.044,"Vulkan.Dispatch.shader_resources":858.652,"Vulkan.DispatchRecipe":114.042,"Vulkan.DispatchRecipe.command_record":113.086,"Vulkan.DrawFromRecipe":4124.915,"Vulkan.GraphicsPipeline":809.438,"Vulkan.GraphicsPipeline.create":779.182,"Vulkan.GraphicsPipeline.modules_and_state":30.252,"Vulkan.GraphicsPipelineLibrary":779.095,"Vulkan.GraphicsPipelineLink":0.043,"Vulkan.Present":19.352,"Vulkan.Present.command_record_scale":8.269,"Vulkan.Present.pixel_upload":5.363,"Vulkan.Present.queue_submit":5.522,"Vulkan.QueuePresent":637.42,"Vulkan.QueuePresent.queue_present":636.785,"Vulkan.Retire":1042.974,"Vulkan.Retire.wait":1037.643},"top_phases_ms_per_frame":{"Driver.Packet":360.315,"Driver.Packet.memory_wait":209.152,"Driver.Packet.draw":78.585,"Driver.Draw":77.839,"Graphics.Draw":70.73,"Graphics.Draw.draw_and_resource_release":54.845,"Driver.Draw.shader_compile_and_link":40.671,"Driver.Packet.dispatch":32.218},"owned_draw_counts":{},"graphics_track":{"Graphics.Barrier.copy":3525,"Graphics.Barrier.dcc-clear":2820,"Graphics.Barrier.dcc-keys":2820,"Graphics.Barrier.dispatch-lead":18142,"Graphics.Barrier.dispatch-trail":22325,"Graphics.Barrier.draw":104017,"Graphics.Barrier.fill":8636,"Graphics.Barrier.fill-clear":4230,"Graphics.Barrier.indirect-args":2115,"Graphics.Barrier.input-mirror":476,"Graphics.Barrier.label-run":165557,"Graphics.Barrier.present-blit":470,"Graphics.Barrier.shadow-publish":2585,"Graphics.Barrier.staging-in":51646,"Graphics.Barrier.staging-out":24924,"Graphics.Barrier.storage-upload":13630,"Graphics.Barrier.storage-writeback":47640,"Graphics.BarrierMerged.dispatch-lead":8413,"Graphics.BarrierMerged.fill":2174,"Graphics.BarrierMerged.label-run":258,"Graphics.BarrierMerged.shadow-publish":2115,"Graphics.BarrierMerged.staging-in":23126,"Graphics.BarrierMerged.staging-out":24924,"Graphics.BarrierMerged.storage-writeback":6942,"Graphics.Copy":56244,"Graphics.Copy.bytes":39709763322,"Graphics.RenderPass":48205,"Graphics.RenderPass.Close.command":31232,"Graphics.RenderPass.Close.image":1865,"Graphics.RenderPass.Close.key":1785,"Graphics.RenderPass.Close.label":258,"Graphics.RenderPass.Close.new-batch":13065,"Graphics.RenderPass.Continued":477511},"trace_dropped":true,"trace_dropped_threads":{"queue worker 0x0":{"events_full_after_s":6.494,"events_lost":907291,"totals_full":false},"draw committer":{"events_full_after_s":16.52,"events_lost":199983,"totals_full":false}},"trace":"aps5-trace-030fc64fcc6a-8380.json.gz"}
+```
+
+**Incomplete trace:** recorded data was lost. Slice-based timings, waits and batch inventories cover retained events only; missing slices are not idle time. Summary statistics are reported separately.
+- queue worker 0x0: 907291 events lost; buffer full at 6493.7 ms
+- draw committer: 199983 events lost; buffer full at 16519.8 ms
+
+**Slowest frames** (largest slices inside each, inclusive)
+
+- present 1424: 1009.0 ms at 24293 ms: Driver.Packet (queue worker 0x40) 1008.4, Driver.WorkerWait (queue worker 0x46) 1008.1, Driver.WorkerWait.dequeue_order (queue worker 0x46) 997.0, Driver.Packet (queue worker 0x48) 986.9
+- present 1442: 132.5 ms at 27418 ms: Driver.Packet (queue worker 0x40) 131.8, Driver.WorkerWait (queue worker 0x46) 131.3, Driver.WorkerWait.dequeue_order (queue worker 0x46) 120.4, Driver.Packet (queue worker 0x48) 111.0
+- present 1276: 132.3 ms at 5971 ms: Driver.Packet (queue worker 0x40) 131.7, Driver.WorkerWait (queue worker 0x46) 131.2, Driver.WorkerWait.dequeue_order (queue worker 0x46) 119.3, Driver.Packet (queue worker 0x48) 112.1
+- present 1265: 131.9 ms at 4594 ms: Driver.Packet (queue worker 0x40) 130.8, Driver.WorkerWait (queue worker 0x46) 130.7, Driver.WorkerWait.dequeue_order (queue worker 0x46) 120.4, Driver.Packet (queue worker 0x48) 111.6
+- present 1358: 131.5 ms at 16095 ms: Driver.Packet (queue worker 0x40) 130.9, Driver.WorkerWait (queue worker 0x46) 130.6, Driver.WorkerWait.dequeue_order (queue worker 0x46) 120.2, Driver.Packet (queue worker 0x48) 110.2
+
+**Persistent spikes** (frame time above the fastest frame that separates it from a longer frame; one entry per stall, not per frame)
+
+- present 1424: 1009.0 ms at 24293 ms, persistence 890.1 ms
+- present 1276: 132.3 ms at 5971 ms, persistence 13.4 ms
+- present 1442: 132.5 ms at 27418 ms, persistence 13.0 ms
+- present 1265: 131.9 ms at 4594 ms, persistence 11.2 ms
+- present 1358: 131.5 ms at 16095 ms, persistence 10.8 ms
+- present 1433: 130.2 ms at 26303 ms, persistence 9.6 ms
+- present 1352: 130.2 ms at 15338 ms, persistence 7.4 ms
+- present 1303: 127.6 ms at 9302 ms, persistence 7.1 ms
+- present 1328: 126.5 ms at 12385 ms, persistence 7.0 ms
+- present 1458: 126.9 ms at 29405 ms, persistence 6.9 ms
+
+**Threads** (ms per frame)
+
+| thread | busy | wait | untraced | in slices < 20 us | largest |
+|---|---|---|---|---|---|
+| queue worker 0x0 | 21.1 (17 %) | 1.1 (1 %) | 105.5 | 27.4 | Driver.Packet 21.9, Driver.Completion 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 127.7 | 0.1 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 127.7 | 0.3 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveAbi 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 127.7 | 0.9 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveAbi 0.0 |
+| title | 0.0 (0 %) | 6.9 (5 %) | 120.9 | 0.7 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveAbi 0.0 |
+| queue worker 0x40 | 11.6 (9 %) | 115.3 (90 %) | 0.9 | 2.4 | Driver.Packet 126.7, Driver.EndSubmission 0.1 |
+| queue worker 0x48 | 3.2 (3 %) | 124.1 (97 %) | 0.5 | 0.2 | Driver.Packet 107.9, Driver.EndSubmission 0.7 |
+| draw committer | 42.3 (33 %) | 3.5 (3 %) | 81.9 | 22.9 | Graphics.Draw 30.8, Vulkan.DrawFromRecipe 9.5 |
+| presenter | 3.1 (2 %) | 5.8 (5 %) | 118.8 | 0.0 | VideoOut.Flip 8.9, Driver.Present 0.0 |
+| queue worker 0x46 | 0.7 (1 %) | 126.4 (99 %) | 0.7 | 0.9 | Driver.Packet 0.7, Driver.EndSubmission 0.0 |
+| title | 0.0 (0 %) | 0.0 (0 %) | 127.7 | 0.3 | Shader.ResolveGraphicsStagesAbi 0.0 |
+| gpu | 85.3 (67 %) | 0.0 (0 %) | 42.4 | 0.0 | batch 85.3 |
+
+**Largest slices** (ms per frame, inclusive, all threads): Driver.Packet 257.2, Driver.Packet.memory_wait 209.1, Driver.WorkerWait 145.4, Driver.WorkerWait.dequeue_order 116.2, batch 85.3, Graphics.Draw 30.8, Driver.WorkerWait.idle_and_completion_poll 29.2, Graphics.Draw.draw_and_resource_release 23.2, Driver.Packet.prepare_memory 18.3, Recorder.WaitSerial 15.9
+
+**Longest waits**
+
+- Driver.WorkerWait (queue worker 0x46) 1007.6 ms at 24295 ms, present 1424
+- Driver.Packet.memory_wait (queue worker 0x48) 984.0 ms at 24321 ms, present 1424
+- Driver.Packet.memory_wait (queue worker 0x40) 973.5 ms at 24253 ms, present 1423
+- Driver.WorkerWait (queue worker 0x46) 131.3 ms at 27420 ms, present 1442
+- Driver.WorkerWait (queue worker 0x46) 131.0 ms at 5972 ms, present 1276
+- Driver.WorkerWait (queue worker 0x46) 130.4 ms at 4596 ms, present 1265
+- Driver.WorkerWait (queue worker 0x46) 130.4 ms at 16097 ms, present 1358
+- Driver.WorkerWait (queue worker 0x46) 129.3 ms at 15340 ms, present 1352
+- Driver.WorkerWait (queue worker 0x46) 129.2 ms at 26305 ms, present 1433
+- Driver.WorkerWait (queue worker 0x46) 129.1 ms at 25681 ms, present 1428
+
+**Largest GPU batches** (GPU ranges inside, and the CPU slices that recorded each, inclusive)
+
+- batch 24427: 12.1 ms at 25226 ms, present 1424: GPU no ranges; recorded by no CPU slices
+- batch 26550: 11.0 ms at 27388 ms, present 1441: GPU no ranges; recorded by no CPU slices
+- batch 26800: 10.7 ms at 27644 ms, present 1443: GPU no ranges; recorded by no CPU slices
+- batch 19061: 10.3 ms at 19024 ms, present 1381: GPU no ranges; recorded by no CPU slices
+- batch 19437: 10.0 ms at 19397 ms, present 1384: GPU no ranges; recorded by no CPU slices
